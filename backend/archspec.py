@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Architecture specs restricted to what SAI compiles.
 
 A spec is plain JSON so researchers can author it in the Studio UI and customers never see it:

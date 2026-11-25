@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Standalone job worker: `python -m backend.worker [--kinds train,fitcheck] [--threads N]`.
 
 Run train workers on GPU machines and compile/analyze workers next to the pinned toolchains; all of them share

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """HIL firmware: build the SAI harness (harness/) around a SAI build for one board port, and run it under QEMU.
 
 Ports (harness/ports/*.c + harness/ld/*.ld):

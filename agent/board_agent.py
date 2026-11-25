@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """SAI Platform lab agent: connects MCU boards (USB) or QEMU boards to the platform's board farm.
 
     python agent/board_agent.py --server https://platform.example --token $AGENT_TOKEN --boards boards.json

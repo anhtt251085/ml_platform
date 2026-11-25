@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Retention: keep what customers and reproducibility need, delete what can be rebuilt.
 
 Kept for every finished project: model.onnx, build/ (the compiled package), package.zip, report.json,

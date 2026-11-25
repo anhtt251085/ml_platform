@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* QEMU virt (RV32IMAFC): NS16550 UART at 0x10000000, cycles from `mcycle`, exit via the SiFive test device.
    With -icount the counter tracks executed instructions: numbers are labelled `emulated`, never calibration. */
 #include <stdint.h>

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* SAI feature front ends; see sai_features.h. Float, single precision, deterministic order of operations. */
 #include "sai_features.h"
 

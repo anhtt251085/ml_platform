@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Board farm: a registry of physical (or simulated) MCU boards served by lab agents, a queue of
 hardware-in-the-loop (HIL) runs, and the latency calibration those runs feed.
 

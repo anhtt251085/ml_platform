@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* SAI HIL harness: runs a SAI package on the MCU with the test vectors baked in, and prints a line protocol on
    the board's UART:
 

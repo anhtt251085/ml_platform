@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Job orchestration: the end-to-end pipeline a customer starts with one click, plus the Studio fit check and the
 model analyzer. Jobs run on a thread pool now; the job/stage/log model maps 1:1 onto a queue (Celery, Arq,
 Cloud Tasks) when training moves to GPU workers."""

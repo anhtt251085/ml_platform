@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """UCI HAR (Human Activity Recognition Using Smartphones) -> NPZ for the `har-imu` model type.
 
     python tools/import_uci_har.py "human+activity+recognition+using+smartphones.zip" har_uci.npz

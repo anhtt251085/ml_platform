@@ -188,3 +188,9 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 
 SQLite (one host; Postgres is a later swap of `db.conn`), local file storage, CPU training, one input/one output
 models; physical boards need a lab agent (the emulated lab runs without one). See `docs/IMPLEMENTATION_PLAN.md`.
+
+## License
+
+Copyright (c) 2026 TLA Lab. All rights reserved. This is proprietary software, not open source: see
+[LICENSE](LICENSE). No use, copying, modification or distribution is permitted without a written agreement
+with TLA Lab.

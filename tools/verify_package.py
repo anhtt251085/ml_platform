@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Verify a SAI Platform package: every file's SHA-256 and the platform's Ed25519 signature.
 
     python tools/verify_package.py package.zip platform_public_key.pem

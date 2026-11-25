@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* NUCLEO-H753ZI port of the SAI HIL harness.
 
    Clock: PLL1 from HSI (64 MHz / 4 = 16 MHz reference, wide VCO), SYSCLK 480 MHz on rev V silicon (VOS0 via the
