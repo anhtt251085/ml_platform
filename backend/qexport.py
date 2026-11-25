@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Post-training INT8 quantization of a SpecNet and emission of the QDQ ONNX graph SAI's ONNX front end imports.
 
 Contract (the one SAI's front end checks, see the compiler's frontend_onnx.py):

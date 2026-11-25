@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* QEMU MPS2-AN500 (Cortex-M7 + FPU): CMSDK UART0, cycles from SysTick (24-bit) extended by its wrap interrupt.
    QEMU is not cycle-accurate: with -icount the count tracks executed instructions. The platform labels these
    numbers `emulated`; they never calibrate latency. */

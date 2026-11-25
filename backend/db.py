@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Persistence: SQLite (WAL) with numbered migrations.
 
 Tables are owned by the modules that use them; this module owns the connection and the schema history."""

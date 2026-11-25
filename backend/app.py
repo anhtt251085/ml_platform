@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """SAI Platform HTTP API and static frontend.
 
     uvicorn backend.app:app --port 8000

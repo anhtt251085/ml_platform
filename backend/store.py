@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Model pool (built-in + researcher templates), dataset registry and projects."""
 
 from __future__ import annotations

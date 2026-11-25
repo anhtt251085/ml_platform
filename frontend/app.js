@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* SAI Platform frontend: a dependency-free single-page app (hash routing). */
 "use strict";
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """The model pool: built-in templates (SAI Research) plus researcher-published ones stored in the database.
 
 A template is what a customer picks ("Bearing fault detection"); it owns the input contract, the default

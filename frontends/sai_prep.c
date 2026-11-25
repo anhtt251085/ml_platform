@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* SAI window preprocessing; see sai_prep.h. */
 #include "sai_prep.h"
 

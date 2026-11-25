@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Nightly regression: every published pool model type x every board, on the current SAI release.
 
 For each model type's `tiny` size (random weights; resources do not depend on trained weights) it records the

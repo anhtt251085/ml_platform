@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Commercial layer (M6): plan tiers and quotas, deployment rights, package signing, branding.
 
 Tiers (orgs.tier) decide which tools an organisation can use; deployment rights (orgs.branding["deployment"], set

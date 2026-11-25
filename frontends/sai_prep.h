@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* SAI window preprocessing: channel selection, decimation (block average), per-window mean removal.
    The same C runs in training (Python binding) and on the MCU, so the model sees identical inputs.
    No heap; sequential float32 sums in a fixed order. Compile without -ffast-math. */

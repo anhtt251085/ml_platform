@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """The platform's only door into the SAI compiler: the supported `sai` command, run as a subprocess with JSON output.
 
 Nothing here imports compiler internals, so the platform tracks SAI releases through the CLI contract

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* Cortex-M startup for the SAI HIL harness: vector table, .data/.bss init, FPU enable. */
 #include <stdint.h>
 extern uint32_t _stack_top[], _data_start[], _data_end[], _data_load[], _bss_start[], _bss_end[];

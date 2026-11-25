@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* Sanken MD6605 EVB: cycles from `mcycle` (RV32IMAFC). The UART registers come from the vendor SDK
    (`MDproject` firmware); fill port_putc from it when the first EVB joins the farm. Until then this port is a
    build check: it links the package with the production flags so a farm build fails early, not on the bench. */

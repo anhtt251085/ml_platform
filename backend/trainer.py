@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Training and evaluation for the three task kinds (classification, regression, anomaly autoencoder)."""
 
 from __future__ import annotations

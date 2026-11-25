@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Python binding of frontends/sai_features.c (ctypes). Training computes features with the very C the MCU runs.
 
 A template opts in with a `frontend` block, e.g.

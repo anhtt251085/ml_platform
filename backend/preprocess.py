@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Preprocessing stage: what happens to a dataset between upload and training, and on the MCU before inference.
 
 Config (all optional; `normalize_cfg` fills defaults and validates against the dataset):

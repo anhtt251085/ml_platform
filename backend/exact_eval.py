@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Bit-exact evaluation: compile the model for host-cpu with SAI, link a batch runner, run the test set.
 
 The INT8 accuracy the customer sees is the deployed C program's, not a framework's approximation."""

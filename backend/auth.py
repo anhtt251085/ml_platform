@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Identity: organisations, users, roles, sessions, lab-agent tokens, audit log, usage metering.
 
 Roles

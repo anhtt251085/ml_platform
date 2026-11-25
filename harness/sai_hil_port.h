@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* Board port of the SAI HIL harness. One .c per board in harness/ports/. */
 #ifndef SAI_HIL_PORT_H
 #define SAI_HIL_PORT_H

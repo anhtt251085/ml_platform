@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE. */
 /* Batch runner for a SAI host-cpu build: reads N int8 inputs from stdin, writes N raw outputs to stdout.
    Linked against the build's lib/libsai_model.a, so the numbers are the deployed program's, bit for bit. */
 #include <stdio.h>

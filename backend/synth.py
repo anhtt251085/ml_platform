@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Synthetic demo datasets, one per template, so every pipeline can be demonstrated before a customer has data.
 
 They are physics-flavoured (impulse trains at bearing defect frequencies, arc broadband bursts, PQRST beats...)

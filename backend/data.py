@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Dataset ingestion: every source ends as data.npz (X float32 [N, C, H, W], y, labels, groups) plus meta.json.
 
 Sources: file upload (CSV, NPZ, ZIP of WAV folders), HTTPS URL, synthetic demo data.

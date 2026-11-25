@@ -1,3 +1,4 @@
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Runtime configuration from environment variables (12-factor; the same image runs locally and in the cloud)."""
 
 from __future__ import annotations
