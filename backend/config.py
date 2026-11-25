@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get("SAI_PLATFORM_DATA", ROOT / "var")).resolve()
 DB_PATH = DATA_DIR / "platform.sqlite3"
 WORK_DIR = DATA_DIR
-SAI_BIN = os.environ.get("SAI_BIN") or shutil.which("sai") or "sai"
+# The SAI compiler is never installed or copied into the platform: it runs in place from its own repository
+# checkout (SAI_REPO) through bin/sai. SAI_BIN overrides the command entirely (e.g. a separately managed install).
+SAI_REPO = os.environ.get("SAI_REPO", "")
+SAI_LAUNCHER = str(ROOT / "bin" / "sai")
+SAI_BIN = os.environ.get("SAI_BIN") or (SAI_LAUNCHER if SAI_REPO else shutil.which("sai") or "sai")
 SAI_MD6605_GCC = os.environ.get("SAI_MD6605_GCC", "")
 SAI_CORTEX_M7_GCC = os.environ.get("SAI_CORTEX_M7_GCC", "")
 HOST_CC = os.environ.get("CC", "gcc")

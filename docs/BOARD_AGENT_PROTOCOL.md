@@ -49,6 +49,6 @@ row until the lab resets it. Emulated and simulated results never calibrate late
 
 ## Nightly regression
 
-`python -m backend.regression` (and `.github/workflows/nightly.yml`, and Board Farm → Run regression now): every
+`python -m backend.regression` (and `tools/full_check.sh`, and Board Farm → Run regression now): every
 published pool model type × every board on the current SAI release — RAM, flash, plans that fit, and emulated HIL
 bit-exactness — compared with the previous run; alerts on +5 % RAM/flash, lost fits or HIL mismatches.

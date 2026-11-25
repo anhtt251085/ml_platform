@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -77,7 +78,15 @@ def _env() -> dict:
     if config.SAI_CORTEX_M7_GCC:
         env["SAI_CORTEX_M7_GCC"] = config.SAI_CORTEX_M7_GCC
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.setdefault("SAI_PYTHON", sys.executable)      # bin/sai runs SAI with the platform's interpreter
     return env
+
+
+def available() -> bool:
+    """True when a SAI compiler can be run: an in-place checkout (SAI_REPO) or a `sai` command."""
+    if config.SAI_BIN == config.SAI_LAUNCHER:
+        return bool(config.SAI_REPO) and (Path(config.SAI_REPO) / "sai" / "cli.py").is_file()
+    return shutil.which(config.SAI_BIN) is not None
 
 
 def run(args: list[str], timeout: int = 300) -> dict:
@@ -97,10 +106,10 @@ def run(args: list[str], timeout: int = 300) -> dict:
 
 
 def version() -> dict:
-    out = subprocess.run([config.SAI_BIN, "version"], capture_output=True, text=True, env=_env())
     try:
+        out = subprocess.run([config.SAI_BIN, "version"], capture_output=True, text=True, env=_env())
         return json.loads(out.stdout)
-    except json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return {"sai": "unknown"}
 
 

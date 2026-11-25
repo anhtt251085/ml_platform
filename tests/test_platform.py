@@ -19,7 +19,9 @@ import torch  # noqa: E402
 
 from backend import archspec, catalog, data, qexport, sai_engine, trainer  # noqa: E402
 
-HAS_SAI = shutil.which(os.environ.get("SAI_BIN", "sai")) is not None
+from backend import sai_engine as _sai_engine  # noqa: E402
+
+HAS_SAI = _sai_engine.available()
 need_sai = pytest.mark.skipif(not HAS_SAI, reason="sai CLI not installed")
 
 

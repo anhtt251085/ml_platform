@@ -1,0 +1,8 @@
+#!/bin/sh
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
+# Runs the SAI compiler in place, from its own repository checkout ($SAI_REPO). Nothing is installed, cloned or
+# copied: Python imports the modules straight from that folder, and no bytecode is written back into it.
+: "${SAI_REPO:?set SAI_REPO to the folder of your SAI compiler checkout}"
+export PYTHONPATH="$SAI_REPO:$SAI_REPO/converter${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+exec "${SAI_PYTHON:-python3}" -m sai.cli "$@"

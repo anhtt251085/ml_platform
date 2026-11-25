@@ -18,7 +18,9 @@ import pytest  # noqa: E402
 
 from backend import archspec, exact_eval, hil, qexport, sai_engine  # noqa: E402
 
-HAS_SAI = shutil.which(os.environ.get("SAI_BIN", "sai")) is not None
+from backend import sai_engine as _sai_engine  # noqa: E402
+
+HAS_SAI = _sai_engine.available()
 HAS_QEMU = HAS_SAI and hil.available("qemu-mps2-an500") and hil.available("qemu-virt-rv32")
 need_qemu = pytest.mark.skipif(not HAS_QEMU, reason="sai, MCU toolchains or QEMU missing")
 
