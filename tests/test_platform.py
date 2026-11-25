@@ -257,3 +257,94 @@ def test_migration_from_v01_database(tmp_path, monkeypatch):
     assert db.version() == len(db.MIGRATIONS)
     with db.conn() as k:
         assert k.execute("SELECT org_id, cancel_requested FROM jobs WHERE id='job_old'").fetchone()[1] == 0
+
+
+# ---- M2: data & training depth -------------------------------------------------------------------------------------
+def test_c_frontend_matches_numpy_and_mfcc_layout():
+    from backend import features
+    x = np.random.default_rng(1).normal(size=(2, 1, 256)).astype(np.float32)
+    got = features.apply({"type": "band_energy", "raw_length": 256, "n_fft": 256, "bands": 64}, x)
+    w = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(256) / 255)
+    P = np.abs(np.fft.rfft(x * w, 256)) ** 2
+    ref = np.log10(np.add.reduceat(P[..., 1:129], np.arange(0, 128, 2), axis=-1) / 256 + 1e-6)
+    assert np.abs(got[:, :, 0, :] - ref).max() < 1e-4
+    fe = catalog.builtin()["kws"]["frontend"]
+    a = np.random.default_rng(2).normal(0, 0.1, (1, 1, 16000)).astype(np.float32)
+    assert features.apply(fe, a).shape == (1, 1, 49, 10)
+
+
+def test_recording_split_never_leaks():
+    y = np.repeat([0, 1], 60)
+    groups = np.array([f"rec{i // 6}" for i in range(120)])      # 20 recordings of 6 windows
+    idx = trainer.split(y, "classification", groups=groups)
+    assert idx["split_mode"] == "recording"
+    sets = {k: set(groups[idx[k]].tolist()) for k in ("train", "val", "test")}
+    assert not (sets["train"] & sets["test"]) and not (sets["train"] & sets["val"]) and not (sets["val"] & sets["test"])
+    assert len(idx["train"]) + len(idx["val"]) + len(idx["test"]) == 120
+
+
+def test_wav_zip_ingest_groups_by_speaker():
+    import wave
+    import zipfile
+    buf = io.BytesIO()
+    rng = np.random.default_rng(3)
+    with zipfile.ZipFile(buf, "w") as z:
+        for label in ("yes", "no"):
+            for spk in range(4):
+                for n in range(2):
+                    pcm = (rng.normal(0, 0.1, 12000) * 32767).astype("<i2")    # shorter than 1 s: zero padded
+                    wb = io.BytesIO()
+                    with wave.open(wb, "wb") as w:
+                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(pcm.tobytes())
+                    z.writestr(f"clips/{label}/{spk:08x}_nohash_{n}.wav", wb.getvalue())
+    meta = data.ingest_bytes(buf.getvalue(), "words.zip", catalog.builtin()["kws"], licence="cc-by-4.0")
+    assert meta["shape"] == [1, 49, 10] and meta["n"] == 16 and meta["recordings"] == 4
+    assert meta["frontend"]["type"] == "mfcc" and meta["commercial_use"] is True
+
+
+def test_csv_mapping_jitter_and_licence():
+    tpl = catalog.builtin()["dcdc-fault"]
+    rows = ["ts,Vout_V,IL_A,state,run"]
+    t = 0.0
+    rng = np.random.default_rng(4)
+    for seg in range(4):
+        for i in range(200):
+            t += 5e-5 * (1 + rng.uniform(-0.3, 0.3))                      # 30 % sample-period jitter
+            rows.append(f"{t:.7f},{12 + 0.01 * i},{2.0 + 0.1 * seg},{'ok' if seg % 2 else 'short'},{seg}")
+    raw = "\n".join(rows).encode()
+    pv = data.csv_preview(raw)
+    assert pv["guess"]["label"] is None and set(pv["header"]) == {"ts", "Vout_V", "IL_A", "state", "run"}
+    assert pv["guess"]["time"] == "ts" and pv["guess"]["segment"] == "run"
+    assert pv["guess"]["channels"] == ["Vout_V", "IL_A"]
+    meta = data.from_csv_bytes(raw, tpl, "log.csv", window=64, hop=64, licence="cc-by-nc",
+                               mapping={"label": "state", "segment": "run", "time": "ts", "channels": ["Vout_V", "IL_A"]})
+    assert meta["shape"] == [2, 1, 64] and meta["recordings"] == 4 and meta["commercial_use"] is False
+    assert any("jitter" in w for w in meta["warnings"])
+
+
+@need_sai
+def test_kws_frontend_package_finetune_and_evaluation_marker():
+    import zipfile
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as c:
+        c.headers.update(login(c))
+        b = wait_job(c, c.post("/api/studio/basetrain", json={"template_id": "kws", "sizes": ["tiny"], "per_class": 40,
+                                                              "epochs": 3}).json()["id"])
+        assert b["status"] == "succeeded", b["error"]
+        assert "kws" in c.get("/api/pool/weights").json()
+        ds = c.post("/api/datasets/demo", json={"template_id": "kws", "per_class": 40}).json()
+        assert ds["frontend"]["type"] == "mfcc" and ds["licence"] == "synthetic"
+        r = c.post("/api/projects", json={"name": "kws", "template_id": "kws", "dataset_id": ds["id"], "sizes": ["tiny"],
+                                          "epochs": 3, "targets": ["cortex-m7"], "init_from_pool": True}).json()
+        j = wait_job(c, r["job"]["id"])
+        assert j["status"] == "succeeded", j["error"]
+        logs = " ".join(x["line"] for x in j["logs"])
+        assert "fine-tuning from pool base weights" in logs
+        res = j["result"]
+        assert res["deployable"] is False and res["split_mode"] == "recording"
+        z = zipfile.ZipFile(io.BytesIO(c.get(f"/api/jobs/{j['id']}/download/package.zip").content))
+        names = set(z.namelist())
+        assert {"sai_package/frontend/sai_features.c", "sai_package/frontend/sai_frontend_config.h",
+                "sai_package/EVALUATION_ONLY.txt"} <= names
+        assert b"SAI_PACKAGE_EVALUATION_ONLY" in z.read("sai_package/sai_app.h")

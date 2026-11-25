@@ -183,6 +183,7 @@ function templateCard(t, sel) {
 
 route(/^\/pool$/, async (el) => {
   const cat = await api("/api/catalog");
+  await system();
   const domains = ["All", ...new Set(cat.map((t) => t.domain))];
   let dom = "All", q = "";
   el.innerHTML = `<div class="page-h"><div><h1>Model pool</h1><p class="muted">Ready-to-train model types. Every architecture uses only SAI's operators, so it compiles for every supported MCU.</p></div><a class="btn" href="#/studio">Create a model type →</a></div>
@@ -199,7 +200,9 @@ route(/^\/pool$/, async (el) => {
   $("#grid").onclick = (e) => { const c = e.target.closest("[data-tid]"); if (c) showTemplate(cat.find((t) => t.id === c.dataset.tid)); };
   function showTemplate(t) {
     $("#detail").innerHTML = `<div class="card" style="margin-top:16px"><div class="row"><span class="ic" style="font-size:26px">${esc(t.icon)}</span><div><h2 style="margin:0">${esc(t.name)}</h2><div class="muted small">${esc(t.domain)} · by ${esc(t.author)}</div></div><div class="spacer"></div>
+      ${ME && ME.perms.publish ? `<button class="btn" id="basetrain" data-t="${esc(t.id)}">Train base weights</button>` : ""}
       <a class="btn primary" href="#/new?template=${encodeURIComponent(t.id)}">Use this model type</a></div>
+      ${(SYS.pool_weights || {})[t.id] ? `<p class="small" style="margin-top:8px"><span class="badge b-ok">base weights</span> sizes ${Object.keys(SYS.pool_weights[t.id].sizes).join(", ")}, licence ${esc(SYS.pool_weights[t.id].licence)}: customers can fine-tune from them.</p>` : ""}
       <div class="grid g3" style="margin-top:14px">
         <div><h3>Use cases</h3><ul class="small" style="padding-left:18px;margin:0">${(t.use_cases || []).map((u) => `<li>${esc(u)}</li>`).join("")}</ul></div>
         <div><h3>Input</h3><div class="small">${esc(t.input.kind)} · ${t.input.channels} channel(s) ${esc((t.input.channel_names || []).join(", "))}<br>${t.input.height > 1 ? `${t.input.height}×${t.input.width} frames` : `window ${t.input.width} samples`}${t.input.sample_rate_hz ? ` @ ${fmt(t.input.sample_rate_hz)} Hz` : ""}</div>
@@ -208,12 +211,15 @@ route(/^\/pool$/, async (el) => {
       <h3 style="margin-top:12px">Size variants</h3><div class="tbl-wrap"><table class="t"><thead><tr><th>Size</th><th class="n">Params</th><th class="n">MACs</th><th>Layers</th></tr></thead><tbody>
       ${Object.entries(t.variants).map(([k, layers]) => `<tr><td>${k}</td><td class="n">${fmt(t.sizes[k]?.params)}</td><td class="n">${fmt(t.sizes[k]?.macs)}</td><td class="mono small">${layers.map((l) => l.op + (l.out ? l.out : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "")).join(" → ")} → fc(head)</td></tr>`).join("")}
       </tbody></table></div></div>`;
+    const bt = $("#basetrain");
+    if (bt) bt.onclick = async () => { const j = await api("/api/studio/basetrain", { json: { template_id: bt.dataset.t } }); SYS = null; location.hash = `#/job/${j.id}`; };
     $("#detail").scrollIntoView({ behavior: "smooth" });
   }
 });
 
 /* ------------------------------------------------------------------------------------------------ wizard */
 route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
+  SYS = null;
   const [cat, sys] = await Promise.all([api("/api/catalog"), system()]);
   const st = { step: pre ? 1 : 0, tpl: pre ? cat.find((t) => t.id === decodeURIComponent(pre)) : null, ds: null,
     targets: [], goal: "balanced", budgets: {}, metric: "", sizes: ["tiny", "small", "base"], epochs: 30, name: "" };
@@ -247,9 +253,9 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
         <div id="dsinfo"></div></div></div>
       ${nav(true, true, !!st.ds)}`;
     const tabs = {
-      up: () => `<div class="drop" id="drop">Drop a <b>.csv</b> or <b>.npz</b> here, or click to choose<input type="file" id="file" accept=".csv,.npz,.txt" hidden></div>
+      up: () => `${licSelect()}<div class="drop" id="drop" style="margin-top:10px">Drop a <b>.csv</b>, <b>.npz</b>${t.frontend ? " or a <b>.zip</b> of label folders with WAV files" : ""} here, or click to choose<input type="file" id="file" accept=".csv,.npz,.txt,.zip" hidden></div><div id="mapbox"></div>
         ${ts ? `<div class="row" style="margin-top:10px"><label class="f">Window<input id="win" type="number" value="${t.window}" style="width:100px"></label><label class="f">Hop<input id="hop" type="number" value="${t.hop}" style="width:100px"></label></div>` : ""}`,
-      url: () => `<label class="f">HTTPS link to a .csv or .npz<input id="url" placeholder="https://…/recordings.csv"></label><div class="row" style="margin-top:10px"><button class="btn" id="fetch">Fetch</button></div>`,
+      url: () => `${licSelect()}<label class="f" style="margin-top:10px">HTTPS link to a .csv, .npz or .zip<input id="url" placeholder="https://…/recordings.csv"></label><div class="row" style="margin-top:10px"><button class="btn" id="fetch">Fetch</button></div>`,
       demo: () => `<p class="small">Generate a <b>synthetic</b> dataset with the physics of this task, to try the whole pipeline now. Results on synthetic data say nothing about field accuracy.</p>
         <label class="f">Windows per class<input id="per" type="number" value="300" min="30" max="2000" style="width:120px"></label><div class="row" style="margin-top:10px"><button class="btn" id="gen" ${t.synth ? "" : "disabled"}>Generate demo data</button></div>`,
       soon: () => `<p class="small">Planned connectors (see the implementation plan):</p><ul class="small" style="padding-left:18px"><li>Board-farm data logger: capture straight from your sensor board</li><li>MQTT / OPC-UA live streams with labelling UI</li><li>S3 / GCS / Azure Blob buckets</li><li>Import from Edge Impulse projects or Kaggle datasets</li></ul>`,
@@ -262,15 +268,37 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
         d.ondragover = (e) => { e.preventDefault(); d.classList.add("hover"); }; d.ondragleave = () => d.classList.remove("hover");
         d.ondrop = (e) => { e.preventDefault(); d.classList.remove("hover"); e.dataTransfer.files[0] && upload(e.dataTransfer.files[0]); };
       }
-      if (k === "url") $("#fetch").onclick = () => doIngest(() => api("/api/datasets/url", { json: { template_id: t.id, url: $("#url").value, window: +($("#win")?.value || 0) || null } }));
+      if (k === "url") $("#fetch").onclick = () => doIngest(() => api("/api/datasets/url", { json: { template_id: t.id, url: $("#url").value, licence: $("#lic").value, window: +($("#win")?.value || 0) || null } }));
       if (k === "demo") $("#gen").onclick = () => doIngest(() => api("/api/datasets/demo", { json: { template_id: t.id, per_class: +$("#per").value } }));
     };
     $$(".tab", b).forEach((x) => (x.onclick = () => setTab(x.dataset.tab)));
     setTab("up");
+    function licSelect() {
+      return `<label class="f">Data licence<select id="lic">${Object.entries(LIC()).filter(([k]) => k !== "synthetic").map(([k, v]) => `<option value="${k}" ${k === "proprietary" ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></label>`;
+    }
     async function upload(file) {
-      const fd = new FormData(); fd.append("template_id", t.id); fd.append("file", file);
+      if (/\.(csv|txt)$/i.test(file.name)) return mapColumns(file);
+      send(file, null);
+    }
+    function send(file, mapping) {
+      const fd = new FormData(); fd.append("template_id", t.id); fd.append("file", file); fd.append("licence", $("#lic").value);
       if ($("#win")) { fd.append("window", $("#win").value); fd.append("hop", $("#hop").value); }
+      if (mapping) fd.append("mapping", JSON.stringify(mapping));
       doIngest(() => api("/api/datasets/upload", { method: "POST", body: fd }));
+    }
+    async function mapColumns(file) {
+      const fd = new FormData(); fd.append("file", file);
+      let pv; try { pv = await api("/api/datasets/preview", { method: "POST", body: fd }); } catch (e) { return toast(e.message); }
+      const opt = (sel) => `<option value="">—</option>${pv.header.map((h) => `<option ${h === sel ? "selected" : ""}>${esc(h)}</option>`).join("")}`;
+      $("#mapbox").innerHTML = `<div class="card" style="margin-top:12px"><h3>Map the columns of ${esc(file.name)} <span class="muted small">(${fmt(pv.n_rows)} rows)</span></h3>
+        <div class="grid g3"><label class="f">Label<select id="m_label">${opt(pv.guess.label)}</select></label><label class="f">Recording / segment<select id="m_seg">${opt(pv.guess.segment)}</select></label><label class="f">Time (for sample-rate checks)<select id="m_time">${opt(pv.guess.time)}</select></label></div>
+        <div class="small muted" style="margin-top:8px">Channels (expected ${t.input.channels}${(t.input.channel_names || []).length ? ": " + esc(t.input.channel_names.join(", ")) : ""})</div>
+        <div class="chips" style="margin-top:4px">${pv.header.map((h, i) => pv.numeric[i] ? `<label class="check small"><input type="checkbox" class="m_ch" value="${esc(h)}" ${pv.guess.channels.includes(h) ? "checked" : ""}>${esc(h)}</label>` : "").join("")}</div>
+        <div class="tbl-wrap" style="margin-top:10px"><table class="t"><thead><tr>${pv.header.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${pv.rows.slice(0, 6).map((r) => `<tr>${r.map((v) => `<td class="mono small">${esc(v)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
+        <div class="row" style="margin-top:10px"><button class="btn primary" id="m_go">Ingest with this mapping</button></div></div>`;
+      const sync = () => { const used = [$("#m_label").value, $("#m_seg").value, $("#m_time").value]; $$(".m_ch").forEach((c) => { if (used.includes(c.value)) c.checked = false; }); };
+      ["#m_label", "#m_seg", "#m_time"].forEach((id) => ($(id).onchange = sync)); sync();
+      $("#m_go").onclick = () => send(file, { label: $("#m_label").value || null, segment: $("#m_seg").value || null, time: $("#m_time").value || null, channels: $$(".m_ch:checked").map((x) => x.value) });
     }
     async function doIngest(fn) {
       $("#dsinfo").innerHTML = `<div class="callout info" style="margin-top:12px">Ingesting…</div>`;
@@ -297,6 +325,9 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
       <h3 style="margin-top:14px">Quality</h3><div class="grid g2">
         <label class="f">Minimum ${st.tpl.task === "classification" ? "accuracy" : st.tpl.task === "regression" ? "R²" : "AUC"} (0–1)<input id="mt" type="number" step="0.01" min="0" max="1" value="${st.metric}" placeholder="e.g. 0.95"></label>
         <label class="f">Training epochs<input id="ep" type="number" value="${st.epochs}" min="1" max="200"></label></div>
+      <h3 style="margin-top:14px">Training</h3><div class="stack">
+        <label class="check small"><input type="checkbox" id="ifp" ${st.initPool ? "checked" : ""} ${(SYS.pool_weights || {})[st.tpl.id] ? "" : "disabled"}>Fine-tune from the pool's base weights ${(SYS.pool_weights || {})[st.tpl.id] ? `<span class="badge b-ok">available</span>` : `<span class="muted">(none trained yet for this model type)</span>`}</label>
+        <label class="check small"><input type="checkbox" id="lrs" ${st.lrSearch ? "checked" : ""}>Learning-rate search (2 runs per size, keeps the best on validation)</label></div>
       <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label>`).join("")}</div>
       </div></div>${nav(true, true)}`;
     const help = { balanced: "Best mix of latency, RAM and flash among plans that fit.", fastest: "Lowest latency plan that fits.", "min-ram": "Smallest RAM (workspace + stack): leaves the most memory for your application.", "min-flash": "Smallest code + weights.", accuracy: "Most accurate size that fits, then balanced." };
@@ -306,7 +337,7 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
     const save = () => {
       st.targets = $$("input[name=tgt]:checked").map((x) => x.value); st.sizes = $$("input[name=sz]:checked").map((x) => x.value);
       st.budgets = { max_ram: +$("#mr").value || null, max_flash: +$("#mf").value || null, max_latency_ms: +$("#ml").value || null };
-      st.metric = $("#mt").value; st.epochs = +$("#ep").value || 30;
+      st.metric = $("#mt").value; st.epochs = +$("#ep").value || 30; st.initPool = $("#ifp").checked; st.lrSearch = $("#lrs").checked;
     };
     $("#back").onclick = () => { save(); st.step--; draw(); };
     $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length) return toast("Pick at least one size"); st.step++; draw(); };
@@ -326,7 +357,7 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
     $("#next").onclick = async () => {
       $("#next").disabled = true;
       try {
-        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs } });
+        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch } });
         location.hash = `#/job/${r.job.id}`;
       } catch (e) { toast(e.message); $("#next").disabled = false; }
     };
@@ -334,11 +365,17 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
   draw();
 });
 
+const LIC = () => (SYS && SYS.licences) || { proprietary: { label: "Own / proprietary data" } };
 function datasetSummary(d) {
   const prev = (d.preview || []).map((p) => `<div class="card" style="padding:8px"><div class="small"><b>${esc(p.label)}</b></div>${p.kind === "series" ? sparkSeries(p.series) : heat(p.image)}</div>`).join("");
   return `<div style="margin-top:12px" class="stack">
     <div class="row"><b>${esc(d.name)}</b>${d.synthetic ? `<span class="badge b-warn">synthetic</span>` : ""}<span class="badge">${fmt(d.n)} windows</span><span class="badge">input ${d.shape.join("×")}</span></div>
     ${d.class_counts ? bars(d.class_counts) : d.target_stats ? `<div class="small">target ${fmt(d.target_stats.min, 2)} … ${fmt(d.target_stats.max, 2)} (mean ${fmt(d.target_stats.mean, 2)})</div>` : ""}
+    <div class="row small"><span class="badge ${d.commercial_use ? "b-ok" : "b-warn"}">licence: ${esc((LIC()[d.licence] || {}).label || d.licence)}</span>
+      ${d.frontend ? `<span class="badge b-info">front end: ${esc(d.frontend.type)} (C, same as on the MCU)</span>` : ""}
+      ${d.recordings !== null && d.recordings !== undefined ? `<span class="badge">${fmt(d.recordings)} recordings</span>` : ""}
+      ${d.quality ? `<span class="badge">${d.quality.duplicate_windows} duplicates</span>` : ""}</div>
+    ${!d.commercial_use ? `<div class="callout">This licence does not allow commercial deployment: packages trained on it are marked <b>evaluation only</b>.</div>` : ""}
     ${(d.warnings || []).map((w) => `<div class="callout">${esc(w)}</div>`).join("")}
     <div class="grid g3">${prev}</div></div>`;
 }
@@ -380,6 +417,8 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     const sel = r.selected, v = r.variants.find((x) => x.size === sel.size), task = r.template.task;
     const mt = (m) => task === "classification" ? pct(m.value) : fmt(m.value, 3);
     $("#res").innerHTML = `
+    ${r.deployable === false ? `<div class="callout bad" style="margin-top:16px"><b>Evaluation only.</b> The dataset licence (${esc(r.dataset.licence)}) does not allow commercial use; the package carries an EVALUATION_ONLY marker and a compile-time warning.</div>` : ""}
+    ${r.split_mode ? `<p class="small muted" style="margin-top:10px">Test split: ${r.split_mode === "recording" ? "whole recordings held out (no leakage between windows of one recording)" : r.split_mode === "mixed" ? "recordings where available, windows elsewhere" : "random windows (no recording information in the data)"}.</p>` : ""}
     ${r.dataset.synthetic ? `<div class="callout" style="margin-top:16px">Trained on <b>synthetic demo data</b>. The pipeline, plans and resource numbers are real; the accuracy is not a field accuracy.</div>` : ""}
     <div class="hero" style="margin-top:16px">
       <div class="card"><div class="row"><h2 style="margin:0">Selected model</h2><span class="spacer"></span><span class="badge b-acc">${esc(sel.size)}</span><span class="badge" style="color:${TARGET_COLOR[sel.target]}">${esc(sel.target)}</span></div>

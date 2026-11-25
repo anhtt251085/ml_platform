@@ -12,20 +12,54 @@ import torch.nn as nn
 from . import archspec
 
 torch.set_num_threads(2)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")    # GPU workers train on CUDA
 
 
-def split(y, task, seed=0, frac=(0.7, 0.15, 0.15)):
+def split(y, task, seed=0, frac=(0.7, 0.15, 0.15), groups=None):
+    """Train/val/test indices. With recording groups, whole recordings go to one split (no window from a test
+    recording is ever seen in training), stratified by each recording's majority class; a class with fewer than
+    3 recordings falls back to a window-level split for that class (reported in `split_mode`)."""
     rng = np.random.default_rng(seed)
     idx = {"train": [], "val": [], "test": []}
-    groups = [np.arange(len(y))] if task == "regression" else [np.where(y == k)[0] for k in np.unique(y)]
-    for g in groups:
-        g = rng.permutation(g)
-        a, b = int(len(g) * frac[0]), int(len(g) * (frac[0] + frac[1]))
-        idx["train"] += list(g[:a]); idx["val"] += list(g[a:b]); idx["test"] += list(g[b:])
+    idx_mode = []
+    keys = [None] if task == "regression" else list(np.unique(y))
+    for k in keys:
+        members = np.arange(len(y)) if k is None else np.where(y == k)[0]
+        gs = None if groups is None else groups[members]
+        uniq = [] if gs is None else list(dict.fromkeys(gs.tolist()))
+        if gs is not None and len(uniq) >= 3 and len(uniq) < len(members):
+            order = rng.permutation(len(uniq))
+            sizes = {g: 0 for g in uniq}
+            for g in gs.tolist():
+                sizes[g] += 1
+            total, acc, parts = len(members), 0, {"train": [], "val": [], "test": []}
+            for i, oi in enumerate(order):
+                g = uniq[oi]
+                left = len(order) - i
+                if not parts["test"] and left == 1:
+                    dest = "test"
+                elif not parts["val"] and left == 2 and parts["train"]:
+                    dest = "val"
+                else:
+                    dest = "train" if acc < frac[0] * total else "val" if acc < (frac[0] + frac[1]) * total else "test"
+                parts[dest].append(g)
+                acc += sizes[g]
+            for dest, glist in parts.items():
+                gset = set(glist)
+                idx[dest] += [int(m) for m, g in zip(members, gs.tolist()) if g in gset]
+            idx_mode.append("recording")
+        else:
+            g = rng.permutation(members)
+            a, b = int(len(g) * frac[0]), int(len(g) * (frac[0] + frac[1]))
+            idx["train"] += list(g[:a]); idx["val"] += list(g[a:b]); idx["test"] += list(g[b:])
+            idx_mode.append("window")
     if task == "anomaly":                    # the autoencoder learns normal only; anomalies are for evaluation
         idx["train"] = [i for i in idx["train"] if y[i] == 0]
         idx["val"] = [i for i in idx["val"] if y[i] == 0]
-    return {k: np.array(v, dtype=int) for k, v in idx.items()}
+    out = {k: np.array(v, dtype=int) for k, v in idx.items()}
+    out["split_mode"] = "recording" if all(m == "recording" for m in idx_mode) else \
+        "mixed" if "recording" in idx_mode else "window"
+    return out
 
 
 def norm_stats(X):
@@ -43,7 +77,7 @@ def build_spec(layers, X, task, n_labels):
 def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500, log=lambda m: None, progress=lambda p: None,
           cancelled=lambda: False, y_stats=None, net=None):
     torch.manual_seed(0)
-    net = net if net is not None else archspec.SpecNet(spec)
+    net = (net if net is not None else archspec.SpecNet(spec)).to(DEVICE)
     n_train = len(idx["train"])
     batch = batch or int(min(64, max(16, n_train // 25)))
     # small datasets need more passes: at least `min_steps` optimizer updates in total
@@ -51,15 +85,15 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
     epochs = min(epochs, 300)
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(epochs, 1))
-    Xt = torch.from_numpy(Xn)
+    Xt = torch.from_numpy(Xn).to(DEVICE)
     if task == "classification":
         counts = np.bincount(y[idx["train"]], minlength=spec["outputs"]).astype(np.float32)
         w = torch.tensor(np.where(counts > 0, counts.sum() / np.maximum(counts, 1) / len(counts), 0), dtype=torch.float32)
-        loss_fn = nn.CrossEntropyLoss(weight=w)
-        yt = torch.from_numpy(y.astype(np.int64))
+        loss_fn = nn.CrossEntropyLoss(weight=w.to(DEVICE))
+        yt = torch.from_numpy(y.astype(np.int64)).to(DEVICE)
     elif task == "regression":
         loss_fn = nn.MSELoss()
-        yt = torch.from_numpy(((y - y_stats[0]) / y_stats[1]).astype(np.float32))[:, None]
+        yt = torch.from_numpy(((y - y_stats[0]) / y_stats[1]).astype(np.float32))[:, None].to(DEVICE)
     else:
         loss_fn = nn.MSELoss()
         yt = Xt.flatten(1)
@@ -75,7 +109,7 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
             b = perm[s:s + batch]
             xb = Xt[b]
             if task != "anomaly":            # light augmentation: gain jitter
-                xb = xb * (1 + 0.05 * torch.randn(len(b), 1, 1, 1))
+                xb = xb * (1 + 0.05 * torch.randn(len(b), 1, 1, 1, device=DEVICE))
             opt.zero_grad()
             loss = loss_fn(net(xb), yt[b])
             loss.backward()
@@ -94,16 +128,28 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
         if ep % 5 == 4 or ep == epochs - 1:
             log(f"  epoch {ep + 1}/{epochs} train {tot / max(len(perm), 1):.4f} val {vl:.4f}")
         if vl < best - 1e-5:
-            best, best_state, bad = vl, copy.deepcopy(net.state_dict()), 0
+            best, best_state, bad = vl, {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}, 0
         else:
             bad += 1
             if bad >= max(10, epochs // 5):
                 log(f"  early stop at epoch {ep + 1}")
                 break
+    net = net.cpu()
     if best_state is not None:
         net.load_state_dict(best_state)
     net.eval()
+    net.best_val = best
     return net, history
+
+
+def init_from(net, state: dict) -> list[str]:
+    """Fine-tuning start: copy every parameter whose name and shape match (the head is re-initialised when the
+    customer's label count differs). Returns the copied names."""
+    own = net.state_dict()
+    copied = [k for k, v in state.items() if k in own and own[k].shape == v.shape]
+    own.update({k: state[k] for k in copied})
+    net.load_state_dict(own)
+    return copied
 
 
 def qat_finetune(net, act_q, Xn, y, idx, task, epochs=10, log=lambda m: None, cancelled=lambda: False, y_stats=None):

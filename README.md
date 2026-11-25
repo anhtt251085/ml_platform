@@ -1,4 +1,4 @@
-# SAI Platform (v0.2: production foundation)
+# SAI Platform (v0.3: data & training depth)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -60,6 +60,7 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 | `backend/app.py` | FastAPI: auth, admin, catalog, datasets, projects, jobs, studio, explorer, boards, agent API, UI |
 | `backend/auth.py` | Orgs, users, roles, sessions, agent tokens, audit log, usage metering |
 | `backend/worker.py` | Standalone job worker (DB-backed queue) |
+| `frontends/` + `backend/features.py` | C feature front ends (MFCC, band energy) and their Python binding |
 | `Dockerfile`, `docker-compose.yml` | Image with SAI + pinned toolchains; API + worker services |
 | `backend/pipeline.py` | Job orchestration: train / fitcheck / analyze, packaging, model card, `sai_app.h` |
 | `backend/sai_engine.py` | The only door into SAI: `sai estimate/explore/compile/verify/inspect`; budgets, goals, latency labels |
@@ -82,6 +83,22 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
   enter calibration.
 * Synthetic demo data is labelled as synthetic in the dataset, the job page and the model card.
 
+## Data & training (M2)
+
+* **C feature front ends** (`frontends/sai_features.[ch]`): MFCC and log band energies in portable C (no heap,
+  ~1.6 KB on Cortex-M7). Training calls the same C through ctypes, so train and deploy features are identical;
+  packages ship the sources plus `sai_frontend_config.h` with the exact parameters. Keyword spotting takes raw
+  16 kHz WAV, vibration anomaly takes raw accelerometer windows.
+* **Uploads**: CSV with a column-mapping step (label / recording / time / channels), NPZ, ZIP of `<label>/*.wav`.
+* **Recording-level splits**: windows of one recording never straddle train and test (CSV segment, WAV speaker,
+  NPZ `groups`); the job page states the split used.
+* **Data quality report**: duplicates (and duplicates across recordings), clipping, recordings per class,
+  sample-period jitter from the time column.
+* **Licences**: every dataset records one; non-commercial, research-only, unknown and synthetic data produce
+  *evaluation-only* packages (marker file, `#warning`, model card).
+* **Pool base weights**: researchers train base weights per model type; customers fine-tune from them.
+* **Learning-rate search** (optional) and CUDA training when a GPU worker has one.
+
 ## Security model (M1)
 
 * Sign-in with email + password (scrypt); sessions are random tokens stored as SHA-256; HttpOnly cookie or bearer.
@@ -95,4 +112,4 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 ## Known limitations
 
 SQLite (one host; Postgres is a later swap of `db.conn`), local file storage, CPU training, one input/one output
-models, no C feature front end yet (M2), board farm simulated (M4). See `docs/IMPLEMENTATION_PLAN.md`.
+models, board farm simulated (M4). See `docs/IMPLEMENTATION_PLAN.md`.
