@@ -11,6 +11,8 @@
 #define SYST_CSR (*(volatile uint32_t *)0xE000E010u)
 #define SYST_RVR (*(volatile uint32_t *)0xE000E014u)
 #define SYST_CVR (*(volatile uint32_t *)0xE000E018u)
+#define SCB_ICSR (*(volatile uint32_t *)0xE000ED04u)
+#define PENDSTSET (1u << 26)
 
 static volatile uint32_t wraps;
 void SysTick_Handler(void) { wraps++; }
@@ -31,8 +33,22 @@ void port_putc(char c) {
 
 uint32_t port_cycles(void) {
     uint32_t w, v;
-    do { w = wraps; v = SYST_CVR; } while (w != wraps);
+    do {
+        w = wraps;
+        v = SYST_CVR;
+        /* reloaded but the wrap interrupt not yet taken (masked or pending): count that wrap now */
+        if ((SCB_ICSR & PENDSTSET) && v > 0x00800000u) w++;
+    } while (w != wraps && !(SCB_ICSR & PENDSTSET));
     return w * 0x01000000u + (0x00FFFFFFu - v);
+}
+
+void port_quiet(int on) { SYST_CSR = on ? 5u : 7u; }        /* keep counting, mask the wrap interrupt */
+const char *port_config(void) { return "clock=emulated icache=0 dcache=0"; }
+
+void port_trap(void) {
+    const char *m = "DONE trap\n";
+    while (*m) port_putc(*m++);
+    port_exit(3);
 }
 
 void port_exit(int code) {

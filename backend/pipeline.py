@@ -5,6 +5,7 @@ Cloud Tasks) when training moves to GPU workers."""
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import traceback
 import uuid
@@ -18,21 +19,35 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from . import archspec, config, data, db, exact_eval, features, qexport, sai_engine, trainer
+from . import archspec, config, data, db, exact_eval, features, preprocess, qexport, sai_engine, trainer
 from . import boards as boards_mod
 
 STAGES = {
-    "train": [("data", "Validate data"), ("train", "Train model sizes"), ("quantize", "INT8 quantization"),
+    "train": [("data", "Validate data"), ("preprocess", "Preprocess & normalize"), ("train", "Train model sizes"), ("quantize", "INT8 quantization"),
               ("plan", "SAI plan search"), ("select", "Select model + plan"), ("compile", "Compile + verify"),
               ("exact", "Bit-exact accuracy"), ("package", "Package")],
     "fitcheck": [("build", "Build graph"), ("quantize", "INT8 export"), ("plan", "SAI plan search")],
     "analyze": [("inspect", "Inspect model"), ("plan", "SAI plan search")],
     "rebuild": [("compile", "Recompile"), ("compare", "Compare with the original build")],
     "basetrain": [("data", "Prepare data"), ("train", "Train base weights"), ("save", "Store in the pool")],
+    "ingest": [("ingest", "Parse and validate"), ("store", "Store dataset")],
     "regression": [("plans", "Pool x boards plan check"), ("hil", "Emulated HIL smoke"), ("compare", "Compare with last run")],
 }
 KINDS = tuple(STAGES)
-STALE_RUNNING_S = 6 * 3600
+STALE_RUNNING_S = 30 * 60          # no heartbeat (log/save) for this long = the worker is gone
+
+
+def _finite(o):
+    """NaN/inf -> None, recursively, so results are valid JSON (the API refuses NaN)."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _finite(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_finite(v) for v in o]
+    if isinstance(o, np.generic):
+        return _finite(o.item())
+    return o
 GOALS = ("balanced", "fastest", "min-ram", "min-flash", "accuracy")
 
 
@@ -43,12 +58,18 @@ class Ctx:
         self.dir = config.DATA_DIR / "jobs" / job_id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.stages = [{"key": k, "title": t, "status": "pending"} for k, t in STAGES[kind]]
-        self.seq = 0
+        with db.conn() as c:            # a requeued job continues its log numbering
+            self.seq = c.execute("SELECT COALESCE(MAX(seq), 0) FROM job_logs WHERE job_id=?", (job_id,)).fetchone()[0]
+        self._beat = 0.0
 
     def log(self, line: str):
         self.seq += 1
+        now = db.now()
         with db.conn() as c:
-            c.execute("INSERT INTO job_logs VALUES (?,?,?,?)", (self.id, self.seq, db.now(), str(line)))
+            c.execute("INSERT INTO job_logs VALUES (?,?,?,?)", (self.id, self.seq, now, str(line)))
+            if now - self._beat > 30:       # heartbeat: a job that logs is alive (see requeue_stale)
+                c.execute("UPDATE jobs SET updated=? WHERE id=?", (now, self.id))
+                self._beat = now
 
     def _save(self, **fields):
         sets = ", ".join(f"{k}=?" for k in fields) + ", updated=?"
@@ -56,6 +77,8 @@ class Ctx:
             c.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*fields.values(), db.now(), self.id))
 
     def stage(self, key: str, status: str = "running", note: str | None = None):
+        if status == "running" and self.cancelled():
+            raise InterruptedError("cancelled")
         for i, s in enumerate(self.stages):
             if s["key"] == key:
                 s["status"] = status
@@ -78,7 +101,7 @@ class Ctx:
         return bool(r and r[0])
 
     def result(self, res: dict):
-        self._save(result=db.j(res))
+        self._save(result=json.dumps(_finite(res), default=str, allow_nan=False))
 
 
 def create(kind: str, params: dict, project_id: str | None = None, org_id: str | None = None,
@@ -137,7 +160,7 @@ def queue_stats() -> dict:
     with db.conn() as c:
         rows = c.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall()
         workers = [r[0] for r in c.execute("SELECT DISTINCT worker FROM jobs WHERE status='running'")]
-    return {"by_status": {r[0]: r[1] for r in rows}, "busy_workers": workers, "paused": _PAUSED.is_set()}
+    return {"by_status": {r[0]: r[1] for r in rows}, "busy_workers": workers, "paused": paused()}
 
 
 # ---- workers -----------------------------------------------------------------------------------------------------
@@ -146,7 +169,13 @@ _PAUSED = threading.Event()        # drain for maintenance: running jobs finish,
 
 
 def pause_workers(paused: bool):
+    """Shared by every worker process (stored in the database)."""
+    db.set_setting("queue_paused", bool(paused))
     (_PAUSED.set if paused else _PAUSED.clear)()
+
+
+def paused() -> bool:
+    return bool(db.get_setting("queue_paused", False)) or _PAUSED.is_set()
 
 
 def claim(worker: str, kinds: list[str] | None = None) -> dict | None:
@@ -176,17 +205,29 @@ def requeue_stale():
 
 
 def work_forever(name: str, kinds: list[str] | None = None, stop: threading.Event | None = None):
+    """Never dies: an error in the loop itself (e.g. a locked database) is logged and retried after a pause."""
     stop = stop or threading.Event()
+    last_reap = 0.0
     while not stop.is_set():
-        if _PAUSED.is_set():
-            stop.wait(0.5)
-            continue
-        job = claim(name, kinds)
-        if job:
-            _run(job["id"], job["kind"], job["params"] or {})
-            continue
-        _WAKE.wait(1.0)
-        _WAKE.clear()
+        try:
+            if time.time() - last_reap > 60:
+                requeue_stale()
+                last_reap = time.time()
+                if time.time() - float((db.get_setting("retention_last") or {}).get("at", 0)) > 3600:
+                    from . import retention
+                    retention.sweep()
+            if paused():
+                stop.wait(1.0)
+                continue
+            job = claim(name, kinds)
+            if job:
+                _run(job["id"], job["kind"], job["params"] or {})
+                continue
+            _WAKE.wait(1.0)
+            _WAKE.clear()
+        except Exception:                                   # noqa: BLE001
+            traceback.print_exc()
+            stop.wait(5.0)
 
 
 def start_inprocess_workers(n: int) -> list[threading.Thread]:
@@ -202,11 +243,16 @@ def start_inprocess_workers(n: int) -> list[threading.Thread]:
 
 
 def _run(jid: str, kind: str, params: dict):
-    ctx = Ctx(jid, kind)
     t0 = time.time()
     try:
+        ctx = Ctx(jid, kind)
+    except Exception as e:                                  # noqa: BLE001 - never leave the job "running"
+        with db.conn() as c:
+            c.execute("UPDATE jobs SET status='failed', error=?, updated=? WHERE id=?", (f"{type(e).__name__}: {e}", db.now(), jid))
+        return
+    try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
-         "basetrain": run_basetrain, "regression": _regression}[kind](ctx, params)
+         "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -250,14 +296,32 @@ def run_train(ctx: Ctx, p: dict):
     ctx.log(f"dataset {meta.get('name')} : {len(X)} windows, input {list(X.shape[1:])}, labels {labels}")
     for w in meta.get("warnings", []):
         ctx.log("warning: " + w)
+    pcfg = preprocess.normalize_cfg(p.get("preprocess"), meta, X.shape[1:], task)
+    sp = pcfg["split"]
     groups = data.load_groups(p["dataset_id"])
-    idx = trainer.split(y, task, groups=groups)
-    mean, std = trainer.norm_stats(X[idx["train"]])
-    Xn = ((X - mean) / std).astype(np.float32)
+    idx = trainer.split(y, task, groups=groups, frac=(sp["train"], sp["val"], sp["test"]), mode=sp["mode"])
+    for name in ("train", "val", "test"):
+        if len(idx[name]) == 0:
+            raise ValueError(f"the {name} split is empty: add data or change the split fractions")
     y_stats = (float(y[idx["train"]].mean()), float(y[idx["train"]].std() + 1e-6)) if task == "regression" else None
     ctx.log(f"split train {len(idx['train'])} / val {len(idx['val'])} / test {len(idx['test'])} "
             f"({idx['split_mode']}-level: {'whole recordings per split' if idx['split_mode'] == 'recording' else 'windows'})")
     ctx.stage("data", "done")
+
+    # 1b preprocess ------------------------------------------------------------------------------------------------
+    ctx.stage("preprocess")
+    raw_shape = list(X.shape[1:])
+    X = preprocess.window_ops(X, pcfg)
+    if pcfg["window_ops"]:
+        ctx.log(f"window steps (C): channels {pcfg['channels'] or 'all'}, decimate {pcfg['decimate']}, "
+                f"demean {pcfg['demean']}: {raw_shape} -> {list(X.shape[1:])}")
+    off, sc = preprocess.fit_norm(X[idx["train"]], pcfg)
+    Xn = preprocess.apply_norm(X, off, sc, pcfg["clip"])
+    mean, std = off.reshape(1, -1, 1, 1), sc.reshape(1, -1, 1, 1)
+    ctx.log(f"normalization {pcfg['normalization']} (fit on the train split)"
+            + (f", clip +-{pcfg['clip']}" if pcfg["clip"] else "")
+            + f"; augmentation {pcfg['augment']}; class weights {'on' if pcfg['class_weights'] else 'off'}")
+    ctx.stage("preprocess", "done")
 
     # 2 train ----------------------------------------------------------------------------------------------------
     ctx.stage("train")
@@ -284,6 +348,7 @@ def run_train(ctx: Ctx, p: dict):
                 ctx.log(f"size {size}: fine-tuning from pool base weights ({len(copied)} tensors copied)")
             kw = {"lr": lr if lr else (2e-3 if base is not None else 5e-3)}
             net, hist = trainer.train(spec, Xn, y, idx, task, epochs=epochs, log=ctx.log, cancelled=ctx.cancelled,
+                                      augment=pcfg["augment"], class_weights=pcfg["class_weights"],
                                       progress=lambda f, si=si: ctx.progress_within("train", (si + f) / len(sizes)),
                                       y_stats=y_stats, net=init, **kw)
             if len(lrs) > 1:
@@ -357,6 +422,10 @@ def run_train(ctx: Ctx, p: dict):
             else:
                 v["net"].load_state_dict(backup)
                 qat_path.unlink(missing_ok=True)
+        if task == "anomaly":      # the shipped threshold must match the INT8 program, not the float network
+            xvq = qexport.quantize_input(xv, v["q"]["input"])
+            vo = qexport.dequantize_output(qexport.ort_int8_outputs(path, xvq).reshape(len(xv), -1), v["q"]["output"])
+            v["threshold"] = float(np.percentile(((vo - xv.reshape(len(xv), -1)) ** 2).mean(1), 99))
         v["int8"] = int8_metric(v, path, xt, y[idx["test"]])
         ctx.log(f"size {v['size']}: INT8 ({v['quant_method']}, onnxruntime) test {v['int8']['headline']} = "
                 f"{v['int8']['value']} (float {v['float']['value']})")
@@ -384,11 +453,19 @@ def run_train(ctx: Ctx, p: dict):
     if not rows:
         raise ValueError("no trained size has a plan that fits the board and your limits. "
                          + (variants[0]["plans"].get("advice") or ""))
-    meets = [r for r in rows if acc_target in (None, "") or (r["metric"] or 0) >= float(acc_target)]
     note = None
-    if not meets:
-        note = f"no size reached the target {acc_target}; picked the best available"
-        meets = [r for r in rows if r["metric"] == max(x["metric"] or 0 for x in rows)]
+    if all(r["metric"] is None for r in rows):        # e.g. anomaly data without anomalies in the test split
+        meets = rows
+        if acc_target not in (None, "") or goal == "accuracy":
+            note = "the quality metric is undefined for this data (no test positives); chose by resources"
+        goal = "balanced" if goal == "accuracy" else goal
+    else:
+        meets = [r for r in rows if acc_target in (None, "") or (r["metric"] if r["metric"] is not None else -1e9)
+                 >= float(acc_target)]
+        if not meets:
+            note = f"no size reached the target {acc_target}; picked the best available"
+            top = max(x["metric"] for x in rows if x["metric"] is not None)
+            meets = [r for r in rows if r["metric"] == top]
     if goal == "accuracy":
         top = max(r["metric"] or 0 for r in meets)
         chosen = sai_engine._pick([r for r in meets if (r["metric"] or 0) >= top - 1e-9], "balanced")
@@ -435,22 +512,33 @@ def run_train(ctx: Ctx, p: dict):
     # 8 package --------------------------------------------------------------------------------------------------
     ctx.stage("package")
     pre = {"mean": mean.reshape(-1).tolist(), "std": std.reshape(-1).tolist(), "input": v["q"]["input"],
+           "preprocess": pcfg, "raw_shape": raw_shape, "model_input_shape": list(X.shape[1:]),
            "output": v["q"]["output"], "task": task, "labels": labels, "y_stats": y_stats,
            "threshold": v["threshold"], "layout": "NCHW, 1-D signals as [1, C, 1, T]",
            "frontend": meta.get("frontend")}
-    deployable = bool(meta.get("commercial_use"))
+    from . import commercial
+    with db.conn() as c:
+        org_id = (c.execute("SELECT org_id FROM jobs WHERE id=?", (ctx.id,)).fetchone() or [None])[0]
+    rights = commercial.deployment_rights(org_id)
+    deployable = bool(meta.get("commercial_use")) and rights
+    eval_reason = None if deployable else (
+        f"dataset licence '{meta.get('licence')}' does not allow commercial use" if not meta.get("commercial_use")
+        else "the organisation has no SAI deployment rights yet (royalty or buyout)")
     if not deployable:
-        ctx.log(f"dataset licence '{meta.get('licence')}' does not allow commercial use: package is EVALUATION ONLY")
+        ctx.log(f"{eval_reason}: package is EVALUATION ONLY")
     (ctx.dir / "preprocessing.json").write_text(json.dumps(pre, indent=1))
     (ctx.dir / "sai_app.h").write_text(_app_header(pre, tpl, deployable))
+    (ctx.dir / "sai_app_prepare.h").write_text(preprocess.c_prepare(pcfg, off, sc, v["q"]["input"],
+                                                                     raw_shape if pcfg["window_ops"] else list(X.shape[1:])))
     if meta.get("frontend"):
         (ctx.dir / "sai_frontend_config.h").write_text(features.config_header(meta["frontend"]))
     (ctx.dir / "main_example.c").write_text(_example_main(pre, tpl))
     report = {
-        "template": {k: tpl.get(k) for k in ("id", "name", "domain", "task")},
+        "template": {k: tpl.get(k) for k in ("id", "name", "domain", "task", "version", "source")},
+        "pool_benchmark": bool(p.get("pool_benchmark")),
         "dataset": {k: meta.get(k) for k in ("id", "name", "source", "n", "shape", "labels", "class_counts", "synthetic",
                                              "licence", "commercial_use", "recordings", "quality", "frontend")},
-        "deployable": deployable, "split_mode": idx["split_mode"],
+        "deployable": deployable, "evaluation_reason": eval_reason, "split_mode": idx["split_mode"],
         "goal": goal, "targets": targets, "budgets": p.get("budgets"), "metric_target": acc_target,
         "variants": [{"size": x["size"], "summary": {k: x["summary"][k] for k in ("macs", "params", "spatial_axes")},
                       "layers": x["summary"]["layers"], "spec": x["spec"], "float": x["float"], "int8": x["int8"],
@@ -468,19 +556,31 @@ def run_train(ctx: Ctx, p: dict):
         for f in sorted(build.rglob("*")):
             if f.is_file():
                 z.write(f, Path("sai_package") / f.relative_to(build))
-        for name in ("model.onnx", "preprocessing.json", "sai_app.h", "main_example.c", "report.json", "MODEL_CARD.md"):
+        for name in ("model.onnx", "preprocessing.json", "sai_app.h", "sai_app_prepare.h", "main_example.c",
+                     "report.json", "MODEL_CARD.md"):
             z.write(ctx.dir / name, Path("sai_package") / name)
+        for f in ("sai_prep.c", "sai_prep.h"):
+            z.write(preprocess.SRC / f, Path("sai_package") / f)
         if meta.get("frontend"):
             z.write(ctx.dir / "sai_frontend_config.h", Path("sai_package") / "frontend" / "sai_frontend_config.h")
             for f in ("sai_features.c", "sai_features.h"):
                 z.write(features.SRC / f, Path("sai_package") / "frontend" / f)
         if not deployable:
-            z.writestr("sai_package/EVALUATION_ONLY.txt", "Trained on data whose licence ("
-                       f"{meta.get('licence')}) does not allow commercial use. Not for deployment.\n")
+            z.writestr("sai_package/EVALUATION_ONLY.txt", f"Evaluation only: {eval_reason}. Not for deployment.\n")
+    sig = commercial.sign_package(ctx.dir / "package.zip", {
+        "job": ctx.id, "org": org_id, "deployable": deployable, "platform_version": config.PLATFORM_VERSION,
+        "sai_version": (man or {}).get("compiler_version"), "plan_digest": (man or {}).get("plan_digest"),
+        "target": chosen["target"]})
+    ctx.log(f"package signed (Ed25519, key {sig['key_id']})")
     ctx.log("package.zip ready")
     ctx.stage("package", "done")
     report["downloads"] = ["package.zip", "model.onnx", "report.json", "MODEL_CARD.md"]
-    report["selected_model_path"] = str(v["onnx"])
+    report["signature"] = sig
+    report["selected_model_path"] = str(ctx.dir / "model.onnx")
+    from . import retention
+    freed = retention.job_intermediates(ctx.dir)
+    if freed:
+        ctx.log(f"removed {freed / 1e6:.1f} MB of intermediates (per-size models, evaluation build)")
     ctx.result(report)
 
 
@@ -533,13 +633,20 @@ def run_analyze(ctx: Ctx, p: dict):
 
 
 # ------------------------------------------------------------------------------------------------------------------
-def start_board_run(job_id: str, target: str | None, board_id: str | None, org_id: str | None = None) -> dict:
+def start_board_run(job_id: str, target: str | None, board_id: str | None, org_id: str | None = None,
+                    allowed_kinds: list[str] | None = None) -> dict:
     job = get(job_id)
     if not job or job["status"] != "succeeded" or job["kind"] != "train":
         raise ValueError("board runs need a finished training job")
     res = job["result"]
     sel = res["selected"]
     target = target or sel["target"]
+    if target not in sai_engine.MCU_TARGETS:
+        raise ValueError(f"target must be one of {sai_engine.MCU_TARGETS}")
+    if board_id:
+        b = next((x for x in boards_mod.list_boards() if x["id"] == board_id), None)
+        if not b or b["target"] != target:
+            raise ValueError("that board does not exist or serves another target")
     cands = [c for v in res["variants"] if v["size"] == sel["size"] for c in v["plans"]["candidates"]
              if c["target"] == target]
     cand = next((c for c in cands if c["id"] == sel["id"]), None) or \
@@ -560,6 +667,7 @@ def start_board_run(job_id: str, target: str | None, board_id: str | None, org_i
            "estimated_ms": cand["latency"]["ms"], "estimate_evidence": cand["latency"]["evidence"],
            "stack_bound": cand.get("stack"), "expected_outputs": vec["expected"].tolist(),
            "plan_digest": cand.get("plan_digest"), "plan_name": cand.get("plan_name"), "build_dir": str(build_dir),
+           "allowed_kinds": allowed_kinds,
            "package": f"/api/jobs/{job_id}/download/package.zip"}
     return boards_mod.request_run(job_id, target, board_id, req, org_id)
 
@@ -646,13 +754,33 @@ def _onnx_macs(path: Path) -> int | None:
         return None
 
 
+def _cf(v) -> str:
+    """A C float literal ("5000" -> "5000.0f"; inf/nan cannot occur: the header is generated from finite values)."""
+    t = f"{float(v):.9g}"
+    return (t if any(ch in t for ch in ".en") else t + ".0") + "f"
+
+
+def _c_str(text: str) -> str:
+    """A C string literal for any label (quotes, backslashes, newlines, non-ASCII escaped)."""
+    out = []
+    for ch in str(text):
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif 32 <= ord(ch) < 127:
+            out.append(ch)
+        else:
+            out.extend(f"\\x{b:02x}\"\"" for b in ch.encode())
+    return '"' + "".join(out) + '"'
+
+
 def _app_header(pre: dict, tpl: dict, deployable: bool = True) -> str:
     mean, std = pre["mean"], pre["std"]
     s, z = pre["input"]["scale"], pre["input"]["zero_point"]
     a = [1.0 / (sd * s) for sd in std]
     b = [-m / (sd * s) + z for m, sd in zip(mean, std)]
     q16 = lambda v: int(round(v * 65536))  # noqa: E731
-    labels = ", ".join(f'"{l}"' for l in pre["labels"])
+    labels = ", ".join(_c_str(lb) for lb in pre["labels"])
+    int_ok = all(abs(v) * 65536 < 2 ** 31 - 1 for v in a + b)
     os_, oz = pre["output"]["scale"], pre["output"]["zero_point"]
     lines = [
         "/* Generated by SAI Platform: input quantization and output decoding for this model. */",
@@ -662,20 +790,22 @@ def _app_header(pre: dict, tpl: dict, deployable: bool = True) -> str:
         f"#define SAI_APP_CHANNELS {len(mean)}",
         f"#define SAI_APP_NUM_LABELS {len(pre['labels'])}",
         f"static const char *const sai_app_labels[] = {{ {labels} }};", "",
-        "/* q = clamp(round(x * A[c] + B[c])) with A, B in Q16.16: integer-only, raw sensor units in. */",
-        "static const int32_t sai_app_a_q16[] = { " + ", ".join(str(q16(v)) for v in a) + " };",
-        "static const int32_t sai_app_b_q16[] = { " + ", ".join(str(q16(v)) for v in b) + " };", "",
-        "static inline int8_t sai_app_quantize(int32_t raw, int c) {",
-        "    int64_t v = (int64_t)raw * sai_app_a_q16[c] + sai_app_b_q16[c];",
-        "    int32_t q = (int32_t)((v + (v >= 0 ? 32768 : -32768)) / 65536);",
-        "    return (int8_t)(q < -128 ? -128 : q > 127 ? 127 : q);", "}", "",
+        *(["/* q = clamp(round(x * A[c] + B[c])) with A, B in Q16.16: integer-only, raw sensor units in",
+            "   (approximate: use sai_app_prepare() from sai_app_prepare.h for the exact training preprocessing). */",
+            "static const int32_t sai_app_a_q16[] = { " + ", ".join(str(q16(v)) for v in a) + " };",
+            "static const int32_t sai_app_b_q16[] = { " + ", ".join(str(q16(v)) for v in b) + " };", "",
+            "static inline int8_t sai_app_quantize(int32_t raw, int c) {",
+            "    int64_t v = (int64_t)raw * sai_app_a_q16[c] + sai_app_b_q16[c];",
+            "    int32_t q = (int32_t)((v + (v >= 0 ? 32768 : -32768)) / 65536);",
+            "    return (int8_t)(q < -128 ? -128 : q > 127 ? 127 : q);", "}", ""] if int_ok else
+          ["/* No Q16 integer path: this input scaling does not fit Q16.16. Use sai_app_prepare() (float). */", ""]),
         "/* Floating-point version for float sensor units (MCUs with an FPU). */",
         "static inline int8_t sai_app_quantize_f(float x, int c) {",
-        "    static const float A[] = { " + ", ".join(f"{v:.9g}f" for v in a) + " };",
-        "    static const float B[] = { " + ", ".join(f"{v:.9g}f" for v in b) + " };",
+        "    static const float A[] = { " + ", ".join(_cf(v) for v in a) + " };",
+        "    static const float B[] = { " + ", ".join(_cf(v) for v in b) + " };",
         "    float q = x * A[c] + B[c]; q = q < -128.f ? -128.f : q > 127.f ? 127.f : q;",
         "    return (int8_t)(q >= 0 ? q + 0.5f : q - 0.5f);", "}", "",
-        f"#define SAI_APP_OUT_SCALE {os_:.9g}f", f"#define SAI_APP_OUT_ZP {oz}",
+        f"#define SAI_APP_OUT_SCALE {_cf(os_)}", f"#define SAI_APP_OUT_ZP {oz}",
     ]
     if pre["task"] == "classification":
         lines += ["", "/* Argmax over INT8 logits (one output scale, so the order is the float order). */",
@@ -686,9 +816,9 @@ def _app_header(pre: dict, tpl: dict, deployable: bool = True) -> str:
         m, sd = pre["y_stats"]
         lines += ["", f"/* {tpl['labels'][0]} = ((q - zp) * scale) * {sd:.6g} + {m:.6g} */",
                   "static inline float sai_app_decode(int8_t q) {",
-                  f"    return ((float)(q - SAI_APP_OUT_ZP) * SAI_APP_OUT_SCALE) * {sd:.9g}f + {m:.9g}f;", "}"]
+                  f"    return ((float)(q - SAI_APP_OUT_ZP) * SAI_APP_OUT_SCALE) * {_cf(sd)} + {_cf(m)};", "}"]
     else:
-        lines += ["", f"#define SAI_APP_ANOMALY_THRESHOLD {pre['threshold']:.9g}f",
+        lines += ["", f"#define SAI_APP_ANOMALY_THRESHOLD {_cf(pre['threshold'])}",
                   "/* score = mean((deq(out) - normalized input)^2); anomaly when score > threshold. */"]
     lines += ["", "#endif", ""]
     return "\n".join(lines)
@@ -765,14 +895,64 @@ int sai_infer(const float *raw) {{
 """
 
 
+def run_ingest(ctx: Ctx, p: dict):
+    """Large uploads are parsed by a worker, not by the API process: the file was streamed to uploads/."""
+    from . import store
+    path = Path(p["path"])
+    if config.DATA_DIR / "uploads" not in path.resolve().parents:
+        raise ValueError("bad staged upload path")
+    ctx.stage("ingest")
+    tpl = get_template(p["template_id"])
+    ctx.log(f"parsing {p['filename']} ({path.stat().st_size / 1e6:.1f} MB) for {tpl['name']}")
+    try:
+        meta = data.ingest_bytes(path.read_bytes(), p["filename"], tpl, window=p.get("window"), hop=p.get("hop"),
+                                 mapping=p.get("mapping"), licence=p.get("licence") or "unknown")
+    finally:
+        path.unlink(missing_ok=True)
+    ctx.log(f"{meta['n']:,} windows, input {meta['shape']}, {len(meta.get('warnings', []))} warning(s)")
+    ctx.stage("ingest", "done")
+    ctx.stage("store")
+    with db.conn() as c:
+        org_id = (c.execute("SELECT org_id FROM jobs WHERE id=?", (ctx.id,)).fetchone() or [None])[0]
+    store.add_dataset(meta, org_id)
+    ctx.stage("store", "done")
+    ctx.result({"dataset": {k: v for k, v in meta.items() if k != "preview"}, "dataset_id": meta["id"]})
+
+
 def _regression(ctx, p):
     from . import regression
     regression.run(ctx, p)
 
 
+def leaderboard() -> dict:
+    """Pool program leaderboard: per model type, every pool-benchmark project (real data, run by SAI research)
+    with its bit-exact accuracy and the resources of the selected plan; best first."""
+    with db.conn() as c:
+        rows = [db.row(r) for r in c.execute("SELECT id, params, result, updated FROM jobs WHERE kind='train' AND"
+                                             " status='succeeded' ORDER BY updated DESC LIMIT 500")]
+    out: dict[str, list] = {}
+    for r in rows:
+        params, res = db.uj(r["params"], {}), db.uj(r["result"], {})
+        if not params.get("pool_benchmark") or not res:
+            continue
+        sel, ds = res["selected"], res.get("dataset") or {}
+        v = next((x for x in res["variants"] if x["size"] == sel["size"]), {})
+        out.setdefault(res["template"]["id"], []).append({
+            "job_id": r["id"], "updated": r["updated"], "size": sel["size"], "target": sel["target"],
+            "metric": res["exact"]["headline"], "value": res["exact"]["value"], "float": v.get("float", {}).get("value"),
+            "ram": sel["ram"], "flash": sel["flash"], "latency": sel["latency"], "schedule": sel["schedule"],
+            "dataset": ds.get("name"), "licence": ds.get("licence"), "recordings": ds.get("recordings"),
+            "n": ds.get("n"), "split": res.get("split_mode"), "synthetic": bool(ds.get("synthetic")),
+            "template_version": res["template"].get("version"), "params": v.get("summary", {}).get("params"),
+            "macs": v.get("summary", {}).get("macs")})
+    for k in out:
+        out[k].sort(key=lambda e: (e["synthetic"], -(e["value"] or 0), e["ram"] or 1e12))
+    return out
+
+
 def pool_weights(tid: str, size: str) -> dict | None:
     f = config.DATA_DIR / "pool" / tid / f"{size}.pt"
-    return torch.load(f, map_location="cpu", weights_only=False) if f.exists() else None
+    return torch.load(f, map_location="cpu", weights_only=True) if f.exists() else None
 
 
 def pool_weights_index() -> dict:
@@ -829,8 +1009,8 @@ def _model_card(r: dict, tpl: dict, meta: dict) -> str:
     sel = r["selected"]
     v = next(x for x in r["variants"] if x["size"] == sel["size"])
     synthetic = "**Trained on SYNTHETIC demo data - not valid for field use.**\n\n" if meta.get("synthetic") else ""
-    if not meta.get("commercial_use"):
-        synthetic += f"**EVALUATION ONLY: dataset licence `{meta.get('licence')}` does not allow commercial deployment.**\n\n"
+    if not r.get("deployable", True):
+        synthetic += f"**EVALUATION ONLY: {r.get('evaluation_reason')}.**\n\n"
     return f"""# Model card - {tpl['name']}
 
 {synthetic}| | |

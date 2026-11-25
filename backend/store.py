@@ -36,6 +36,8 @@ def save_template(body: dict, org_id: str | None = None) -> dict:
     if not name:
         raise ValueError("name is required")
     tid = body.get("id") or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] + "-" + uuid.uuid4().hex[:4]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", str(tid)):
+        raise ValueError("template id: lowercase letters, digits and dashes, at most 48 characters")
     if tid in _BUILTIN:
         raise ValueError("built-in templates are read-only; save a copy under a new name")
     task = body.get("task", "classification")
@@ -49,6 +51,8 @@ def save_template(body: dict, org_id: str | None = None) -> dict:
         raise ValueError("a classifier needs at least two labels")
     variants = {}
     for size, layers in (body.get("variants") or {}).items():
+        if size not in ("tiny", "small", "base"):
+            raise ValueError("variant sizes are tiny, small and base")
         if not layers:
             continue
         n_out = len(labels) if task == "classification" else 1 if task == "regression" else \
@@ -64,7 +68,9 @@ def save_template(body: dict, org_id: str | None = None) -> dict:
                   "height": int(inp.get("height", 1)), "width": int(inp.get("width", 128)),
                   "sample_rate_hz": inp.get("sample_rate_hz"), "channel_names": inp.get("channel_names") or []},
         "labels": labels, "window": int(inp.get("width", 128)) if int(inp.get("height", 1)) == 1 else None,
-        "hop": body.get("hop") or max(1, int(inp.get("width", 128)) // 2), "synth": body.get("synth") or None,
+        "hop": int(body.get("hop") or max(1, int(inp.get("width", 128)) // 2)),
+        "synth": body.get("synth") if body.get("synth") in ("bearing", "motor_current", "arc_fault", "dcdc", "battery",
+                                                            "har", "ecg", "gas", "vib_anomaly", "kws", "thermal") else None,
         "variants": variants, "targets": body.get("targets") or ["md6605", "cortex-m7"],
         "datasets_hint": body.get("datasets_hint") or "", "status": body.get("status", "draft"),
         "author": body.get("author") or "researcher", "source": "studio",
@@ -96,8 +102,8 @@ def add_dataset(meta: dict, org_id: str | None = None):
 
 def datasets(template_id: str | None = None, org_id: str | None = None) -> list[dict]:
     with db.conn() as c:
-        q = "SELECT body FROM datasets" + (" WHERE org_id=?" if org_id else "") + " ORDER BY created DESC"
-        rows = [db.uj(r[0]) for r in c.execute(q, (org_id,) if org_id else ())]
+        q = "SELECT body, created FROM datasets" + (" WHERE org_id=?" if org_id else "") + " ORDER BY created DESC"
+        rows = [{**db.uj(r[0]), "created": r[1]} for r in c.execute(q, (org_id,) if org_id else ())]
     rows = [r for r in rows if not template_id or r.get("template") == template_id]
     for r in rows:
         r.pop("preview", None)
@@ -106,8 +112,26 @@ def datasets(template_id: str | None = None, org_id: str | None = None) -> list[
 
 def dataset(did: str) -> dict | None:
     with db.conn() as c:
-        r = c.execute("SELECT body FROM datasets WHERE id=?", (did,)).fetchone()
-    return db.uj(r[0]) if r else None
+        r = c.execute("SELECT body, created FROM datasets WHERE id=?", (did,)).fetchone()
+    return {**db.uj(r[0]), "created": r[1]} if r else None
+
+
+def dataset_usage(did: str) -> list[dict]:
+    with db.conn() as c:
+        return [db.row(r) for r in c.execute("SELECT p.id, p.name, p.job_id, j.status FROM projects p LEFT JOIN jobs j"
+                                             " ON j.id = p.job_id WHERE p.dataset_id=? ORDER BY p.created DESC", (did,))]
+
+
+def delete_dataset(did: str):
+    """Remove the dataset's rows and files. Finished projects keep their reports, models and packages."""
+    import re
+    import shutil
+    from . import config
+    if not re.fullmatch(r"ds_[0-9a-f]{10}", did):
+        raise ValueError("bad dataset id")
+    with db.conn() as c:
+        c.execute("DELETE FROM datasets WHERE id=?", (did,))
+    shutil.rmtree(config.DATA_DIR / "datasets" / did, ignore_errors=True)
 
 
 def create_project(name, template_id, dataset_id, cfg, job_id, org_id=None) -> dict:

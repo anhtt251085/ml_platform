@@ -19,3 +19,6 @@ uint32_t port_cycles(void) {
 }
 
 void port_exit(int code) { (void)code; for (;;) {} }
+void port_quiet(int on) { (void)on; }
+const char *port_config(void) { return "clock=66666666 icache=0 dcache=0"; }
+void port_trap(void) { port_exit(3); }

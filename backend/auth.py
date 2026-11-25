@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import time
 import uuid
 
 from fastapi import Depends, Header, HTTPException, Request
@@ -119,11 +120,30 @@ def users(org_id: str | None = None) -> list[dict]:
                                      else c.execute(q + " ORDER BY created"))]
 
 
-def login(email: str, password: str) -> tuple[str, dict]:
+_FAILS: dict[str, list[float]] = {}
+FAIL_WINDOW_S, FAIL_MAX = 15 * 60, 10
+
+
+def verify_password(email: str, password: str) -> dict:
+    """Check credentials without creating a session. Throttled: FAIL_MAX failures per email per FAIL_WINDOW_S."""
+    key = email.strip().lower()
+    now = time.time()
+    recent = [t for t in _FAILS.get(key, []) if now - t < FAIL_WINDOW_S]
+    if len(recent) >= FAIL_MAX:
+        raise PermissionError("too many failed sign-ins; try again in 15 minutes")
     with db.conn() as c:
-        r = db.row(c.execute("SELECT * FROM users WHERE email=?", (email.strip().lower(),)).fetchone())
+        r = db.row(c.execute("SELECT * FROM users WHERE email=?", (key,)).fetchone())
     if not r or r["disabled"] or not check_pw(password, r["pw_hash"]):
+        _FAILS[key] = recent + [now]
         raise PermissionError("wrong email or password")
+    _FAILS.pop(key, None)
+    return r
+
+
+def login(email: str, password: str) -> tuple[str, dict]:
+    r = verify_password(email, password)
+    with db.conn() as c:
+        c.execute("DELETE FROM sessions WHERE expires<?", (db.now(),))
     return new_session(r["id"]), user(r["id"])
 
 
@@ -151,8 +171,9 @@ def bootstrap():
     create_user(PLATFORM_ORG, email, "Platform admin", "platform_admin", pw)
     if not os.environ.get("SAI_PLATFORM_ADMIN_PASSWORD"):
         p = config.DATA_DIR / "ADMIN_PASSWORD"
-        p.write_text(f"{email}\n{pw}\n")
-        p.chmod(0o600)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{email}\n{pw}\n")
         print(f"[sai-platform] created {email}; password in {p}")
 
 
