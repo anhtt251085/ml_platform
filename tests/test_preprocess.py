@@ -12,6 +12,8 @@ os.environ.setdefault("SAI_PLATFORM_DATA", tempfile.mkdtemp(prefix="saiplat-"))
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
+from tests.approval_helper import release  # noqa: E402
+
 from backend import preprocess  # noqa: E402
 
 META = {}
@@ -162,6 +164,7 @@ def test_project_with_window_steps_ships_prepare_and_stays_exact():
         r = j["result"]
         assert r["preprocessing"]["model_input_shape"] == [4, 1, 64] and r["preprocessing"]["raw_shape"] == [6, 1, 128]
         assert r["exact"]["value"] is not None
+        release(c, j["id"])
         z = zipfile.ZipFile(io.BytesIO(c.get(f"/api/jobs/{j['id']}/download/package.zip").content))
         names = set(z.namelist())
         assert {"sai_package/sai_app_prepare.h", "sai_package/sai_prep.c", "sai_package/sai_prep.h"} <= names

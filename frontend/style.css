@@ -1,3 +1,4 @@
+[hidden] { display: none !important; }
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --line: #e3e6eb; --text: #16191f; --muted: #646b78;
   --accent: #2f5bea; --accent-soft: #e8eeff; --ok: #12805c; --ok-soft: #e3f5ee; --warn: #a15c00; --warn-soft: #fff3df;
@@ -122,6 +123,8 @@ table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
 .progress > i { display: block; height: 100%; background: var(--accent); transition: width .3s; }
 
 .log { background: #0f1216; color: #cdd3dc; font: 12px/1.5 var(--mono); border-radius: 8px; padding: 10px 12px; max-height: 280px; overflow: auto; white-space: pre-wrap; }
+.nav-count { background: var(--warn); color: #fff; border-radius: 9px; font-size: 11px; padding: 0 6px; margin-left: 4px; }
+.b-pend { background: var(--warn-soft); color: var(--warn); }
 .log .lw { color: #f5c26b; }
 .log .le { color: #ff8a80; }
 .log .ls { color: #8ab4ff; font-weight: 600; }

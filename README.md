@@ -24,6 +24,11 @@ SAI_REPO=/path/to/sai-compiler-checkout docker compose up -d --build     # http:
 
 * The image contains no SAI compiler code: the checkout is mounted read-only at run time and the compiler runs in
   place from it (`bin/sai`).
+* Roles (every organisation): **engineer** (projects, datasets, jobs, board runs; no research pages),
+  **researcher** (+ Model Studio, Plan Explorer), **manager** (+ approves compiled-package downloads, never their
+  own request), **admin** (everything in the organisation, Admin console). Admins of the SAI organisation are the
+  platform admins. The compiled package (`package.zip`), the model (`model.onnx`) and the report (`report.json`) download
+  only after a manager's approval (Compiled packages page); the model card stays freely downloadable.
 * `SAI_PLATFORM_MODE=multi` (default): multi-tenant SaaS. SAI admins create customer organisations and invite users
   (no public sign-up).
 * `SAI_PLATFORM_MODE=single SAI_PLATFORM_ORG_NAME="Acme"`: one customer per install (on-prem / customer VPC).
@@ -77,6 +82,7 @@ The SAI-dependent tests and the pool x board regression run on a machine with th
 | `frontends/` + `backend/features.py` | C feature front ends (MFCC, band energy) and their Python binding |
 | `harness/` + `backend/hil.py` | HIL harness firmware, board ports, QEMU runner |
 | `backend/trainer.py` | Training (settings in `TRAIN_DEFAULTS`: optimizer, LR and schedule, batch, early stopping, clip, label smoothing, seed, QAT), per-epoch metrics for the live monitor |
+| `backend/approvals.py` | Compiled packages and their release approval (request → manager approves/rejects → download; revoke; audited) |
 | `backend/recommend.py` | Architecture recommender: data profile → rules → candidates → exact SAI cost per board → pick for the goal |
 | `backend/regression.py` | Nightly pool x boards regression |
 | `Dockerfile`, `docker-compose.yml` | Image with SAI + pinned toolchains; API + worker services |

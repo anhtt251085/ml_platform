@@ -180,6 +180,7 @@ function projectsTable(rows) {
   ${rows.map((p) => `<tr><td><a href="#/job/${esc(p.job_id)}">${esc(p.name)}</a></td><td>${esc(p.template_id)}</td><td>${esc(GOAL_LABEL[p.config.goal] || p.config.goal)}</td>
     <td>${statusBadge(p.job_status, p.job_progress)}</td><td class="muted">${ago(p.created)}</td></tr>`).join("")}</tbody></table></div>`;
 }
+const GATED = ["package.zip", "model.onnx", "report.json"];   // downloads that need a manager's approval
 function dur(sec) {
   if (sec === null || sec === undefined || !isFinite(sec)) return "–";
   sec = Math.max(0, Math.round(sec));
@@ -570,6 +571,62 @@ function datasetSummary(d) {
 }
 
 /* ------------------------------------------------------------------------------------------------ job page */
+async function refreshPending() {
+  const el = $("#pendingCount"); if (!el || !ME) return;
+  try {
+    const r = await api("/api/packages?status=pending");
+    const n = r.can_approve ? r.packages.filter((p) => p.approval.requested_by !== ME.id).length : 0;
+    el.hidden = !n; el.textContent = n;
+  } catch { /* not signed in yet */ }
+}
+
+route(/^\/packages$/, async (el) => {
+  let status = "";
+  const ST = { not_requested: ["not requested", ""], pending: ["pending approval", "b-pend"], approved: ["approved", "b-ok"], rejected: ["rejected", "b-bad"], revoked: ["revoked", "b-bad"] };
+  el.innerHTML = `<div class="page-h"><div><h1>Compiled packages</h1><p class="muted">Every compiled package the backend has produced (SAI-generated C sources, runtime, headers, manifest, memory certificate, signature) with its model and report. These files leave only with a manager's approval; every request, decision and download is audited.</p></div></div>
+    <div class="kpis" id="pk"></div><div class="chips" id="pf" style="margin:14px 0">${[["", "All"], ["pending", "Pending"], ["approved", "Approved"], ["not_requested", "Not requested"], ["rejected", "Rejected"], ["revoked", "Revoked"]].map(([k, v]) => `<button class="chip ${k === status ? "on" : ""}" data-s="${k}">${v}</button>`).join("")}</div>
+    <div class="card"><div class="tbl-wrap" id="pt"></div></div><div id="pd"></div>`;
+  async function load() {
+    const all = await api("/api/packages");
+    const can = all.can_approve, list = all.packages.filter((p) => !status || p.approval.status === status);
+    const cnt = (s) => all.packages.filter((p) => p.approval.status === s).length;
+    $("#pk").innerHTML = [["Packages", all.packages.length], ["Pending approval", cnt("pending")], ["Approved", cnt("approved")], ["Downloads", all.packages.reduce((a, p) => a + (p.approval.downloads || 0), 0)]].map(([l, v]) => `<div class="kpi"><div class="l">${l}</div><div class="v">${fmt(v)}</div></div>`).join("");
+    $("#pt").innerHTML = list.length ? `<table class="t"><thead><tr><th>Project</th><th>Board · plan</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Accuracy</th><th>SAI</th><th>Built</th><th>Approval</th><th class="n">Downloads</th><th></th></tr></thead><tbody>
+      ${list.map((p) => { const a = p.approval, [lab, cls] = ST[a.status];
+        const acts = [];
+        if (a.status === "approved") acts.push(`<a class="btn primary sm" href="/api/jobs/${esc(p.job_id)}/download/package.zip" title="compiled package">⬇ package</a><a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/model.onnx">model</a><a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/report.json">report</a>`);
+        if (["not_requested", "rejected", "revoked"].includes(a.status)) acts.push(`<button class="btn sm" data-act="request" data-j="${esc(p.job_id)}">Request</button>`);
+        if (a.status === "pending" && can && a.requested_by !== ME.id) acts.push(`<button class="btn primary sm" data-act="approve" data-j="${esc(p.job_id)}">Approve</button><button class="btn sm" data-act="reject" data-j="${esc(p.job_id)}">Reject</button>`);
+        if (a.status === "pending" && can && a.requested_by === ME.id) acts.push(`<span class="small muted">your request: another manager decides</span>`);
+        if (a.status === "approved" && can) acts.push(`<button class="btn sm ghost" data-act="revoke" data-j="${esc(p.job_id)}">Revoke</button>`);
+        return `<tr><td><a href="#/job/${esc(p.job_id)}"><b>${esc(p.project || p.job_id)}</b></a><div class="small muted">${esc(p.template_id || "")}${ME.perms.platform_admin ? ` · ${esc(p.org_name || "")}` : ""}${p.deployable === false ? ` · <span class="badge b-warn">evaluation only</span>` : ""}</div></td>
+          <td class="small">${esc(p.target || "")} · <code>${esc(p.plan || "")}</code><div class="muted">size ${esc(p.size || "")}${p.signed_key ? ` · signed ${esc(p.signed_key)}` : ""}</div></td>
+          <td class="n">${bytes(p.ram)}</td><td class="n">${bytes(p.flash)}</td><td class="n">${p.metric === "accuracy" ? pct(p.accuracy) : fmt(p.accuracy, 3)}</td><td class="mono small">${esc(p.sai || "")}</td><td class="small muted">${ago(p.built)}</td>
+          <td><span class="badge ${cls}">${lab}</span>${a.requested_by_name ? `<div class="small muted">req. ${esc(a.requested_by_name)} ${ago(a.requested_at)}${a.request_note ? `: “${esc(a.request_note)}”` : ""}</div>` : ""}${a.decided_by_name ? `<div class="small muted">${esc(a.status)} by ${esc(a.decided_by_name)} ${ago(a.decided_at)}${a.decision_note ? `: “${esc(a.decision_note)}”` : ""}</div>` : ""}</td>
+          <td class="n">${fmt(a.downloads || 0)}</td><td><div class="row" style="gap:6px;flex-wrap:nowrap">${acts.join("")}</div><a class="small" href="#" data-hist="${esc(p.job_id)}">history</a></td></tr>`; }).join("")}</tbody></table>`
+      : `<div class="empty small">No ${status ? (ST[status] || [status])[0] + " " : ""}packages. A package appears here when a project finishes.</div>`;
+    refreshPending();
+  }
+  el.onclick = async (e) => {
+    const t = e.target;
+    if (t.dataset.s !== undefined && t.classList.contains("chip")) { status = t.dataset.s; $$("#pf .chip").forEach((c) => c.classList.toggle("on", c.dataset.s === status)); return load(); }
+    if (t.dataset.hist) {
+      e.preventDefault();
+      const d = await api(`/api/packages/${t.dataset.hist}`);
+      $("#pd").innerHTML = `<div class="card" style="margin-top:16px"><h2>History · ${esc(t.dataset.hist)}</h2>${d.history.length ? `<table class="t"><tbody>${d.history.map((h) => `<tr><td class="small muted">${new Date(h.ts * 1000).toLocaleString()}</td><td>${esc(h.action.replace("package_", ""))}</td><td class="small">${esc(h.email || "")}</td><td class="small">${esc((h.detail && (h.detail.note || h.detail.file)) || "")}</td></tr>`).join("")}</tbody></table>` : `<p class="small muted">No activity yet.</p>`}</div>`;
+      $("#pd").scrollIntoView({ behavior: "smooth" });
+      return;
+    }
+    const act = t.dataset.act, j = t.dataset.j;
+    if (!act) return;
+    const ask = { request: "Why do you need the compiled package? (shown to the approving manager)", approve: "Approval note (optional)", reject: "Reason for rejecting (required)", revoke: "Reason for revoking (required)" }[act];
+    const note = prompt(ask, "");
+    if (note === null) return;
+    try { await api(`/api/packages/${j}/${act}`, { json: { note } }); toast({ request: "Requested", approve: "Approved", reject: "Rejected", revoke: "Revoked" }[act]); load(); } catch (err) { toast(err.message); }
+  };
+  load();
+});
+
 route(/^\/jobs$/, async (el) => {
   let timer = null, kind = "", status = "";
   el.innerHTML = `<div class="page-h"><div><h1>Jobs &amp; logs</h1><p class="muted">Every training run, recommendation, import, rebuild and regression, live. Open a job for its training monitor and full log.</p></div></div>
@@ -608,7 +665,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
         if (job.kind === "recommend" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawRecommend(job.result); }
         if (job.kind === "ingest" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; $("#res").innerHTML = `<div class="callout ok" style="margin-top:16px">Dataset imported: <a href="#/data/${esc(job.result.dataset_id)}">open it</a>.</div>`; return; }
         if (["rebuild", "regression", "basetrain"].includes(job.kind) && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawPlansOnly(job.result); }
-        if (rendered !== job.status) { rendered = job.status; drawResult(); }
+        if (rendered !== job.status) { rendered = job.status; drawResult(); if (job.kind === "train" && job.status === "succeeded") drawPackageButton().catch(() => {}); }
         return;
       }
     } catch (e) { if (e instanceof Stale) return; toast(e.message); }
@@ -680,6 +737,26 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     lg.scrollTop = logFollow ? lg.scrollHeight : logTop;
     logShown = logs.length;
   }
+  async function drawPackageButton() {
+    const b = $("#pkgbtn"); if (!b) return;
+    const a = await api(`/api/packages/${jid}`);
+    const who = (x) => esc(x || "");
+    if (a.status === "approved") {
+      b.innerHTML = GATED.map((d, i) => `<a class="btn ${i ? "" : "primary"} sm" href="/api/jobs/${jid}/download/${d}">${i ? "" : "⬇ "}${d}</a>`).join("");
+      $("#pkgnote").innerHTML = `<span class="badge b-ok">approved</span> by ${who(a.decided_by_name)} ${ago(a.decided_at)}${a.decision_note ? ` – “${esc(a.decision_note)}”` : ""} · <a href="#/packages">Compiled packages</a>`;
+    } else if (a.status === "pending") {
+      b.innerHTML = `<button class="btn sm" disabled>⏳ package, model &amp; report awaiting approval</button>`;
+      $("#pkgnote").innerHTML = `Requested by ${who(a.requested_by_name)} ${ago(a.requested_at)}. A manager approves it on <a href="#/packages">Compiled packages</a>.`;
+    } else {
+      b.innerHTML = `<button class="btn primary sm" id="pkgreq">Request download (package, model, report)</button>`;
+      $("#pkgnote").innerHTML = a.status === "not_requested" ? `The compiled package, the model and the report are released after a manager's approval.` : `<span class="badge b-bad">${esc(a.status)}</span> ${esc(a.decision_note || "")} – you can request again.`;
+      $("#pkgreq").onclick = async () => {
+        const note = prompt("Why do you need the compiled package? (shown to the approving manager)", "");
+        if (note === null) return;
+        try { await api(`/api/packages/${jid}/request`, { json: { note } }); toast("Requested: a manager will review it"); drawPackageButton(); refreshPending(); } catch (e) { toast(e.message); }
+      };
+    }
+  }
   function drawRecommend(r) {
     const rec = r.recommended;
     $("#res").innerHTML = `<div class="card" style="margin-top:16px"><h2>Recommendation</h2>${rec ? `<div class="callout ok"><b>${esc(rec.id)}</b>: ${esc(r.why)}. ${fmt(rec.params)} params, ${fmt(rec.macs)} MACs; worst board ${bytes(rec.ram)} RAM, ${bytes(rec.flash)} flash, ${ms(rec.latency_ms)}.</div>` : `<div class="callout warn">${esc(r.why)}</div>`}
@@ -710,7 +787,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
         <div class="stat"><span class="l">INT8 (${esc(v.quant_method || "PTQ")})</span><span class="big">${mt(v.int8)}</span></div>
         <div class="stat"><span class="l">Deployed C, bit-exact</span><span class="big" style="color:var(--ok)">${mt(r.exact)}</span></div></div>
         <p class="small muted" style="margin-top:8px">SAI verify: <b>${r.verify.passed}/${r.verify.total}</b> checks passed (manifest, hashes, memory certificate replay, SBOM, reproducible library…)${r.certificate_check ? ` · certificate re-derived by <code>sai certify --check</code>: <b>${r.certificate_check.passed}/${r.certificate_check.total}</b>` : ""}</p>
-        <div class="row" style="margin-top:10px">${r.downloads.map((d) => `<a class="btn ${d === "package.zip" ? "primary" : ""} sm" href="/api/jobs/${jid}/download/${d}">${d === "package.zip" ? "⬇ " : ""}${esc(d)}</a>`).join("")}</div></div></div>
+        <div class="row" style="margin-top:10px"><span id="pkgbtn" class="row" style="gap:8px"></span>${r.downloads.filter((d) => !GATED.includes(d)).map((d) => `<a class="btn sm" href="/api/jobs/${jid}/download/${d}">${esc(d)}</a>`).join("")}</div><div id="pkgnote" class="small" style="margin-top:6px"></div></div></div>
     <div class="card" style="margin-top:16px"><h2>Model sizes</h2><div class="tbl-wrap"><table class="t"><thead><tr><th>Size</th><th class="n">Params</th><th class="n">MACs</th><th class="n">Float</th><th class="n">INT8</th><th>Quant</th><th class="n">Plans that fit</th><th>Best plan for goal</th></tr></thead><tbody>
       ${r.variants.map((x) => { const rec = x.plans.recommended; return `<tr class="${x.size === sel.size ? "rec" : ""}"><td><b>${x.size}</b></td><td class="n">${fmt(x.summary.params)}</td><td class="n">${fmt(x.summary.macs)}</td><td class="n">${mt(x.float)}</td><td class="n">${mt(x.int8)}</td><td>${esc(x.quant_method || "PTQ")}</td><td class="n">${x.plans.feasible}/${x.plans.candidates.length}</td><td class="small">${rec ? `${esc(rec.target)} · ${bytes(rec.ram)} RAM · ${ms(rec.latency.ms)}` : `<span class="muted">${esc(x.plans.advice || "none")}</span>`}</td></tr>`; }).join("")}
     </tbody></table></div></div>
@@ -833,7 +910,11 @@ const BLANK = () => ({ name: "", domain: "", icon: "🧪", task: "classification
   input: { kind: "timeseries", channels: 3, height: 1, width: 128, sample_rate_hz: 100 }, datasets_hint: "", synth: "",
   variants: { tiny: [{ op: "conv", out: 8, k: 5, stride: 2, relu: true }, { op: "dwconv", k: 3, relu: true }, { op: "pwconv", out: 16, relu: true }, { op: "gap" }], small: [], base: [] } });
 
+function noAccess(el, what) {
+  el.innerHTML = `<div class="page-h"><div><h1>${esc(what)}</h1></div></div><div class="callout bad">Your role (<b>${esc(ME.role)}</b>) cannot open ${esc(what)}. Research pages are for researchers, managers and admins; ask your admin if you need access.</div>`;
+}
 route(/^\/studio$/, async (el) => {
+  if (!ME.perms.research) return noAccess(el, "Model Studio");
   const [sys, mine] = await Promise.all([system(), api("/api/catalog?drafts=true")]);
   const builtins = mine.filter((t) => t.source === "builtin"), research = mine.filter((t) => t.source === "studio");
   let m = BLANK(), size = "tiny", vtimer = null;
@@ -946,6 +1027,7 @@ route(/^\/studio$/, async (el) => {
 
 /* ------------------------------------------------------------------------------------------------ explorer */
 route(/^\/explorer$/, async (el) => {
+  if (!ME.perms.research) return noAccess(el, "Plan Explorer");
   const jobs = (await api("/api/jobs?kind=analyze")).slice(0, 8);
   el.innerHTML = `<div class="page-h"><div><h1>Plan Explorer</h1><p class="muted">Bring your own INT8 model (.onnx QDQ or .tflite). SAI inspects it and searches every execution plan on every board.</p></div></div>
   <div class="grid g2"><div class="card"><div class="drop" id="drop" role="button" tabindex="0" aria-label="Choose a model file">Drop an INT8 <b>.onnx</b> or <b>.tflite</b>, or click<input type="file" id="file" accept=".onnx,.tflite" hidden></div>
@@ -1098,7 +1180,7 @@ route(/^\/plan$/, async (el) => {
 /* ------------------------------------------------------------------------------------------------ admin */
 route(/^\/admin$/, async (el) => {
   const m = ME;
-  if (!m.perms.org_admin && !m.perms.farm_admin) { el.innerHTML = `<div class="callout bad">Your role cannot open the admin console.</div>`; return; }
+  if (!m.perms.org_admin) { el.innerHTML = `<div class="callout bad">Only admins can open the admin console (your role: <b>${esc(m.role)}</b>).</div>`; return; }
   const tabs = [m.perms.org_admin && ["orgs", "Organisations"], m.perms.org_admin && ["users", "Users"], m.perms.farm_admin && ["agents", "Lab agents"], m.perms.org_admin && ["audit", "Audit log"], m.perms.platform_admin && ["queue", "Job queue"]].filter(Boolean);
   let tab = tabs[0][0];
   const draw = async () => {
@@ -1120,7 +1202,7 @@ route(/^\/admin$/, async (el) => {
     if (tab === "users") {
       const [us, orgs] = await Promise.all([api("/api/admin/users"), api("/api/admin/orgs")]);
       const on = Object.fromEntries(orgs.map((o) => [o.id, o.name]));
-      const roles = m.perms.platform_admin ? ["member", "org_admin", "researcher", "lab", "platform_admin"] : ["member", "org_admin"];
+      const roles = ["engineer", "researcher", "manager", "admin"];
       box.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="t"><thead><tr><th>User</th><th>Organisation</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>
         ${us.map((x) => `<tr><td><b>${esc(x.name)}</b><div class="small muted">${esc(x.email)}</div></td><td>${esc(on[x.org_id] || x.org_id)}</td><td><span class="badge">${esc(x.role)}</span></td><td>${x.disabled ? `<span class="badge b-bad">disabled</span>` : `<span class="badge b-ok">active</span>`}</td><td>${!x.disabled && x.id !== m.id ? `<button class="btn sm ghost" data-dis="${x.id}">Disable</button>` : ""}</td></tr>`).join("")}</tbody></table></div>
         <h3 style="margin-top:14px">Invite a user</h3><div class="grid g4"><label class="f">Name<input id="un"></label><label class="f">Email<input id="ue" type="email"></label><label class="f">Initial password<input id="up" type="text" placeholder="≥ 8 characters"></label>
@@ -1185,6 +1267,8 @@ async function boot() {
   $("#signout").onclick = async (e) => { e.preventDefault(); await api("/api/auth/logout", { method: "POST" }); SYS = null; history.replaceState(null, "", "#/"); showLogin(); };
   try { const s = await system(); $("#sysline").textContent = `SAI ${s.sai.sai || "?"} · platform ${s.platform_version}`; } catch { /* shown per page */ }
   render();
+  refreshPending();
+  if (!window.__pendTimer) window.__pendTimer = setInterval(refreshPending, 60000);
 }
 
 /* ------------------------------------------------------------------------------------------------ boot */

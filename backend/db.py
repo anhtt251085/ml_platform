@@ -81,6 +81,15 @@ MIGRATIONS: list[str] = [
     CREATE TABLE job_metrics (job_id TEXT, seq INTEGER, ts REAL, series TEXT, data TEXT);
     CREATE INDEX job_metrics_i ON job_metrics(job_id, seq);
     """,
+    # 7: four roles (engineer, researcher, manager, admin) and manager approval of compiled-package downloads
+    """
+    UPDATE users SET role='admin' WHERE role IN ('platform_admin', 'org_admin');
+    UPDATE users SET role='engineer' WHERE role IN ('member', 'lab');
+    CREATE TABLE package_approvals (job_id TEXT PRIMARY KEY, org_id TEXT, status TEXT, requested_by TEXT,
+                                    requested_at REAL, request_note TEXT, decided_by TEXT, decided_at REAL,
+                                    decision_note TEXT, downloads INTEGER DEFAULT 0, last_download REAL);
+    CREATE INDEX package_approvals_i ON package_approvals(org_id, status);
+    """,
 ]
 
 
