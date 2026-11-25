@@ -32,6 +32,7 @@ AGENT_TOKEN = os.environ.get("SAI_PLATFORM_AGENT_TOKEN", "dev-agent-token")
 ALLOW_DEV_AGENT_TOKEN = os.environ.get("SAI_PLATFORM_ALLOW_DEV_AGENT_TOKEN", "0") == "1"
 COOKIE_SECURE = os.environ.get("SAI_PLATFORM_COOKIE_SECURE", "0") == "1"
 BRAND_NAME = os.environ.get("SAI_PLATFORM_BRAND", "SAI Platform")         # white-label (M6)
+SIGNING_KEY = os.environ.get("SAI_PLATFORM_SIGNING_KEY", "")                # Ed25519 PEM; generated when unset
 
 
 def _git_sha() -> str:

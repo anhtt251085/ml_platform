@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 import numpy as np
 
-from . import archspec, auth, boards, config, data, db, pipeline, sai_engine, store
+from . import archspec, auth, boards, commercial, config, data, db, pipeline, sai_engine, store
 
 app = FastAPI(title=config.BRAND_NAME, version=config.PLATFORM_VERSION)
 FRONT = config.ROOT / "frontend"
@@ -84,8 +84,10 @@ def logout(response: Response, u: dict = Depends(auth.current)):
 @app.get("/api/me")
 def me(u: dict = Depends(auth.current)):
     perms = {k: u["role"] in v for k, v in auth.PERMS.items()}
+    s = commercial.settings(u["org_id"])
     return {**{k: v for k, v in u.items() if k != "token"}, "perms": perms, "mode": config.MODE,
-            "brand": config.BRAND_NAME}
+            "brand": {"product_name": config.BRAND_NAME, **s["brand"]}, "plan": commercial.plan_of(u),
+            "deployment": s["deployment"]}
 
 
 class PasswordIn(BaseModel):
@@ -126,6 +128,8 @@ def admin_orgs(u: dict = Depends(auth.require("org_admin"))):
     rows = auth.orgs() if u["role"] == "platform_admin" else [auth.org(u["org_id"])]
     for r in rows:
         r["usage"] = auth.usage(r["id"])
+        r["deployment"] = commercial.settings(r["id"])["deployment"]
+        r.pop("branding", None)
         r["users"] = len(auth.users(r["id"]))
     return rows
 
@@ -150,6 +154,34 @@ def admin_org_tier(oid: str, body: dict, u: dict = Depends(auth.require("platfor
         _bad(e)
     auth.audit(u, "tier_changed", oid, {"tier": body.get("tier")})
     return auth.org(oid)
+
+
+@app.post("/api/admin/orgs/{oid}/deployment")
+def admin_org_deployment(oid: str, body: dict, u: dict = Depends(auth.require("platform_admin"))):
+    try:
+        commercial.set_deployment(oid, body.get("model", "none"), body.get("units"), body.get("contract"))
+    except ValueError as e:
+        _bad(e)
+    auth.audit(u, "deployment_rights_set", oid, body)
+    return commercial.settings(oid)["deployment"]
+
+
+@app.get("/api/plan")
+def plan_usage(u: dict = Depends(auth.current)):
+    return {"plan": commercial.plan_of(u), "usage": commercial.counts(u["org_id"]), "plans": commercial.PLANS,
+            "deployment": commercial.settings(u["org_id"])["deployment"], "metered": auth.usage(u["org_id"])}
+
+
+@app.put("/api/org/brand")
+def org_brand(body: dict, u: dict = Depends(auth.require("org_admin"))):
+    b = commercial.set_brand(u["org_id"], body)
+    auth.audit(u, "branding_changed", u["org_id"], b)
+    return b
+
+
+@app.get("/api/signing/public-key")
+def signing_key():
+    return {"key_id": commercial.key_id(), "algorithm": "Ed25519", "public_key_pem": commercial.public_key_pem()}
 
 
 @app.get("/api/admin/users")
@@ -397,7 +429,8 @@ def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
     cfg["epochs"] = max(1, min(cfg["epochs"], 200))
     if cfg.get("pool_benchmark") and u["role"] not in auth.PERMS["publish"]:
         raise HTTPException(403, "only SAI research publishes pool benchmarks")
-    job = pipeline.create("train", cfg, org_id=u["org_id"], user_id=u["id"])
+    plan = commercial.check_project(u)
+    job = pipeline.create("train", cfg, org_id=u["org_id"], user_id=u["id"], priority=plan["priority"])
     prj = store.create_project(body.name or "Untitled", body.template_id, body.dataset_id, cfg, job["id"], u["org_id"])
     with db.conn() as c:
         c.execute("UPDATE jobs SET project_id=? WHERE id=?", (prj["id"], job["id"]))
@@ -471,6 +504,8 @@ def _file(jid: str, name: str) -> Path:
 def job_download(jid: str, name: str, u: dict = Depends(auth.current)):
     _job(jid, u)
     p = _file(jid, name)
+    if name == "package.zip":
+        commercial.check_package_download(u)
     auth.audit(u, "download", jid, {"file": name})
     auth.meter(u["org_id"], "download", 1, f"{jid}/{name}")
     return FileResponse(p, media_type=DOWNLOADS[name], filename=f"{jid}_{name}")
@@ -558,6 +593,10 @@ class RunIn(BaseModel):
 @app.post("/api/boards/runs")
 def board_run(body: RunIn, u: dict = Depends(auth.current)):
     _job(body.job_id, u)
+    bd = {b["id"]: b for b in boards.list_boards()}
+    kind = bd[body.board_id]["kind"] if body.board_id in bd else \
+        ("physical" if any(b["kind"] == "physical" and b["online"] for b in bd.values()) else "emulated")
+    commercial.check_board_run(u, kind)
     try:
         r = pipeline.start_board_run(body.job_id, body.target, body.board_id, u["org_id"])
     except (ValueError, KeyError) as e:
