@@ -8,6 +8,7 @@ Customer data (datasets, projects, jobs, board runs) is scoped to the caller's o
 
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -222,7 +223,7 @@ def system(u: dict = Depends(auth.current)):
     return {"sai": sai_engine.version(), "targets": sai_engine.target_status(), "goals": pipeline.GOALS,
             "ops": {k: v["sai"] for k, v in archspec.OPS.items()}, "calibration": boards.calibration(),
             "sim_boards": config.SIM_BOARDS, "platform_version": config.PLATFORM_VERSION, "mode": config.MODE,
-            "schema": db.version()}
+            "schema": db.version(), "licences": data.LICENCES, "pool_weights": pipeline.pool_weights_index()}
 
 
 # ---- model pool --------------------------------------------------------------------------------------------------
@@ -292,13 +293,26 @@ def _ds(did: str, u: dict) -> dict:
     return d
 
 
+@app.post("/api/datasets/preview")
+async def dataset_preview(file: UploadFile = File(...), u: dict = Depends(auth.current)):
+    """CSV header, first rows and a guessed column mapping for the mapping step."""
+    raw = await file.read(2_000_000)
+    try:
+        return data.csv_preview(raw)
+    except data.DataError as e:
+        _bad(e)
+
+
 @app.post("/api/datasets/upload")
 async def dataset_upload(template_id: str = Form(...), file: UploadFile = File(...), window: int | None = Form(None),
-                         hop: int | None = Form(None), u: dict = Depends(auth.current)):
+                         hop: int | None = Form(None), mapping: str | None = Form(None),
+                         licence: str | None = Form(None), u: dict = Depends(auth.current)):
     raw = await file.read()
     try:
-        meta = data.ingest_bytes(raw, file.filename or "upload.csv", _tpl(template_id), window=window, hop=hop)
-    except data.DataError as e:
+        m = json.loads(mapping) if mapping else None
+        meta = data.ingest_bytes(raw, file.filename or "upload.csv", _tpl(template_id), window=window, hop=hop,
+                                 mapping=m, licence=licence or "unknown")
+    except (data.DataError, json.JSONDecodeError) as e:
         _bad(e)
     store.add_dataset(meta, u["org_id"])
     auth.audit(u, "dataset_uploaded", meta["id"], {"name": meta.get("name"), "n": meta.get("n")})
@@ -311,12 +325,14 @@ class UrlIn(BaseModel):
     url: str
     window: int | None = None
     hop: int | None = None
+    licence: str = "unknown"
 
 
 @app.post("/api/datasets/url")
 def dataset_url(body: UrlIn, u: dict = Depends(auth.current)):
     try:
-        meta = data.ingest_url(body.url, _tpl(body.template_id), window=body.window, hop=body.hop)
+        meta = data.ingest_url(body.url, _tpl(body.template_id), window=body.window, hop=body.hop,
+                               licence=body.licence)
     except (data.DataError, OSError) as e:
         _bad(e)
     store.add_dataset(meta, u["org_id"])
@@ -360,6 +376,8 @@ class ProjectIn(BaseModel):
     budgets: dict = {}
     metric_target: float | None = None
     epochs: int = 30
+    init_from_pool: bool = False      # fine-tune from the pool's base weights when the shapes match
+    lr_search: bool = False           # try two learning rates per size, keep the better validation loss
 
 
 @app.post("/api/projects")
@@ -466,6 +484,29 @@ def studio_fitcheck(body: dict, u: dict = Depends(auth.require("studio"))):
     except archspec.SpecError as e:
         _bad(e)
     return pipeline.create("fitcheck", body, org_id=u["org_id"], user_id=u["id"], priority=2)
+
+
+class BaseTrainIn(BaseModel):
+    template_id: str
+    sizes: list[str] | None = None
+    dataset_id: str | None = None
+    per_class: int = 300
+    epochs: int = 30
+
+
+@app.post("/api/studio/basetrain")
+def studio_basetrain(body: BaseTrainIn, u: dict = Depends(auth.require("publish"))):
+    _tpl(body.template_id)
+    if body.dataset_id:
+        _ds(body.dataset_id, u)
+    j = pipeline.create("basetrain", body.model_dump(), org_id=u["org_id"], user_id=u["id"])
+    auth.audit(u, "basetrain_requested", body.template_id, {"job": j["id"]})
+    return j
+
+
+@app.get("/api/pool/weights")
+def pool_weights(u: dict = Depends(auth.current)):
+    return pipeline.pool_weights_index()
 
 
 @app.post("/api/explorer/analyze")

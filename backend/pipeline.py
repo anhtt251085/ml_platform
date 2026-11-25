@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from . import archspec, config, data, db, exact_eval, qexport, sai_engine, trainer
+from . import archspec, config, data, db, exact_eval, features, qexport, sai_engine, trainer
 from . import boards as boards_mod
 
 STAGES = {
@@ -28,6 +28,7 @@ STAGES = {
     "fitcheck": [("build", "Build graph"), ("quantize", "INT8 export"), ("plan", "SAI plan search")],
     "analyze": [("inspect", "Inspect model"), ("plan", "SAI plan search")],
     "rebuild": [("compile", "Recompile"), ("compare", "Compare with the original build")],
+    "basetrain": [("data", "Prepare data"), ("train", "Train base weights"), ("save", "Store in the pool")],
 }
 KINDS = tuple(STAGES)
 STALE_RUNNING_S = 6 * 3600
@@ -203,7 +204,8 @@ def _run(jid: str, kind: str, params: dict):
     ctx = Ctx(jid, kind)
     t0 = time.time()
     try:
-        {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild}[kind](ctx, params)
+        {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
+         "basetrain": run_basetrain}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -247,11 +249,13 @@ def run_train(ctx: Ctx, p: dict):
     ctx.log(f"dataset {meta.get('name')} : {len(X)} windows, input {list(X.shape[1:])}, labels {labels}")
     for w in meta.get("warnings", []):
         ctx.log("warning: " + w)
-    idx = trainer.split(y, task)
+    groups = data.load_groups(p["dataset_id"])
+    idx = trainer.split(y, task, groups=groups)
     mean, std = trainer.norm_stats(X[idx["train"]])
     Xn = ((X - mean) / std).astype(np.float32)
     y_stats = (float(y[idx["train"]].mean()), float(y[idx["train"]].std() + 1e-6)) if task == "regression" else None
-    ctx.log(f"split train {len(idx['train'])} / val {len(idx['val'])} / test {len(idx['test'])}")
+    ctx.log(f"split train {len(idx['train'])} / val {len(idx['val'])} / test {len(idx['test'])} "
+            f"({idx['split_mode']}-level: {'whole recordings per split' if idx['split_mode'] == 'recording' else 'windows'})")
     ctx.stage("data", "done")
 
     # 2 train ----------------------------------------------------------------------------------------------------
@@ -268,9 +272,24 @@ def run_train(ctx: Ctx, p: dict):
             continue
         summ = archspec.summary(spec)
         ctx.log(f"size {size}: {summ['params']:,} params, {summ['macs']:,} MACs")
-        net, hist = trainer.train(spec, Xn, y, idx, task, epochs=epochs, log=ctx.log, cancelled=ctx.cancelled,
-                                  progress=lambda f, si=si: ctx.progress_within("train", (si + f) / len(sizes)),
-                                  y_stats=y_stats)
+        base = pool_weights(tpl["id"], size) if p.get("init_from_pool") else None
+        lrs = [3e-3, 1e-2] if p.get("lr_search") else [None]
+        best_net = None
+        for lr in lrs:
+            init = None
+            if base is not None:
+                init = archspec.SpecNet(spec)
+                copied = trainer.init_from(init, base["state"])
+                ctx.log(f"size {size}: fine-tuning from pool base weights ({len(copied)} tensors copied)")
+            kw = {"lr": lr if lr else (2e-3 if base is not None else 5e-3)}
+            net, hist = trainer.train(spec, Xn, y, idx, task, epochs=epochs, log=ctx.log, cancelled=ctx.cancelled,
+                                      progress=lambda f, si=si: ctx.progress_within("train", (si + f) / len(sizes)),
+                                      y_stats=y_stats, net=init, **kw)
+            if len(lrs) > 1:
+                ctx.log(f"size {size}: lr {kw['lr']} -> best validation loss {net.best_val:.4f}")
+            if best_net is None or net.best_val < best_net[0].best_val:
+                best_net = (net, hist)
+        net, hist = best_net
         with torch.no_grad():
             out = net(torch.from_numpy(Xn[idx["test"]])).numpy().reshape(len(idx["test"]), -1)
         thr = None
@@ -410,13 +429,21 @@ def run_train(ctx: Ctx, p: dict):
     ctx.stage("package")
     pre = {"mean": mean.reshape(-1).tolist(), "std": std.reshape(-1).tolist(), "input": v["q"]["input"],
            "output": v["q"]["output"], "task": task, "labels": labels, "y_stats": y_stats,
-           "threshold": v["threshold"], "layout": "NCHW, 1-D signals as [1, C, 1, T]"}
+           "threshold": v["threshold"], "layout": "NCHW, 1-D signals as [1, C, 1, T]",
+           "frontend": meta.get("frontend")}
+    deployable = bool(meta.get("commercial_use"))
+    if not deployable:
+        ctx.log(f"dataset licence '{meta.get('licence')}' does not allow commercial use: package is EVALUATION ONLY")
     (ctx.dir / "preprocessing.json").write_text(json.dumps(pre, indent=1))
-    (ctx.dir / "sai_app.h").write_text(_app_header(pre, tpl))
+    (ctx.dir / "sai_app.h").write_text(_app_header(pre, tpl, deployable))
+    if meta.get("frontend"):
+        (ctx.dir / "sai_frontend_config.h").write_text(features.config_header(meta["frontend"]))
     (ctx.dir / "main_example.c").write_text(_example_main(pre, tpl))
     report = {
         "template": {k: tpl.get(k) for k in ("id", "name", "domain", "task")},
-        "dataset": {k: meta.get(k) for k in ("id", "name", "source", "n", "shape", "labels", "class_counts", "synthetic")},
+        "dataset": {k: meta.get(k) for k in ("id", "name", "source", "n", "shape", "labels", "class_counts", "synthetic",
+                                             "licence", "commercial_use", "recordings", "quality", "frontend")},
+        "deployable": deployable, "split_mode": idx["split_mode"],
         "goal": goal, "targets": targets, "budgets": p.get("budgets"), "metric_target": acc_target,
         "variants": [{"size": x["size"], "summary": {k: x["summary"][k] for k in ("macs", "params", "spatial_axes")},
                       "layers": x["summary"]["layers"], "spec": x["spec"], "float": x["float"], "int8": x["int8"],
@@ -436,6 +463,13 @@ def run_train(ctx: Ctx, p: dict):
                 z.write(f, Path("sai_package") / f.relative_to(build))
         for name in ("model.onnx", "preprocessing.json", "sai_app.h", "main_example.c", "report.json", "MODEL_CARD.md"):
             z.write(ctx.dir / name, Path("sai_package") / name)
+        if meta.get("frontend"):
+            z.write(ctx.dir / "sai_frontend_config.h", Path("sai_package") / "frontend" / "sai_frontend_config.h")
+            for f in ("sai_features.c", "sai_features.h"):
+                z.write(features.SRC / f, Path("sai_package") / "frontend" / f)
+        if not deployable:
+            z.writestr("sai_package/EVALUATION_ONLY.txt", "Trained on data whose licence ("
+                       f"{meta.get('licence')}) does not allow commercial use. Not for deployment.\n")
     ctx.log("package.zip ready")
     ctx.stage("package", "done")
     report["downloads"] = ["package.zip", "model.onnx", "report.json", "MODEL_CARD.md"]
@@ -591,7 +625,7 @@ def _onnx_macs(path: Path) -> int | None:
         return None
 
 
-def _app_header(pre: dict, tpl: dict) -> str:
+def _app_header(pre: dict, tpl: dict, deployable: bool = True) -> str:
     mean, std = pre["mean"], pre["std"]
     s, z = pre["input"]["scale"], pre["input"]["zero_point"]
     a = [1.0 / (sd * s) for sd in std]
@@ -602,6 +636,8 @@ def _app_header(pre: dict, tpl: dict) -> str:
     lines = [
         "/* Generated by SAI Platform: input quantization and output decoding for this model. */",
         "#ifndef SAI_APP_H", "#define SAI_APP_H", "#include <stdint.h>", "",
+        *([] if deployable else ["#define SAI_PACKAGE_EVALUATION_ONLY 1",
+                                 "#warning \"SAI package trained on data not licensed for commercial use: evaluation only\"", ""]),
         f"#define SAI_APP_CHANNELS {len(mean)}",
         f"#define SAI_APP_NUM_LABELS {len(pre['labels'])}",
         f"static const char *const sai_app_labels[] = {{ {labels} }};", "",
@@ -638,6 +674,9 @@ def _app_header(pre: dict, tpl: dict) -> str:
 
 
 def _example_main(pre: dict, tpl: dict) -> str:
+    fe = pre.get("frontend")
+    if fe:
+        return _example_main_frontend(pre, tpl, fe)
     return f"""/* Minimal integration of the generated model ({tpl['name']}). Link lib/libsai_model.a (or the sources
    in model/) and call sai_infer() once per window. No heap; the workspace is a static array. */
 #include <stdint.h>
@@ -669,10 +708,103 @@ int sai_infer(const int32_t *raw, int T) {{
 """
 
 
+def _example_main_frontend(pre: dict, tpl: dict, fe: dict) -> str:
+    call = ("sai_mfcc(raw, SAI_FRONTEND_RAW_LENGTH, &sai_frontend_mfcc, work, feat)" if fe["type"] == "mfcc" else
+            "sai_band_energy(raw, SAI_FRONTEND_RAW_LENGTH, SAI_FRONTEND_N_FFT, SAI_FRONTEND_BANDS, work, feat)")
+    return f"""/* {tpl['name']}: raw signal -> SAI feature front end (same C as training) -> model. No heap. */
+#include <stdint.h>
+#include "model/sai_model.h"
+#include "sai_app.h"
+#include "frontend/sai_frontend_config.h"
+
+static uint8_t workspace[SAI_MODEL_WORKSPACE_BYTES + 1] __attribute__((aligned(SAI_MODEL_WORKSPACE_ALIGNMENT)));
+static float work[SAI_FEAT_WORK_FLOATS];
+static float feat[SAI_MODEL_INPUT0_BYTES];
+static int8_t input[SAI_MODEL_INPUT0_BYTES];
+static int8_t output[SAI_MODEL_OUTPUT0_BYTES];
+static sai_model_t model;
+
+int sai_setup(void) {{
+    sai_run_context_t ctx = {{ workspace, SAI_MODEL_WORKSPACE_BYTES, 0 }};
+    return sai_model_init(&model, &ctx) == SAI_OK ? 0 : -1;
+}}
+
+/* raw: SAI_FRONTEND_RAW_LENGTH samples ({'audio in [-1, 1]' if fe['type'] == 'mfcc' else 'sensor units'}). */
+int sai_infer(const float *raw) {{
+    if ({call} != SAI_FEAT_OK) return -1;
+    for (unsigned i = 0; i < SAI_MODEL_INPUT0_BYTES; i++)
+        input[i] = sai_app_quantize_f(feat[i], 0);
+    size_t ni, no;
+    const int64_t *si = sai_model_input_shape(0, &ni), *so = sai_model_output_shape(0, &no);
+    sai_tensor_view_t in = {{ input, sizeof input, si, ni, SAI_MODEL_INPUT0_DTYPE }};
+    sai_tensor_buffer_t out = {{ output, sizeof output, so, no, SAI_MODEL_OUTPUT0_DTYPE }};
+    if (sai_model_invoke(&model, &in, 1, &out, 1) != SAI_OK) return -1;
+    {"return sai_app_argmax(output);" if pre["task"] == "classification" else "return 0; /* decode output[] with sai_app.h */"}
+}}
+"""
+
+
+def pool_weights(tid: str, size: str) -> dict | None:
+    f = config.DATA_DIR / "pool" / tid / f"{size}.pt"
+    return torch.load(f, map_location="cpu", weights_only=False) if f.exists() else None
+
+
+def pool_weights_index() -> dict:
+    root = config.DATA_DIR / "pool"
+    out = {}
+    for d in root.iterdir() if root.exists() else []:
+        meta = d / "meta.json"
+        if meta.exists():
+            out[d.name] = json.loads(meta.read_text())
+    return out
+
+
+def run_basetrain(ctx: Ctx, p: dict):
+    """Researcher job: train base weights of a pool model type (on a given dataset or its synthetic demo data)
+    that customer projects can fine-tune from."""
+    tpl = get_template(p["template_id"])
+    task = tpl["task"]
+    ctx.stage("data")
+    if p.get("dataset_id"):
+        did = p["dataset_id"]
+    else:
+        meta0 = data.from_synthetic(tpl, int(p.get("per_class", 300)))
+        from . import store
+        store.add_dataset(meta0, None)
+        did = meta0["id"]
+    X, y, labels, meta = data.load(did)
+    idx = trainer.split(y, task, groups=data.load_groups(did))
+    mean, std = trainer.norm_stats(X[idx["train"]])
+    Xn = ((X - mean) / std).astype(np.float32)
+    y_stats = (float(y[idx["train"]].mean()), float(y[idx["train"]].std() + 1e-6)) if task == "regression" else None
+    ctx.stage("data", "done")
+    ctx.stage("train")
+    out_dir = config.DATA_DIR / "pool" / tpl["id"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = {}
+    for size in p.get("sizes") or list(tpl["variants"]):
+        spec = trainer.build_spec(tpl["variants"][size], X, task, len(labels))
+        net, _ = trainer.train(spec, Xn, y, idx, task, epochs=int(p.get("epochs", 30)), log=ctx.log,
+                               cancelled=ctx.cancelled, y_stats=y_stats)
+        torch.save({"state": net.state_dict(), "spec": spec, "labels": labels, "dataset": did,
+                    "licence": meta.get("licence")}, out_dir / f"{size}.pt")
+        saved[size] = {"best_val_loss": round(float(net.best_val), 5), "params": archspec.summary(spec)["params"]}
+        ctx.log(f"size {size}: base weights stored (val loss {net.best_val:.4f})")
+    ctx.stage("train", "done")
+    ctx.stage("save")
+    info = {"template": tpl["id"], "sizes": saved, "dataset": did, "licence": meta.get("licence"),
+            "created": db.now(), "job": ctx.id}
+    (out_dir / "meta.json").write_text(json.dumps(info, indent=1))
+    ctx.stage("save", "done")
+    ctx.result(info)
+
+
 def _model_card(r: dict, tpl: dict, meta: dict) -> str:
     sel = r["selected"]
     v = next(x for x in r["variants"] if x["size"] == sel["size"])
     synthetic = "**Trained on SYNTHETIC demo data - not valid for field use.**\n\n" if meta.get("synthetic") else ""
+    if not meta.get("commercial_use"):
+        synthetic += f"**EVALUATION ONLY: dataset licence `{meta.get('licence')}` does not allow commercial deployment.**\n\n"
     return f"""# Model card - {tpl['name']}
 
 {synthetic}| | |
