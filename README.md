@@ -1,4 +1,4 @@
-# SAI Platform (v0.3: data & training depth)
+# SAI Platform (v0.4: compiler integration depth)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -82,6 +82,18 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * Latency is a planning number until a real board measures the build. Simulated board runs are flagged and never
   enter calibration.
 * Synthetic demo data is labelled as synthetic in the dataset, the job page and the model card.
+
+## Compiler integration (M3)
+
+* **Explored plans become candidates**: the Pareto frontier (workspace vs SAI rank) of `sai explore` is built
+  with `sai compile --plan NAME --candidate-id ID`, so intermediate RAM/latency trade-offs get exact flash and a
+  proven stack bound and can be selected; rebuilds replay the same plan.
+* **Certificate re-check**: every package's memory certificate is re-derived by `sai certify --check`.
+* **`measured` evidence**: a real board-farm run stores cycles per `target:plan_digest`; every later plan search
+  that produces the same program shows that measurement instead of an estimate.
+* **SAI contract tests** (`tests/test_sai_contract.py`) pin the JSON fields and schema versions the platform reads;
+  newer schemas surface as compatibility warnings on the Compiler & targets page.
+* `tools/sai_findings_repro.sh` reproduces the open SAI findings (issue #9) for upstream.
 
 ## Data & training (M2)
 

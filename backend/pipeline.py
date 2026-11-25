@@ -367,7 +367,8 @@ def run_train(ctx: Ctx, p: dict):
     for i, v in enumerate(variants):
         v["plans"] = sai_engine.plan_search(v["onnx"], v["summary"]["macs"], v["summary"]["spatial_axes"], targets,
                                             goal if goal != "accuracy" else "balanced", p.get("budgets"), cal,
-                                            log=ctx.log)
+                                            log=ctx.log, measurements=boards_mod.measurements(),
+                                            explore_builds=int(p.get("explore_builds", 3)))
         ctx.progress_within("plan", (i + 1) / len(variants))
         ctx.log(f"size {v['size']}: {v['plans']['feasible']} of {len(v['plans']['candidates'])} plans fit")
     ctx.stage("plan", "done")
@@ -405,13 +406,18 @@ def run_train(ctx: Ctx, p: dict):
         shutil.rmtree(build)
     final = ctx.dir / "model.onnx"            # the delivered model; rebuilds compile this exact file
     shutil.copy(v["onnx"], final)
-    man = sai_engine.compile_build(final, chosen["target"], chosen["objective"], build)
+    man = sai_engine.compile_build(final, chosen["target"], chosen["objective"], build, chosen.get("plan_name"),
+                                   chosen.get("candidate_id"))
+    if chosen.get("plan_name"):
+        ctx.log(f"built explored plan {chosen['plan_name']} (candidate {chosen['candidate_id'][:12]})")
     ctx.log(f"sai compile: {man.get('compile_status')} -> build/")
     ver = sai_engine.verify(build, final)
     checks = ver.get("checks", [])
     passed = sum(1 for c in checks if c.get("passed"))
     ctx.log(f"sai verify: {passed}/{len(checks)} checks passed")
     cert = _read_json(build / "memory-certificate.json")
+    cert_check = sai_engine.certify_check(build, final)
+    ctx.log(f"sai certify --check: {cert_check['passed']}/{cert_check['total']} certificate checks re-derived")
     ctx.stage("compile", "done")
 
     # 7 exact ----------------------------------------------------------------------------------------------------
@@ -451,7 +457,7 @@ def run_train(ctx: Ctx, p: dict):
                       "history": x["history"], "plans": x["plans"]} for x in variants],
         "selected": {**chosen, "note": note},
         "exact": exact, "verify": {"passed": passed, "total": len(checks), "checks": checks},
-        "memory_certificate": cert, "preprocessing": pre, "sai": sai_engine.version(),
+        "memory_certificate": cert, "certificate_check": cert_check, "preprocessing": pre, "sai": sai_engine.version(),
         "provenance": provenance(build, p["dataset_id"], chosen),
         "tier_compare": sai_engine.tier_compare(v["onnx"], [chosen["target"]]),
     }
@@ -497,7 +503,8 @@ def run_fitcheck(ctx: Ctx, p: dict):
     ctx.stage("plan")
     targets = [t for t in (p.get("targets") or sai_engine.MCU_TARGETS) if t in sai_engine.MCU_TARGETS]
     plans = sai_engine.plan_search(path, summ["macs"], summ["spatial_axes"], targets, p.get("goal", "balanced"),
-                                   p.get("budgets"), boards_mod.calibration(), log=ctx.log)
+                                   p.get("budgets"), boards_mod.calibration(), log=ctx.log,
+                                   measurements=boards_mod.measurements())
     ctx.stage("plan", "done")
     ctx.result({"spec": spec, "summary": summ, "plans": plans})
 
@@ -514,7 +521,7 @@ def run_analyze(ctx: Ctx, p: dict):
     axes = 1 if any(len(t.get("shape", [])) == 4 and t["shape"][2] == 1 for t in info.get("inputs", [])) else 2
     targets = [t for t in (p.get("targets") or sai_engine.MCU_TARGETS) if t in sai_engine.MCU_TARGETS]
     plans = sai_engine.plan_search(path, macs or 0, axes, targets, p.get("goal", "balanced"), p.get("budgets"),
-                                   boards_mod.calibration(), log=ctx.log)
+                                   boards_mod.calibration(), log=ctx.log, measurements=boards_mod.measurements())
     if not macs:
         for c in plans["candidates"]:
             if c["latency"]["evidence"] == "heuristic":
@@ -534,13 +541,15 @@ def start_board_run(job_id: str, target: str | None, board_id: str | None, org_i
     target = target or sel["target"]
     cands = [c for v in res["variants"] if v["size"] == sel["size"] for c in v["plans"]["candidates"]
              if c["target"] == target]
-    cand = next((c for c in cands if c["objective"] == sel["objective"]), cands[0] if cands else sel)
+    cand = next((c for c in cands if c["id"] == sel["id"]), None) or \
+        next((c for c in cands if c["objective"] == sel["objective"]), cands[0] if cands else sel)
     vec = np.load(config.DATA_DIR / "jobs" / job_id / "hil_vectors.npz")
     macs = next(v["summary"]["macs"] for v in res["variants"] if v["size"] == sel["size"])
     req = {"model_path": res["selected_model_path"], "objective": cand.get("objective"), "macs": macs,
            "schedule": cand.get("schedule"), "estimated_cycles": cand["latency"]["cycles"],
            "estimated_ms": cand["latency"]["ms"], "estimate_evidence": cand["latency"]["evidence"],
            "stack_bound": cand.get("stack"), "expected_outputs": vec["expected"].tolist(),
+           "plan_digest": cand.get("plan_digest"), "plan_name": cand.get("plan_name"),
            "package": f"/api/jobs/{job_id}/download/package.zip"}
     return boards_mod.request_run(job_id, target, board_id, req, org_id)
 
@@ -561,6 +570,7 @@ def provenance(build: Path, dataset_id: str, chosen: dict) -> dict:
         "toolchain_digest": man.get("toolchain_digest"),
         "toolchain": ((rep.get("toolchain") or {}).get("build_record") or {}).get("toolchain"),
         "target": chosen["target"], "objective": chosen["objective"], "schedule": chosen["schedule"],
+        "plan_name": chosen.get("plan_name"), "candidate_id": chosen.get("candidate_id"),
     }
 
 
@@ -575,7 +585,8 @@ def run_rebuild(ctx: Ctx, p: dict):
     out = ctx.dir / "build"
     if out.exists():
         shutil.rmtree(out)
-    sai_engine.compile_build(model, prov["target"], prov["objective"], out)
+    sai_engine.compile_build(model, prov["target"], prov["objective"], out, prov.get("plan_name"),
+                             prov.get("candidate_id"))
     ctx.stage("compile", "done")
     ctx.stage("compare")
     man = _read_json(out / "manifest.json") or {}

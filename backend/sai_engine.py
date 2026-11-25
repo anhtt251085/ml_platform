@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
-from . import config
+from . import config  # noqa: F401  (also used for the tmp build root)
 
 # Board budgets come from the compiler's own profiles (profiles/*.json); clocks from the measured sessions.
 TARGETS = {
@@ -164,8 +166,37 @@ def explore(model: Path, target: str, spatial_axes: int, max_seconds: int = 20, 
     return {"unavailable": str(last)}
 
 
-def compile_build(model: Path, target: str, objective: str, out: Path) -> dict:
+def compile_build(model: Path, target: str, objective: str, out: Path, plan: str | None = None,
+                  candidate_id: str | None = None) -> dict:
+    """Objective build (SAI picks the plan), or an explored plan by name + candidate id (`--plan`)."""
+    if plan:
+        args = ["compile", str(model), "--target", target, "--output", str(out), "--plan", plan]
+        if candidate_id:
+            args += ["--candidate-id", candidate_id]
+        return run(args, timeout=600)
     return run(["compile", str(model), "--target", target, "--output", str(out), "--objective", objective], timeout=600)
+
+
+def certify_check(build: Path, model: Path) -> dict:
+    """Independent re-check of a build's memory certificate against the model and the generated C (`sai certify
+    --check`): the workspace and lifetime claims are re-derived, not read back."""
+    out = run(["certify", str(model), "--check", str(build / "memory-certificate.json"),
+               "--source", str(build / "model" / "sai_model.c")], timeout=300)
+    checks = (out.get("check") or {}).get("checks", [])
+    return {"passed": sum(1 for c in checks if c.get("passed")), "total": len(checks),
+            "checks": [{"check": c.get("check"), "passed": c.get("passed")} for c in checks]}
+
+
+# Schema versions of the SAI JSON the platform reads (contract-tested in tests/test_sai_contract.py).
+SUPPORTED_SCHEMAS = {"estimate": {"1.0"}, "explore": {"1.1"}, "explore-1d": {"1.1"}, "manifest": {"1.0"}}
+COMPAT_WARNINGS: set[str] = set()
+
+
+def check_schema(kind: str, version: str | None):
+    v = None if version is None else str(version).rsplit("/", 1)[-1]
+    if v is not None and kind in SUPPORTED_SCHEMAS and v not in SUPPORTED_SCHEMAS[kind]:
+        COMPAT_WARNINGS.add(f"SAI {kind} report schema {version} is newer than the platform's tested "
+                            f"{sorted(SUPPORTED_SCHEMAS[kind])}")
 
 
 def verify(build: Path, model: Path) -> dict:
@@ -197,9 +228,96 @@ def latency(target: str, objective: str, macs: int, calibration: dict | None, co
             "basis": basis, "clock_hz": clock}
 
 
+def _measured_latency(target: str, plan_digest: str | None, measurements: dict | None) -> dict | None:
+    m = (measurements or {}).get(f"{target}:{plan_digest}") if plan_digest else None
+    if not m:
+        return None
+    clock = TARGETS[target]["clock_hz"]
+    return {"cycles": int(m["cycles"]), "ms": round(m["cycles"] / clock * 1000, 4), "evidence": "measured",
+            "basis": f"median on {m['board']} ({m['runs']} run(s)), board farm", "clock_hz": clock}
+
+
+def _row(est: dict, target: str, objective: str, space: list, budgets: dict, lat: dict) -> dict:
+    res = est.get("resources", {})
+    ws, ws_ev = _val(res, "tensor_workspace")
+    flash, flash_ev = _val(res, "linked_sai_flash")
+    stack, stack_ev = _val(res, "stack")
+    sram, sram_ev = _val(res, "static_ram")
+    if stack is None:
+        guess = [x["stack_estimate"] for x in space if x.get("stack_estimate")]
+        stack, stack_ev = (max(guess), "estimate") if guess else (512, "assumed")
+    plan = (est.get("provenance") or {}).get("plan") or {}
+    cand = {
+        "id": f"{target}:{objective}", "target": target, "objective": objective,
+        "schedule": plan.get("schedule"), "tier": plan.get("tier"), "program_id": plan.get("program_id"),
+        "workspace": ws, "workspace_evidence": ws_ev, "stack": stack, "stack_evidence": stack_ev,
+        "static_ram": sram or 0, "static_ram_evidence": sram_ev,
+        "ram": (ws or 0) + (stack or 0) + (sram or 0), "flash": flash, "flash_evidence": flash_ev,
+        "latency": lat, "plan_digest": est.get("plan_digest"), "status": est.get("status"),
+    }
+    cand["violations"] = _violations(cand, budgets)
+    cand["fits"] = not cand["violations"]
+    return cand
+
+
+def pareto(points: list[dict], keys=("workspace", "rank_score")) -> list[dict]:
+    """Non-dominated points (minimise every key); ties keep the first."""
+    out = []
+    for p in sorted(points, key=lambda x: tuple(x[k] for k in keys)):
+        if not any(all(q[k] <= p[k] for k in keys) and any(q[k] < p[k] for k in keys) for q in out) and \
+                not any(all(q[k] == p[k] for k in keys) for q in out):
+            out.append(p)
+    return out
+
+
+def build_explored(model: Path, target: str, ex: dict, exclude_ws: set, budgets: dict, macs: int,
+                   cost_scale: float | None, calibration: dict | None, measurements: dict | None, limit: int,
+                   log=lambda m: None) -> list[dict]:
+    """Compile the Pareto frontier (workspace vs SAI rank) of the explored plans that the three objectives did not
+    already pick, so intermediate RAM/latency trade-offs become real candidates with exact flash and proven stack."""
+    ranked = [{"name": r["name"], "candidate_id": r.get("candidate_id"),
+               "workspace": (r.get("workspace") or {}).get("value"), "rank_score": (r.get("rank_score") or {}).get("value"),
+               "basis": (r.get("rank_score") or {}).get("basis")}
+              for r in ex.get("ranking", []) if r.get("candidate_id")]
+    ranked = [r for r in ranked if r["workspace"] is not None and r["rank_score"] is not None]
+    front = [r for r in pareto(ranked) if r["workspace"] not in exclude_ws][:limit]
+    best = min((r["rank_score"] for r in ranked), default=None)
+    rows = []
+    tmp_root = config.DATA_DIR / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    for r in front:
+        out = tmp_root / uuid.uuid4().hex
+        try:
+            log(f"plan search on {target}: building explored plan {r['name']}")
+            compile_build(model, target, "fast", out, r["name"], r["candidate_id"])
+            est = json.loads((out / "estimate-report.json").read_text())
+            est.setdefault("plan_digest", json.loads((out / "manifest.json").read_text()).get("plan_digest"))
+        except (SaiFailure, OSError, json.JSONDecodeError) as e:
+            log(f"  {r['name']}: not built ({e})")
+            continue
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+        family = "fast" if r["name"].startswith("full") else "min-ram"
+        lat = _measured_latency(target, est.get("plan_digest"), measurements)
+        if lat is None:
+            lat = latency(target, family, macs, calibration, cost_scale)
+            if r["basis"] != "MAC count" and best:
+                ratio = r["rank_score"] / best      # SAI's own ranking between explored plans
+                lat = {**lat, "cycles": int(lat["cycles"] * ratio) if family == "fast" else lat["cycles"],
+                       "basis": lat["basis"] + f"; SAI rank ratio {ratio:.2f}"}
+                if lat["clock_hz"]:
+                    lat["ms"] = round(lat["cycles"] / lat["clock_hz"] * 1000, 4)
+        row = _row(est, target, "explored", [], budgets, lat)
+        row.update({"id": f"{target}:plan:{r['name']}", "plan_name": r["name"], "candidate_id": r["candidate_id"],
+                    "rank_score": r["rank_score"]})
+        row["schedule"] = row["schedule"] or r["name"]
+        rows.append(row)
+    return rows
+
+
 def plan_search(model: Path, macs: int, spatial_axes: int, targets: list[str], goal: str = "balanced",
                 budgets: dict | None = None, calibration: dict | None = None, explore_seconds: int = 15,
-                log=lambda m: None) -> dict:
+                log=lambda m: None, measurements: dict | None = None, explore_builds: int = 3) -> dict:
     """Ask SAI for its plan under every objective on every target, add the explored plan space, check board and
     user budgets, and recommend one plan for the user's goal.
 
@@ -214,6 +332,8 @@ def plan_search(model: Path, macs: int, spatial_axes: int, targets: list[str], g
         cost_scale = None
         space = []
         if ex and "ranking" in ex:
+            check_schema("explore-1d" if str(ex.get("schema_version", "")).startswith("sai-explore-report-1d")
+                         else "explore", ex.get("schema_version"))
             for r in ex["ranking"]:
                 rs = r.get("rank_score") or {}
                 space.append({"name": r.get("name"), "workspace": (r.get("workspace") or {}).get("value"),
@@ -237,33 +357,20 @@ def plan_search(model: Path, macs: int, spatial_axes: int, targets: list[str], g
             except SaiFailure as e:
                 errors.append({"target": target, "objective": objective, "error": str(e)})
                 continue
-            res = est.get("resources", {})
-            ws, ws_ev = _val(res, "tensor_workspace")
-            flash, flash_ev = _val(res, "linked_sai_flash")
-            stack, stack_ev = _val(res, "stack")
-            sram, sram_ev = _val(res, "static_ram")
-            if stack is None:
-                guess = [s["stack_estimate"] for s in space if s.get("stack_estimate")]
-                stack, stack_ev = (max(guess), "estimate") if guess else (512, "assumed")
+            check_schema("estimate", est.get("schema_version"))
             measured = (est.get("metrics") or {}).get("latency_cycles") or {}
             if measured.get("value"):
                 clock = TARGETS[target]["clock_hz"]
                 lat = {"cycles": measured["value"], "ms": round(measured["value"] / clock * 1000, 4),
                        "evidence": measured.get("evidence", "measured"), "basis": "SAI measured row", "clock_hz": clock}
             else:
-                lat = latency(target, objective, macs, calibration, cost_scale)
-            plan = (est.get("provenance") or {}).get("plan") or {}
-            cand = {
-                "id": f"{target}:{objective}", "target": target, "objective": objective,
-                "schedule": plan.get("schedule"), "tier": plan.get("tier"), "program_id": plan.get("program_id"),
-                "workspace": ws, "workspace_evidence": ws_ev, "stack": stack, "stack_evidence": stack_ev,
-                "static_ram": sram or 0, "static_ram_evidence": sram_ev,
-                "ram": (ws or 0) + (stack or 0) + (sram or 0), "flash": flash, "flash_evidence": flash_ev,
-                "latency": lat, "plan_digest": est.get("plan_digest"), "status": est.get("status"),
-            }
-            cand["violations"] = _violations(cand, budgets)
-            cand["fits"] = not cand["violations"]
-            candidates.append(cand)
+                lat = _measured_latency(target, est.get("plan_digest"), measurements) or \
+                    latency(target, objective, macs, calibration, cost_scale)
+            candidates.append(_row(est, target, objective, space, budgets, lat))
+        if ex and "ranking" in ex and explore_builds:
+            have = {c["workspace"] for c in candidates if c["target"] == target}
+            candidates += build_explored(model, target, ex, have, budgets, macs, cost_scale, calibration,
+                                         measurements, explore_builds, log)
     # the same program can be chosen by two objectives; keep one row, remember every objective that chose it
     uniq: dict[tuple, dict] = {}
     for c in candidates:

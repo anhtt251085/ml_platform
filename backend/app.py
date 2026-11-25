@@ -223,7 +223,10 @@ def system(u: dict = Depends(auth.current)):
     return {"sai": sai_engine.version(), "targets": sai_engine.target_status(), "goals": pipeline.GOALS,
             "ops": {k: v["sai"] for k, v in archspec.OPS.items()}, "calibration": boards.calibration(),
             "sim_boards": config.SIM_BOARDS, "platform_version": config.PLATFORM_VERSION, "mode": config.MODE,
-            "schema": db.version(), "licences": data.LICENCES, "pool_weights": pipeline.pool_weights_index()}
+            "schema": db.version(), "licences": data.LICENCES, "pool_weights": pipeline.pool_weights_index(),
+            "sai_compat": {"supported": {k: sorted(v) for k, v in sai_engine.SUPPORTED_SCHEMAS.items()},
+                           "warnings": sorted(sai_engine.COMPAT_WARNINGS)},
+            "measurements": len(boards.measurements())}
 
 
 # ---- model pool --------------------------------------------------------------------------------------------------

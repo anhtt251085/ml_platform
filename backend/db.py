@@ -57,6 +57,12 @@ MIGRATIONS: list[str] = [
     ALTER TABLE hil_runs ADD COLUMN org_id TEXT;
     CREATE INDEX jobs_queue_i ON jobs(status, priority, created);
     """,
+    # 3: M3 - board-farm measurements of exact programs (plan digest), the platform's `measured` evidence
+    """
+    CREATE TABLE measurements (target TEXT, plan_digest TEXT, cycles INTEGER, stack_painted INTEGER, board TEXT,
+                               run_id TEXT, created REAL);
+    CREATE INDEX measurements_i ON measurements(target, plan_digest);
+    """,
 ]
 
 

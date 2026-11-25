@@ -123,7 +123,27 @@ def complete(rid: str, result: dict):
         if status == "succeeded" and not result.get("simulated") and result.get("cycles") and req.get("macs"):
             c.execute("INSERT INTO calibration VALUES (?,?,?,?,?,?)",
                       (run["target"], req.get("objective"), int(req["macs"]), int(result["cycles"]), rid, db.now()))
+        if status == "succeeded" and not result.get("simulated") and result.get("cycles") and req.get("plan_digest"):
+            c.execute("INSERT INTO measurements VALUES (?,?,?,?,?,?,?)",
+                      (run["target"], req["plan_digest"], int(result["cycles"]), result.get("stack_painted"),
+                       run["board_id"], rid, db.now()))
     return get_run(rid)
+
+
+def measurements() -> dict:
+    """`target:plan_digest` -> median cycles of real board runs of that exact program (never simulated ones)."""
+    with db.conn() as c:
+        rows = [db.row(r) for r in c.execute("SELECT * FROM measurements ORDER BY created")]
+    out: dict[str, dict] = {}
+    for r in rows:
+        k = f"{r['target']}:{r['plan_digest']}"
+        e = out.setdefault(k, {"samples": [], "board": r["board"], "stack": []})
+        e["samples"].append(r["cycles"])
+        if r["stack_painted"]:
+            e["stack"].append(r["stack_painted"])
+        e["board"] = r["board"]
+    return {k: {"cycles": float(np.median(v["samples"])), "runs": len(v["samples"]), "board": v["board"],
+                "stack_painted": max(v["stack"]) if v["stack"] else None} for k, v in out.items()}
 
 
 def calibration() -> dict:
