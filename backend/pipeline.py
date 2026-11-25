@@ -63,7 +63,14 @@ class Ctx:
         self.stages = [{"key": k, "title": t, "status": "pending"} for k, t in STAGES[kind]]
         with db.conn() as c:            # a requeued job continues its log numbering
             self.seq = c.execute("SELECT COALESCE(MAX(seq), 0) FROM job_logs WHERE job_id=?", (job_id,)).fetchone()[0]
+            self.mseq = c.execute("SELECT COALESCE(MAX(seq), 0) FROM job_metrics WHERE job_id=?", (job_id,)).fetchone()[0]
         self._beat = 0.0
+
+    def metric(self, series: str, data: dict):
+        """One point of a live training curve (series e.g. "train:tiny", "qat:tiny")."""
+        self.mseq += 1
+        with db.conn() as c:
+            c.execute("INSERT INTO job_metrics VALUES (?,?,?,?,?)", (self.id, self.mseq, db.now(), series, db.j(data)))
 
     def log(self, line: str):
         self.seq += 1
@@ -124,17 +131,29 @@ def create(kind: str, params: dict, project_id: str | None = None, org_id: str |
     return get(jid)
 
 
-def get(jid: str, log_after: int = 0) -> dict | None:
+def get(jid: str, log_after: int = 0, metrics_after: int | None = None) -> dict | None:
     with db.conn() as c:
         r = db.row(c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone())
         if not r:
             return None
         logs = [dict(x) for x in c.execute("SELECT seq, ts, line FROM job_logs WHERE job_id=? AND seq>? ORDER BY seq",
                                            (jid, log_after))]
+        if metrics_after is not None:
+            r["metrics"] = [{"seq": m["seq"], "ts": m["ts"], "series": m["series"], **db.uj(m["data"], {})}
+                            for m in c.execute("SELECT seq, ts, series, data FROM job_metrics WHERE job_id=? AND seq>?"
+                                               " ORDER BY seq", (jid, metrics_after))]
     for k in ("stages", "result", "params"):
         r[k] = db.uj(r[k])
     r["logs"] = logs
     return r
+
+
+def log_text(jid: str) -> str:
+    with db.conn() as c:
+        rows = c.execute("SELECT ts, line FROM job_logs WHERE job_id=? ORDER BY seq", (jid,)).fetchall()
+    import datetime as _dt
+    return "".join(f"{_dt.datetime.fromtimestamp(t, _dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}Z  {line}\n"
+                   for t, line in rows)
 
 
 def list_jobs(kind: str | None = None, limit: int = 50, org_id: str | None = None) -> list[dict]:
@@ -143,8 +162,10 @@ def list_jobs(kind: str | None = None, limit: int = 50, org_id: str | None = Non
         where.append("kind=?"); args.append(kind)
     if org_id:
         where.append("org_id=?"); args.append(org_id)
-    q = ("SELECT id, kind, project_id, status, stage, progress, error, created, updated, params, org_id, worker"
-         " FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT ?")
+    q = ("SELECT id, kind, project_id, status, stage, progress, error, created, updated, params, org_id, worker,"
+         " (SELECT line FROM job_logs l WHERE l.job_id=jobs.id ORDER BY seq DESC LIMIT 1) AS last_log,"
+         " (SELECT COUNT(*) FROM job_logs l WHERE l.job_id=jobs.id AND (line LIKE '%warning%' OR line LIKE '%error%'))"
+         " AS warnings FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT ?")
     with db.conn() as c:
         rows = [db.row(r) for r in c.execute(q, (*args, limit))]
     for r in rows:
@@ -291,7 +312,8 @@ def run_train(ctx: Ctx, p: dict):
     targets = [t for t in p.get("targets") or tpl.get("targets") or list(sai_engine.MCU_TARGETS) if t in sai_engine.MCU_TARGETS]
     goal = p.get("goal", "balanced")
     sizes = p.get("sizes") or ["tiny", "small", "base"]
-    epochs = int(p.get("epochs") or 30)
+    tcfg = trainer.normalize_training(p.get("training"), p.get("epochs"))
+    epochs = tcfg["epochs"]
     acc_target = p.get("metric_target")
 
     # 1 data ---------------------------------------------------------------------------------------------------
@@ -345,7 +367,7 @@ def run_train(ctx: Ctx, p: dict):
         summ = archspec.summary(spec)
         ctx.log(f"size {size}: {summ['params']:,} params, {summ['macs']:,} MACs")
         base = pool_weights(tpl["id"], size) if p.get("init_from_pool") else None
-        lrs = [3e-3, 1e-2] if p.get("lr_search") else [None]
+        lrs = [3e-3, 1e-2] if p.get("lr_search") and not tcfg["lr"] else [None]
         best_net = None
         for lr in lrs:
             init = None
@@ -354,7 +376,10 @@ def run_train(ctx: Ctx, p: dict):
                 copied = trainer.init_from(init, base["state"])
                 ctx.log(f"size {size}: fine-tuning from pool base weights ({len(copied)} tensors copied)")
             kw = {"lr": lr if lr else (2e-3 if base is not None else 5e-3)}
+            run_cfg = {**tcfg, "lr": lr or tcfg["lr"]}
+            series = f"train:{size}" + (f"@lr{kw['lr']:g}" if len(lrs) > 1 else "")
             net, hist = trainer.train(spec, Xn, y, idx, task, epochs=epochs, log=ctx.log, cancelled=ctx.cancelled,
+                                      cfg=run_cfg, metric=lambda d, s=series: ctx.metric(s, d),
                                       augment=pcfg["augment"], class_weights=pcfg["class_weights"],
                                       progress=lambda f, si=si: ctx.progress_within("train", (si + f) / len(sizes)),
                                       y_stats=y_stats, net=init, **kw)
@@ -412,12 +437,15 @@ def run_train(ctx: Ctx, p: dict):
         if task == "anomaly":                      # relative growth of the reconstruction error
             drop = (ptq - fval) / max(abs(fval), 1e-9) * -0.1 if fval else 0.0
         ctx.log(f"size {v['size']}: post-training INT8 on validation {ptq} (float {fval})")
-        if drop > 0.01:
-            ctx.log(f"size {v['size']}: drop {drop:.3f} > 0.01, quantization-aware fine-tuning")
+        if tcfg["qat"] == "always" or (tcfg["qat"] == "auto" and drop > 0.01):
+            ctx.log(f"size {v['size']}: " + ("quantization-aware fine-tuning (always on)" if tcfg["qat"] == "always"
+                                              else f"drop {drop:.3f} > 0.01, quantization-aware fine-tuning"))
             act, _ = qexport.calibrate(v["net"], calib)
             backup = {k: t.clone() for k, t in v["net"].state_dict().items()}
-            v["net"], _ = trainer.qat_finetune(v["net"], act, Xn, y, idx, task, epochs=max(5, epochs // 3),
-                                               cancelled=ctx.cancelled, y_stats=y_stats)
+            v["net"], _ = trainer.qat_finetune(v["net"], act, Xn, y, idx, task,
+                                               epochs=tcfg["qat_epochs"] or max(5, epochs // 3), log=ctx.log,
+                                               cancelled=ctx.cancelled, y_stats=y_stats, cfg=tcfg,
+                                               metric=lambda d, s=f"qat:{v['size']}": ctx.metric(s, d))
             qat_path = ctx.dir / f"model_{v['size']}_qat.onnx"
             q_qat = qexport.export_qdq(v["net"], calib, qat_path, q=act)
             cand = {**v, "q": q_qat}
@@ -547,6 +575,7 @@ def run_train(ctx: Ctx, p: dict):
                                              "licence", "commercial_use", "recordings", "quality", "frontend")},
         "deployable": deployable, "evaluation_reason": eval_reason, "split_mode": idx["split_mode"],
         "goal": goal, "targets": targets, "budgets": p.get("budgets"), "metric_target": acc_target,
+        "training": tcfg,
         "variants": [{"size": x["size"], "summary": {k: x["summary"][k] for k in ("macs", "params", "spatial_axes")},
                       "layers": x["summary"]["layers"], "spec": x["spec"], "float": x["float"], "int8": x["int8"],
                       "quant_method": x.get("quant_method"),

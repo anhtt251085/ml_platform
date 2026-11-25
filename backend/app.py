@@ -562,6 +562,7 @@ class ProjectIn(BaseModel):
     lr_search: bool = False           # try two learning rates per size, keep the better validation loss
     preprocess: dict = {}             # preprocessing stage settings (backend/preprocess.py)
     custom_variants: dict[str, list[dict]] = {}   # e.g. {"auto": layers} from the architecture recommender
+    training: dict = {}               # training settings (backend/trainer.py TRAIN_DEFAULTS); empty = automatic
 
 
 class RecommendIn(BaseModel):
@@ -606,6 +607,11 @@ def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
         raise HTTPException(400, f"goal must be one of {pipeline.GOALS}")
     cfg = body.model_dump()
     cfg["epochs"] = max(1, min(cfg["epochs"], 200))
+    from . import trainer
+    try:
+        trainer.normalize_training(cfg["training"], cfg["epochs"])
+    except trainer.TrainCfgError as e:
+        _bad(e)
     c_in, h_in, w_in = (int(v) for v in d["shape"])
     if pcfg["window_ops"]:                                   # the model sees the window after the C steps
         c_in, w_in = len(pcfg["channels"] or range(c_in)), w_in // pcfg["decimate"]
@@ -645,8 +651,8 @@ def project_get(pid: str, u: dict = Depends(auth.current)):
 
 
 # ---- jobs --------------------------------------------------------------------------------------------------------
-def _job(jid: str, u: dict, log_after: int = 0) -> dict:
-    j = pipeline.get(jid, log_after)
+def _job(jid: str, u: dict, log_after: int = 0, metrics_after: int | None = None) -> dict:
+    j = pipeline.get(jid, log_after, metrics_after)
     if not j:
         raise HTTPException(404, "unknown job")
     _own(u, j.get("org_id"), "job")
@@ -659,13 +665,27 @@ def job_list(kind: str | None = None, u: dict = Depends(auth.current)):
 
 
 @app.get("/api/jobs/{jid}")
-def job_get(jid: str, log_after: int = 0, u: dict = Depends(auth.current)):
-    j = _job(jid, u, log_after)
+def job_get(jid: str, log_after: int = 0, metrics_after: int | None = None, u: dict = Depends(auth.current)):
+    j = _job(jid, u, log_after, metrics_after)
     # server-side paths are not the customer's business
     (j.get("params") or {}).pop("model_path", None)
     if isinstance(j.get("result"), dict):
         j["result"].pop("selected_model_path", None)
     return j
+
+
+@app.get("/api/jobs/{jid}/log.txt")
+def job_log_download(jid: str, u: dict = Depends(auth.current)):
+    _job(jid, u)
+    return Response(pipeline.log_text(jid), media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{jid}.log"'})
+
+
+@app.get("/api/training/defaults")
+def training_defaults(u: dict = Depends(auth.current)):
+    from . import trainer
+    return {"defaults": trainer.TRAIN_DEFAULTS, "optimizers": trainer.OPTIMIZERS, "schedules": trainer.SCHEDULES,
+            "qat": trainer.QAT_MODES}
 
 
 @app.post("/api/jobs/{jid}/cancel")
