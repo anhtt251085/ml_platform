@@ -295,12 +295,18 @@ class EmulatedAgent(threading.Thread):
         port = next(b["port"] for b in self.BOARDS if b["id"] == run["board_id"])
         jobdir = config.DATA_DIR / "jobs" / run["job_id"]
         vec = np.load(jobdir / "hil_vectors.npz")
-        fw = hil.build(Path(req["build_dir"]), port, vec["x"], jobdir / "hil" / run["id"])
-        res = hil.run_emulated(fw["elf"], port)
+        fwdir = jobdir / "hil" / run["id"]
+        try:
+            fw = hil.build(Path(req["build_dir"]), port, vec["x"], fwdir)
+            res = hil.run_emulated(fw["elf"], port)
+        finally:
+            import shutil
+            shutil.rmtree(fwdir, ignore_errors=True)              # firmware is rebuilt per run; keep no copies
         complete(run["id"], {
             "ok": True, "emulated": True, "outputs": res["outputs"], "cycles": res["cycles"],
             "cycles_min": res.get("cycles_min"), "cycles_max": res.get("cycles_max"), "latency_ms": None,
             "stack_painted": res["stack_painted"], "board": run["board_id"], "n_vectors": len(res["outputs"]),
+            "config": res.get("config") or {},
             "firmware": f"sai-hil-harness 1 ({port}, text {fw['text']} B, bss {fw['bss']} B)",
             "log": [f"built {Path(fw['elf']).name}", f"qemu {port}: DONE {res['status']}",
                     "cycles: QEMU -icount instruction clock (emulated, not latency evidence)"]})

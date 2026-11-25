@@ -42,7 +42,7 @@ PORTS = {
                        "emulator": ["qemu-system-riscv32", "-M", "virt", "-bios", "none", "-nographic",
                                     "-monitor", "none", "-icount", "shift=0", "-kernel"], "clock_hz": None},
     "stm32h753-nucleo": {"target": "cortex-m7", "isa": "arm", "flags": M7_FLAGS, "startup": "startup_cm7.c",
-                         "emulator": None, "clock_hz": 64_000_000},
+                         "emulator": None, "clock_hz": 480_000_000},
     "md6605-evb": {"target": "md6605", "isa": "riscv", "flags": RV_FLAGS, "startup": "startup_rv32.S",
                    "emulator": None, "clock_hz": 66_666_666},
 }

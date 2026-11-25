@@ -12,7 +12,7 @@ import json
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -62,14 +62,22 @@ def health():
     return {"ok": True, "version": config.PLATFORM_VERSION, "schema": db.version(), "mode": config.MODE}
 
 
+def _secure(request: Request) -> bool:
+    if config.COOKIE_SECURE in ("1", "true", "yes"):
+        return True
+    if config.COOKIE_SECURE in ("0", "false", "no"):
+        return False
+    return request.url.scheme == "https"
+
+
 @app.post("/api/auth/login")
-def login(body: LoginIn, response: Response):
+def login(body: LoginIn, response: Response, request: Request):
     try:
         token, u = auth.login(body.email, body.password)
     except PermissionError as e:
         auth.audit(None, "login_failed", body.email.lower())
         raise HTTPException(401, str(e)) from None
-    response.set_cookie("sai_session", token, httponly=True, samesite="lax", secure=config.COOKIE_SECURE,
+    response.set_cookie("sai_session", token, httponly=True, samesite="lax", secure=_secure(request),
                         max_age=auth.SESSION_S)
     auth.audit(u, "login")
     return {"user": u, "token": token}
@@ -244,7 +252,17 @@ def admin_agent_disable(aid: str, u: dict = Depends(auth.require("farm_admin")))
 
 @app.get("/api/admin/queue")
 def admin_queue(u: dict = Depends(auth.require("platform_admin"))):
-    return pipeline.queue_stats()
+    from . import retention
+    return {**pipeline.queue_stats(), "retention": db.get_setting("retention_last"),
+            "retention_days": retention.RETENTION_DAYS, "upload_ttl_days": retention.UPLOAD_TTL_DAYS}
+
+
+@app.post("/api/admin/retention")
+def admin_retention(u: dict = Depends(auth.require("platform_admin"))):
+    from . import retention
+    r = retention.sweep()
+    auth.audit(u, "retention_sweep", "", {"freed_bytes": r["freed_bytes"], "removed": r["removed"]})
+    return r
 
 
 @app.post("/api/admin/queue/pause")
@@ -326,18 +344,27 @@ def _tpl(tid, u: dict | None = None):
     return t
 
 
-async def _read_capped(file: UploadFile, limit: int) -> bytes:
-    """Read an upload in chunks and stop at the limit (never holds more than limit + 1 MB)."""
-    chunks, total = [], 0
-    while True:
-        chunk = await file.read(1 << 20)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > limit:
-            raise HTTPException(413, f"file larger than {limit // (1 << 20)} MB")
-        chunks.append(chunk)
-    return b"".join(chunks)
+async def _stage_upload(file: UploadFile, limit: int) -> Path:
+    """Stream an upload to uploads/ in 1 MB chunks (constant memory), stopping at the limit."""
+    dst = config.DATA_DIR / "uploads" / f"ingest_{uuid.uuid4().hex}"
+    total = 0
+    try:
+        with open(dst, "wb") as f:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise HTTPException(413, f"file larger than {limit // (1 << 20)} MB")
+                f.write(chunk)
+    except BaseException:
+        dst.unlink(missing_ok=True)
+        raise
+    return dst
+
+
+MAX_MODEL_BYTES = 256 * 1024 * 1024        # an MCU model is far smaller; this bounds the explorer upload
 
 
 def _ds(did: str, u: dict) -> dict:
@@ -362,18 +389,33 @@ async def dataset_preview(file: UploadFile = File(...), u: dict = Depends(auth.c
 async def dataset_upload(template_id: str = Form(...), file: UploadFile = File(...), window: int | None = Form(None),
                          hop: int | None = Form(None), mapping: str | None = Form(None),
                          licence: str | None = Form(None), u: dict = Depends(auth.current)):
-    raw = await _read_capped(file, config.MAX_UPLOAD_BYTES)
     tpl = _tpl(template_id, u)
     try:
         m = json.loads(mapping) if mapping else None
+    except json.JSONDecodeError as e:
+        _bad(e)
+    staged = await _stage_upload(file, config.MAX_UPLOAD_BYTES)
+    size = staged.stat().st_size
+    if size > config.INLINE_INGEST_BYTES:
+        # big file: a worker parses it; the client polls the job and gets the dataset from its result
+        job = pipeline.create("ingest", {"path": str(staged), "filename": file.filename or "upload.csv",
+                                         "template_id": template_id, "window": window, "hop": hop, "mapping": m,
+                                         "licence": licence or "unknown"}, org_id=u["org_id"], user_id=u["id"], priority=1)
+        auth.audit(u, "dataset_upload_queued", job["id"], {"name": file.filename, "bytes": size})
+        auth.meter(u["org_id"], "upload_bytes", size, job["id"])
+        return JSONResponse({"job": {"id": job["id"], "status": job["status"]}}, status_code=202)
+    try:
+        raw = staged.read_bytes()
         # parsing / feature extraction is CPU work: keep it off the event loop
         meta = await run_in_threadpool(data.ingest_bytes, raw, file.filename or "upload.csv", tpl, window=window,
                                        hop=hop, mapping=m, licence=licence or "unknown")
-    except (data.DataError, json.JSONDecodeError) as e:
+    except data.DataError as e:
         _bad(e)
+    finally:
+        staged.unlink(missing_ok=True)
     store.add_dataset(meta, u["org_id"])
     auth.audit(u, "dataset_uploaded", meta["id"], {"name": meta.get("name"), "n": meta.get("n")})
-    auth.meter(u["org_id"], "upload_bytes", len(raw), meta["id"])
+    auth.meter(u["org_id"], "upload_bytes", size, meta["id"])
     return meta
 
 
@@ -676,9 +718,9 @@ async def explorer_analyze(file: UploadFile = File(...), targets: str = Form("md
     name = (file.filename or "model.onnx").lower()
     if not name.endswith((".onnx", ".tflite")):
         raise HTTPException(400, "upload an INT8 .onnx or .tflite model")
-    raw = await _read_capped(file, config.MAX_UPLOAD_BYTES)
-    path = config.DATA_DIR / "uploads" / f"{uuid.uuid4().hex}{Path(name).suffix}"
-    path.write_bytes(raw)
+    staged = await _stage_upload(file, MAX_MODEL_BYTES)            # streamed to disk, constant memory
+    path = staged.with_name(f"{uuid.uuid4().hex}{Path(name).suffix}")
+    staged.replace(path)
     auth.audit(u, "model_uploaded", path.name, {"filename": file.filename})
     return pipeline.create("analyze", {"model_path": str(path), "filename": file.filename,
                                        "targets": [t for t in targets.split(",") if t], "goal": goal,
@@ -814,6 +856,8 @@ async def _security_headers(request, call_next):
                             "base-uri 'none'")
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.scheme == "https":
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return resp
 
 
