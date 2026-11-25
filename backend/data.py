@@ -51,8 +51,18 @@ class DataError(ValueError):
 
 
 # ---- storage -----------------------------------------------------------------------------------------------------
+MAX_VALUES = 400_000_000          # 1.6 GB of float32 once decoded: larger datasets go through a worker import
+
+
 def _save(X, y, labels, meta: dict, groups=None, template: dict | None = None) -> dict:
-    X = np.nan_to_num(np.asarray(X, np.float32))
+    X = np.asarray(X, np.float32)
+    if not np.isfinite(X).all():
+        bad = int((~np.isfinite(X)).sum())
+        raise DataError(f"{bad} sample values are NaN or infinite: clean the recording (or drop those rows)")
+    if meta.get("task") == "regression" and not np.isfinite(np.asarray(y, np.float64)).all():
+        raise DataError("some regression targets are NaN or infinite")
+    if len(X) < 10:
+        raise DataError(f"only {len(X)} windows: at least 10 are needed (100+ per class recommended)")
     fe = (template or {}).get("frontend")
     if fe and X.shape[2] == 1 and X.shape[3] == int(fe["raw_length"]):
         X = features.apply(fe, X)                     # raw signal -> the C front end's features
@@ -244,7 +254,14 @@ def from_csv_bytes(raw: bytes, template: dict, name: str, window: int | None = N
     regression = task == "regression"
     if task == "anomaly":
         labs = ["normal" if v.lower() in ("normal", "0", "ok", "healthy") else "anomaly" for v in labs]
-    Xs, ys, gs = _windows(data, labs if not regression else [float(v) for v in labs], segs, window, hop, regression)
+    if regression:
+        try:
+            labs = [float(v) for v in labs]
+        except ValueError:
+            raise DataError("regression labels must be numeric") from None
+    if not np.isfinite(data).all():
+        raise DataError("some channel values are NaN or infinite: clean the recording")
+    Xs, ys, gs = _windows(data, labs, segs, window, hop, regression)
     if len(Xs) < 10:
         raise DataError(f"only {len(Xs)} windows of {window} samples; provide longer recordings or a shorter window")
     raw_stats = None
@@ -269,7 +286,32 @@ def from_csv_bytes(raw: bytes, template: dict, name: str, window: int | None = N
     return _save(X, y, labels, meta, np.array(gs) if si is not None else None, template)
 
 
+def _npz_guard(raw: bytes):
+    """Refuse decompression bombs: the declared uncompressed size of every member and the element count in each
+    .npy header must stay within MAX_VALUES before numpy inflates anything."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        raise DataError("not a readable .npz") from None
+    total = 0
+    for info in zf.infolist():
+        total += info.file_size
+        if total > MAX_VALUES * 8:
+            raise DataError("the arrays in this .npz are too large to import here (ask for a worker import)")
+        if info.filename.endswith(".npy"):
+            with zf.open(info) as f:
+                try:
+                    ver = np.lib.format.read_magic(f)
+                    shape, _, _ = (np.lib.format.read_array_header_1_0(f) if ver == (1, 0)
+                                   else np.lib.format.read_array_header_2_0(f))
+                except ValueError as e:
+                    raise DataError(f"{info.filename}: {e}") from None
+            if int(np.prod(shape, dtype=np.int64)) > MAX_VALUES:
+                raise DataError(f"{info.filename} has {int(np.prod(shape, dtype=np.int64)):,} values: too large")
+
+
 def from_npz_bytes(raw: bytes, template: dict, name: str, licence: str | None = None) -> dict:
+    _npz_guard(raw)
     try:
         z = np.load(io.BytesIO(raw), allow_pickle=False)
     except Exception:
@@ -277,7 +319,7 @@ def from_npz_bytes(raw: bytes, template: dict, name: str, licence: str | None = 
     if "X" not in z or "y" not in z:
         raise DataError("NPZ needs arrays X and y")
     try:                                   # arrays load lazily: a pickled array is refused here
-        X = np.nan_to_num(np.asarray(z["X"], np.float32))
+        X = np.asarray(z["X"], np.float32)
         y = np.asarray(z["y"])
         names = [str(s) for s in z["labels"]] if "labels" in z else None
         groups = np.asarray(z["groups"]) if "groups" in z else None
@@ -292,19 +334,29 @@ def from_npz_bytes(raw: bytes, template: dict, name: str, licence: str | None = 
     if len(X) != len(y) or (groups is not None and len(groups) != len(y)):
         raise DataError("X, y (and groups) have different lengths")
     task = template["task"]
-    if task == "regression":
-        labels, y = template["labels"], y.astype(np.float32)
-    else:
-        if names:
-            labels = names
-            y = y.astype(int)
-        elif y.dtype.kind in "iu":
-            labels = [str(i) for i in range(int(y.max()) + 1)]
-        else:
-            labels = sorted(set(str(v) for v in y))
-            y = np.array([labels.index(str(v)) for v in y])
+    try:
+        y, labels = _npz_labels(y, names, task, template)
+    except (ValueError, TypeError) as e:
+        raise DataError(f"labels: {e}") from None
     return _save(X, y, labels, {"source": "npz", "name": name, "template": template["id"], "task": task,
                                 "licence": licence}, groups, template)
+
+
+def _npz_labels(y, names, task, template):
+    if task == "regression":
+        return y.astype(np.float32), template["labels"]
+    if names:
+        if y.dtype.kind not in "iu":
+            raise ValueError("with a `labels` array, y must hold class indices")
+        if len(y) and (y.min() < 0 or y.max() >= len(names)):
+            raise ValueError(f"class indices must be in 0..{len(names) - 1}")
+        return y.astype(int), names
+    if y.dtype.kind in "iu":
+        if len(y) and y.min() < 0:
+            raise ValueError("class indices must be >= 0")
+        return y.astype(int), [str(i) for i in range(int(y.max()) + 1)]
+    labels = sorted(set(str(v) for v in y))
+    return np.array([labels.index(str(v)) for v in y]), labels
 
 
 SPEAKER = re.compile(r"^([0-9a-f]{8})_nohash_", re.I)     # Speech Commands naming: <speaker>_nohash_<n>.wav
@@ -331,11 +383,14 @@ def from_wav_zip(raw: bytes, template: dict, name: str, licence: str | None = No
             continue
         if info.file_size > 50 * 1024 * 1024:
             raise DataError(f"{info.filename} is larger than 50 MB")
-        with zf.open(info) as f, wave.open(f) as w:
-            if w.getsampwidth() != 2 or w.getnchannels() != 1:
-                raise DataError(f"{info.filename}: need 16-bit mono PCM")
-            rates.add(w.getframerate())
-            a = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+        try:
+            with zf.open(info) as f, wave.open(f) as w:
+                if w.getsampwidth() != 2 or w.getnchannels() != 1:
+                    raise DataError(f"{info.filename}: need 16-bit mono PCM")
+                rates.add(w.getframerate())
+                a = np.frombuffer(w.readframes(min(w.getnframes(), L)), dtype="<i2").astype(np.float32) / 32768.0
+        except (wave.Error, EOFError) as e:
+            raise DataError(f"{info.filename}: not a valid WAV file ({e})") from None
         a = a[:L] if len(a) >= L else np.pad(a, (0, L - len(a)))
         Xs.append(a)
         labs.append(label)
@@ -366,11 +421,57 @@ def ingest_bytes(raw: bytes, filename: str, template: dict, **kw) -> dict:
     raise DataError("supported files: .csv (time series), .npz (arrays), .zip (label folders of WAV files)")
 
 
-def ingest_url(url: str, template: dict, **kw) -> dict:
-    if not url.lower().startswith("https://"):
+def safe_fetch(url: str, limit: int) -> bytes:
+    """HTTPS GET that cannot reach internal services: the host must resolve only to public addresses, the
+    connection goes to the address that was checked (no DNS rebinding), redirects are refused."""
+    import http.client
+    import ipaddress
+    import socket
+    import ssl
+    from urllib.parse import urlsplit
+
+    u = urlsplit(url)
+    if u.scheme != "https" or not u.hostname:
         raise DataError("only https:// URLs are accepted")
-    req = urllib.request.Request(url, headers={"User-Agent": "sai-platform-ingest/0.2"})
-    with urllib.request.urlopen(req, timeout=120) as resp:        # noqa: S310 (scheme checked above)
-        raw = resp.read(config.MAX_UPLOAD_BYTES + 1)
+    if u.port not in (None, 443):
+        raise DataError("only the standard HTTPS port is allowed")
+    try:
+        infos = socket.getaddrinfo(u.hostname, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise DataError("the host name does not resolve") from None
+    addrs = {i[4][0] for i in infos}
+    for a in addrs:
+        ip = ipaddress.ip_address(a)
+        if not ip.is_global or ip.is_multicast:
+            raise DataError("the URL points to a private or reserved network address")
+    ip = sorted(addrs)[0]
+    ctx = ssl.create_default_context()
+
+    class _Pinned(http.client.HTTPSConnection):
+        def connect(self):
+            sock = socket.create_connection((ip, 443), timeout=60)
+            self.sock = ctx.wrap_socket(sock, server_hostname=u.hostname)
+
+    conn = _Pinned(u.hostname, 443, timeout=120, context=ctx)
+    try:
+        conn.request("GET", (u.path or "/") + (f"?{u.query}" if u.query else ""),
+                     headers={"User-Agent": "sai-platform-ingest/0.3", "Host": u.hostname})
+        resp = conn.getresponse()
+        if resp.status in (301, 302, 303, 307, 308):
+            raise DataError("the URL redirects; give the final https:// address of the file")
+        if resp.status != 200:
+            raise DataError(f"download failed: HTTP {resp.status}")
+        raw = resp.read(limit + 1)
+    except (OSError, http.client.HTTPException) as e:
+        raise DataError(f"download failed: {type(e).__name__}") from None
+    finally:
+        conn.close()
+    if len(raw) > limit:
+        raise DataError("file too large")
+    return raw
+
+
+def ingest_url(url: str, template: dict, **kw) -> dict:
+    raw = safe_fetch(url, config.MAX_UPLOAD_BYTES)
     name = url.rstrip("/").rsplit("/", 1)[-1].split("?")[0] or "download.csv"
     return ingest_bytes(raw, name, template, **kw)

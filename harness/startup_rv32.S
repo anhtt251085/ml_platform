@@ -7,6 +7,8 @@ Reset_Handler:
     la gp, __global_pointer$
     .option pop
     la sp, _stack_top
+    la t0, trap_entry          /* traps report "DONE trap" instead of jumping to an undefined address */
+    csrw mtvec, t0
     li t0, 0x2000              /* mstatus.FS = initial: enable the F extension */
     csrs mstatus, t0
     la t0, _data_load
@@ -26,3 +28,9 @@ Reset_Handler:
     j 3b
 4:  call main
 5:  j 5b
+
+    .align 4
+trap_entry:
+    la sp, _stack_top
+    call port_trap
+6:  j 6b

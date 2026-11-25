@@ -67,13 +67,16 @@ class QemuDriver(BoardDriver):
 
 
 class _SerialDriver(BoardDriver):
-    """Flash with a probe tool, then read the harness's UART lines until DONE."""
+    """Flash with a probe tool, then capture the harness's UART lines until DONE. The port is opened and flushed
+    BEFORE the target starts (flash-and-run or reset), so the first lines are never lost; lines before the SAI-HIL
+    header (boot noise, a previous run) are ignored by the parser."""
 
-    def _read_uart(self, timeout: int) -> dict:
+    def _capture(self, start, timeout: int) -> dict:
         import serial                                        # pyserial
         lines = []
         with serial.Serial(self.cfg["serial"], self.cfg.get("baud", 115200), timeout=1) as s:
-            self._reset()
+            s.reset_input_buffer()
+            start()
             t0 = time.time()
             while time.time() - t0 < timeout:
                 raw = s.readline().decode(errors="replace").strip()
@@ -86,9 +89,6 @@ class _SerialDriver(BoardDriver):
             raise hil.HilError(f"board did not finish: {lines[-3:]}")
         return res
 
-    def _reset(self):
-        pass
-
 
 class PyOcdDriver(_SerialDriver):
     """ST-LINK / CMSIS-DAP boards (NUCLEO-H753ZI)."""
@@ -98,18 +98,27 @@ class PyOcdDriver(_SerialDriver):
                                *(["-u", self.cfg["uid"]] if self.cfg.get("uid") else [])],
                               capture_output=True, text=True, timeout=timeout)
 
+    _health = (0.0, {"probe": "unknown"})
+
     def health(self):
-        r = subprocess.run(["pyocd", "list"], capture_output=True, text=True)
-        return {"probe": "ok" if self.cfg.get("uid", "") in r.stdout else "not found"}
+        """Cached for 60 s; a hung probe cannot stall the agent (10 s timeout)."""
+        t, h = self._health
+        if time.time() - t < 60:
+            return h
+        try:
+            r = subprocess.run(["pyocd", "list"], capture_output=True, text=True, timeout=10)
+            uid = self.cfg.get("uid")
+            h = {"probe": ("ok" if uid in r.stdout else "not found") if uid else "no uid configured"}
+        except (OSError, subprocess.TimeoutExpired) as e:
+            h = {"probe": f"error: {type(e).__name__}"}
+        self._health = (time.time(), h)
+        return h
 
     def run(self, elf, timeout=60):
-        f = self._pyocd("flash", elf)
+        f = self._pyocd("flash", elf)                      # flash leaves the core halted after programming
         if f.returncode:
             raise hil.HilError("pyocd flash failed: " + f.stderr[-400:])
-        return self._read_uart(timeout)
-
-    def _reset(self):
-        self._pyocd("reset", timeout=30)
+        return self._capture(lambda: self._pyocd("reset", timeout=30), timeout)
 
 
 class JLinkDriver(_SerialDriver):
@@ -120,11 +129,14 @@ class JLinkDriver(_SerialDriver):
         subprocess.run([hil.cc_for(self.cfg["port"]).replace("gcc", "objcopy"), "-O", "ihex", elf, str(bin_)], check=True)
         script = Path(elf).with_suffix(".jlink")
         script.write_text(f"loadfile {bin_}\nr\ng\nq\n")
-        f = subprocess.run(["JLinkExe", "-device", self.cfg.get("jlink_device", "MD6605"), "-if", "JTAG", "-speed", "4000",
-                            "-autoconnect", "1", "-CommandFile", str(script)], capture_output=True, text=True, timeout=120)
-        if f.returncode:
-            raise hil.HilError("J-Link flash failed: " + f.stdout[-400:])
-        return self._read_uart(timeout)
+
+        def flash_and_start():               # runs with the UART already open, so no output is missed
+            f = subprocess.run(["JLinkExe", "-device", self.cfg.get("jlink_device", "MD6605"), "-if", "JTAG", "-speed",
+                                "4000", "-autoconnect", "1", "-CommandFile", str(script)], capture_output=True, text=True,
+                               timeout=120)
+            if f.returncode:
+                raise hil.HilError("J-Link flash failed: " + f.stdout[-400:])
+        return self._capture(flash_and_start, timeout)
 
 
 DRIVERS = {"qemu": QemuDriver, "pyocd": PyOcdDriver, "jlink": JLinkDriver}
@@ -156,18 +168,61 @@ class Agent:
         return bool(run)
 
     def loop(self):
-        print("registered", self.register())
+        """Never exits on network errors: backs off (2 s .. 60 s) and keeps polling."""
+        delay = 2
         while True:
-            if not self.poll_once():
-                time.sleep(2)
+            try:
+                print("registered", self.register())
+                break
+            except OSError as e:
+                print(f"register failed ({e}); retrying in {delay} s")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+        delay = 2
+        while True:
+            try:
+                if not self.poll_once():
+                    time.sleep(2)
+                delay = 2
+            except OSError as e:
+                print(f"poll failed ({e}); retrying in {delay} s")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    def _post_result(self, rid: str, body: dict):
+        for attempt in range(5):
+            try:
+                return self._req("POST", f"/api/agent/runs/{rid}/result", body)
+            except OSError as e:
+                print(f"result post failed ({e}); attempt {attempt + 1}/5")
+                time.sleep(2 ** attempt)
+        return None
+
+    def _heartbeat_while(self, done):
+        """Keep the boards online on the server during a long build/flash/run."""
+        while not done.wait(10):
+            try:
+                self._req("POST", "/api/agent/poll", {"health": {}, "heartbeat_only": True})
+            except OSError:
+                pass
 
     def execute(self, run: dict):
+        import shutil
+        import threading
         rid, board = run["id"], run["board_id"]
-        drv = self.drivers[board]
+        drv = self.drivers.get(board)
+        if drv is None:
+            self._post_result(rid, {"ok": False, "error": f"board {board} is not configured on this agent"})
+            return
         work = self.work / rid
+        done = threading.Event()
+        threading.Thread(target=self._heartbeat_while, args=(done,), daemon=True).start()
         try:
             pkg = self._req("GET", f"/api/agent/runs/{rid}/package", raw=True)
-            zipfile.ZipFile(io.BytesIO(pkg)).extractall(work)
+            zf = zipfile.ZipFile(io.BytesIO(pkg))
+            if sum(i.file_size for i in zf.infolist()) > 512 * 1024 * 1024:
+                raise hil.HilError("package too large")
+            zf.extractall(work)                   # extractall strips absolute paths and '..' components
             vec = np.array(json.loads((work / "sai_package" / "hil_vectors.json").read_text()), np.int8)
             fw = hil.build(work / "sai_package", drv.cfg["port"], vec, work / "fw")
             try:
@@ -177,15 +232,21 @@ class Agent:
                     raise
                 res = drv.run(fw["elf"])
             clock = hil.PORTS[drv.cfg["port"]]["clock_hz"]
-            self._req("POST", f"/api/agent/runs/{rid}/result", {
+            cfg_clock = res.get("config", {}).get("clock")
+            if cfg_clock and cfg_clock.isdigit():
+                clock = int(cfg_clock)
+            self._post_result(rid, {
                 "ok": True, "emulated": drv.emulated, "outputs": res["outputs"], "cycles": res["cycles"],
                 "latency_ms": None if drv.emulated or not clock else round(res["cycles"] / clock * 1000, 4),
                 "stack_painted": res["stack_painted"], "board": board, "n_vectors": len(res["outputs"]),
+                "config": res.get("config", {}),
                 "firmware": f"sai-hil-harness 1 ({drv.cfg['port']}, text {fw['text']} B)",
                 "log": [f"agent driver {type(drv).__name__}"]})
         except Exception as e:                   # report, never crash the agent
-            self._req("POST", f"/api/agent/runs/{rid}/result", {"ok": False, "error": str(e)[-800:], "board": board,
-                                                                "emulated": drv.emulated})
+            self._post_result(rid, {"ok": False, "error": str(e)[-800:], "board": board, "emulated": drv.emulated})
+        finally:
+            done.set()
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def main():

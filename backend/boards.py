@@ -29,11 +29,19 @@ def register(agent_id: str, boards: list[dict], simulated: bool = False) -> list
         for b in boards:
             if b.get("target") not in sai_engine.TARGETS:
                 continue
-            bid = b.get("id") or f"{agent_id}:{b.get('serial', uuid.uuid4().hex[:6])}"
-            c.execute("INSERT OR REPLACE INTO boards (id, name, target, agent_id, status, last_seen, simulated, info,"
-                      " fail_count, health) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
-                      (bid, b.get("name", bid), b["target"], agent_id, "idle", db.now(), int(simulated),
-                       db.j({k: v for k, v in b.items() if k not in ("id", "name", "target")})))
+            bid = str(b.get("id") or f"{agent_id}:{b.get('serial', uuid.uuid4().hex[:6])}")[:64]
+            info = db.j({k: v for k, v in b.items() if k not in ("id", "name", "target")})
+            own = c.execute("SELECT agent_id FROM boards WHERE id=?", (bid,)).fetchone()
+            if own and own[0] != agent_id:
+                out.append({"id": bid, "error": "board id belongs to another agent"})
+                continue
+            if own:        # re-register: keep status, failures and quarantine; refresh description only
+                c.execute("UPDATE boards SET name=?, target=?, info=?, last_seen=?, simulated=? WHERE id=?",
+                          (str(b.get("name", bid))[:120], b["target"], info, db.now(), int(simulated), bid))
+            else:
+                c.execute("INSERT INTO boards (id, name, target, agent_id, status, last_seen, simulated, info,"
+                          " fail_count, health) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
+                          (bid, str(b.get("name", bid))[:120], b["target"], agent_id, "idle", db.now(), int(simulated), info))
             out.append({"id": bid, "target": b["target"]})
     return out
 
@@ -53,9 +61,26 @@ def heartbeat(agent_id: str, health: dict | None = None):
 
 
 def reset_board(board_id: str):
-    """Lab action after fixing a board: clear the failure count and put it back in service."""
+    """Lab action after fixing a board: fail its open run, clear the failure count, put it back in service."""
     with db.conn() as c:
+        c.execute("UPDATE hil_runs SET status='failed', result=?, updated=? WHERE board_id=? AND status='running'",
+                  (db.j({"ok": False, "error": "board reset by the lab"}), db.now(), board_id))
         c.execute("UPDATE boards SET status='idle', fail_count=0 WHERE id=?", (board_id,))
+
+
+RUN_LEASE_S = 30 * 60
+
+
+def reap_runs():
+    """Runs claimed longer than the lease (agent died, board hung) fail and free their board."""
+    cutoff = db.now() - RUN_LEASE_S
+    with db.conn() as c:
+        stale = [db.row(r) for r in c.execute("SELECT id, board_id FROM hil_runs WHERE status='running' AND updated<?",
+                                              (cutoff,))]
+        for r in stale:
+            c.execute("UPDATE hil_runs SET status='failed', result=?, updated=? WHERE id=?",
+                      (db.j({"ok": False, "error": f"no result within {RUN_LEASE_S // 60} min (agent lost?)"}), db.now(), r["id"]))
+            c.execute("UPDATE boards SET status='idle' WHERE id=? AND status='busy'", (r["board_id"],))
 
 
 QUARANTINE_AFTER = 3
@@ -106,12 +131,20 @@ def list_runs(job_id: str | None = None, limit: int = 50, org_id: str | None = N
 
 
 def claim(agent_id: str) -> dict | None:
-    """Give the agent the oldest queued run for an idle online board it owns."""
+    """Give the agent the oldest queued run for an idle board it owns whose kind the run's plan allows."""
+    reap_runs()
     with db.conn() as c:
         boards = [db.row(b) for b in c.execute("SELECT * FROM boards WHERE agent_id=? AND status='idle'", (agent_id,))]
         for b in boards:
-            r = c.execute("SELECT * FROM hil_runs WHERE status='queued' AND target=? AND (board_id IS NULL OR board_id=?)"
-                          " ORDER BY created LIMIT 1", (b["target"], b["id"])).fetchone()
+            info = db.uj(b["info"], {})
+            kind = "emulated" if info.get("emulated") else "simulated" if b["simulated"] else "physical"
+            r = None
+            for cand in c.execute("SELECT * FROM hil_runs WHERE status='queued' AND target=? AND (board_id IS NULL OR"
+                                  " board_id=?) ORDER BY created LIMIT 20", (b["target"], b["id"])).fetchall():
+                allowed = db.uj(cand["request"], {}).get("allowed_kinds")
+                if not allowed or kind in allowed:
+                    r = cand
+                    break
             if r:
                 c.execute("UPDATE hil_runs SET status='running', board_id=?, updated=? WHERE id=?", (b["id"], db.now(), r["id"]))
                 c.execute("UPDATE boards SET status='busy' WHERE id=?", (b["id"],))
@@ -122,16 +155,50 @@ def claim(agent_id: str) -> dict | None:
     return None
 
 
-def complete(rid: str, result: dict):
+RESULT_KEYS = {"ok": bool, "simulated": bool, "emulated": bool, "outputs": list, "cycles": int, "cycles_min": int,
+               "cycles_max": int, "latency_ms": float, "stack_painted": int, "energy_uj": float, "board": str,
+               "n_vectors": int, "firmware": str, "log": list, "error": str, "config": dict}
+
+
+def _clean(result: dict) -> dict:
+    """Keep known fields with the right types (agents are not trusted with free-form JSON)."""
+    out = {}
+    for k, typ in RESULT_KEYS.items():
+        v = result.get(k)
+        if v is None:
+            continue
+        try:
+            if typ is list:
+                out[k] = list(v)[:4096] if k == "outputs" else [str(x)[:300] for x in list(v)[:50]]
+            elif typ is dict:
+                out[k] = {str(a)[:40]: str(b)[:80] for a, b in dict(v).items()}
+            elif typ is str:
+                out[k] = str(v)[:2000]
+            else:
+                out[k] = typ(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def complete(rid: str, result: dict, agent_id: str | None = None):
+    """Record a run's result. With agent_id (an HTTP agent) the run must be running on one of its boards.
+    outputs_match is always computed here, never taken from the agent."""
     run = get_run(rid)
     if not run:
         raise KeyError(rid)
+    if agent_id is not None and (run["status"] != "running" or board_agent(run["board_id"]) != agent_id):
+        raise PermissionError("this run is not running on one of your boards")
+    result = _clean(result)
     req = run["request"]
     expected = req.get("expected_outputs")
     got = result.get("outputs")
-    if expected is not None and got is not None:
-        result["outputs_match"] = bool(np.array_equal(np.array(expected), np.array(got)))
-    status = "succeeded" if result.get("ok", True) and result.get("outputs_match", True) else "failed"
+    if expected is not None:
+        try:
+            result["outputs_match"] = got is not None and bool(np.array_equal(np.array(expected), np.array(got, dtype=np.int64)))
+        except (TypeError, ValueError):
+            result["outputs_match"] = False
+    status = "succeeded" if result.get("ok", True) and result.get("outputs_match", expected is None) else "failed"
     with db.conn() as c:
         c.execute("UPDATE hil_runs SET status=?, result=?, updated=? WHERE id=?", (status, db.j(result), db.now(), rid))
         if status == "succeeded":
@@ -139,7 +206,11 @@ def complete(rid: str, result: dict):
         else:   # a board that fails QUARANTINE_AFTER runs in a row leaves service until the lab resets it
             c.execute("UPDATE boards SET fail_count=COALESCE(fail_count,0)+1, status=CASE WHEN COALESCE(fail_count,0)+1>=?"
                       " THEN 'quarantined' ELSE 'idle' END WHERE id=?", (QUARANTINE_AFTER, run["board_id"]))
-        real = not result.get("simulated") and not result.get("emulated")
+        # calibration and `measured` only from physical boards at the reference clock SAI plans for
+        ref_clock = sai_engine.TARGETS.get(run["target"], {}).get("clock_hz")
+        clock = (result.get("config") or {}).get("clock")
+        real = (not result.get("simulated") and not result.get("emulated")
+                and (clock is None or str(clock) == str(ref_clock)))
         if status == "succeeded" and real and result.get("cycles") and req.get("macs"):
             c.execute("INSERT INTO calibration VALUES (?,?,?,?,?,?)",
                       (run["target"], req.get("objective"), int(req["macs"]), int(result["cycles"]), rid, db.now()))
@@ -224,12 +295,18 @@ class EmulatedAgent(threading.Thread):
         port = next(b["port"] for b in self.BOARDS if b["id"] == run["board_id"])
         jobdir = config.DATA_DIR / "jobs" / run["job_id"]
         vec = np.load(jobdir / "hil_vectors.npz")
-        fw = hil.build(Path(req["build_dir"]), port, vec["x"], jobdir / "hil" / run["id"])
-        res = hil.run_emulated(fw["elf"], port)
+        fwdir = jobdir / "hil" / run["id"]
+        try:
+            fw = hil.build(Path(req["build_dir"]), port, vec["x"], fwdir)
+            res = hil.run_emulated(fw["elf"], port)
+        finally:
+            import shutil
+            shutil.rmtree(fwdir, ignore_errors=True)              # firmware is rebuilt per run; keep no copies
         complete(run["id"], {
             "ok": True, "emulated": True, "outputs": res["outputs"], "cycles": res["cycles"],
             "cycles_min": res.get("cycles_min"), "cycles_max": res.get("cycles_max"), "latency_ms": None,
             "stack_painted": res["stack_painted"], "board": run["board_id"], "n_vectors": len(res["outputs"]),
+            "config": res.get("config") or {},
             "firmware": f"sai-hil-harness 1 ({port}, text {fw['text']} B, bss {fw['bss']} B)",
             "log": [f"built {Path(fw['elf']).name}", f"qemu {port}: DONE {res['status']}",
                     "cycles: QEMU -icount instruction clock (emulated, not latency evidence)"]})
