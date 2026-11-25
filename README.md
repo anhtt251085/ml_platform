@@ -1,4 +1,4 @@
-# SAI Platform (v1.0: roadmap M1–M6)
+# SAI Platform (v1.1: preprocessing, datasets, review fixes)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -85,6 +85,18 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
   enter calibration.
 * Synthetic demo data is labelled as synthetic in the dataset, the job page and the model card.
 
+## Preprocessing & datasets (v1.1)
+
+* **Preprocess step** in the wizard (between Data and Board & goal), with a live before/after preview:
+  channel selection, decimation (block average), per-window mean removal — run by the same C
+  (`frontends/sai_prep.c`) in training and on the MCU — then per-channel normalization (z-score, robust,
+  min-max, none) fit on the train split, optional clipping, training-only augmentation (gain, noise, time shift),
+  class weights and split ratios / unit (recording or window).
+* Packages ship `sai_app_prepare.h` + `sai_prep.[ch]`: raw window in, the model's exact int8 input out — tested
+  bit-for-bit against the training path.
+* **Datasets** pages: every dataset of the organisation with licence, shape, recordings and quality; a detail page
+  with class and channel statistics, a sample browser per class, usage, delete, and "Use in a new project".
+
 ## Commercial (M6)
 
 * **Plans**: Free (pool, fit check, estimates; 3 projects/month, no packages, no board farm), Standard (packages,
@@ -147,7 +159,7 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * **Pool base weights**: researchers train base weights per model type; customers fine-tune from them.
 * **Learning-rate search** (optional) and CUDA training when a GPU worker has one.
 
-## Security model (M1)
+## Security model
 
 * Sign-in with email + password (scrypt); sessions are random tokens stored as SHA-256; HttpOnly cookie or bearer.
 * Roles: `platform_admin`, `researcher`, `lab` (SAI staff), `org_admin`, `member` (customers).
@@ -156,6 +168,12 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * Audit log of sign-ins, uploads, projects, downloads, admin actions; usage metering per org.
 * Reproducibility: every package records SAI version, toolchain and digests, dataset SHA-256, seeds;
   "Rebuild & compare" proves the package rebuilds byte for byte.
+* URL ingest only reaches public HTTPS addresses (resolved and pinned, no redirects); uploads are streamed with a
+  cap and NPZ sizes are checked before decompression; non-finite values are refused.
+* Lab agents can only act on runs claimed on their own boards; outputs are always compared server side; runs
+  have a lease; only physical boards at SAI's reference clock produce `measured` evidence and calibration.
+* CSP and security headers; login throttling; password change signs out other sessions; 500s return a reference
+  id, not internals; failed `sai verify` / `sai certify --check` fail the job.
 
 ## Known limitations
 

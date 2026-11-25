@@ -30,11 +30,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY --from=sai . /opt/sai-src
-RUN pip install --no-cache-dir /opt/sai-src && rm -rf /opt/sai-src && sai version
+# Bind-mounted for the install only: the SAI source never lands in an image layer.
+RUN --mount=type=bind,from=sai,target=/opt/sai-src,rw pip install --no-cache-dir /opt/sai-src && sai version
 
 COPY . .
-RUN useradd -m -u 1000 sai && mkdir -p /data && chown -R sai /data /app
+RUN useradd -m -u 1000 sai && mkdir -p /data && chown -R sai /data     # /app stays root-owned (read-only code)
 USER sai
 
 ENV SAI_PLATFORM_DATA=/data \

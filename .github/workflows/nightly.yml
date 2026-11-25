@@ -7,6 +7,9 @@ on:
     - cron: "17 2 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   regression:
     runs-on: ubuntu-24.04
@@ -24,6 +27,7 @@ jobs:
         with:
           repository: anhtt251085/mcu_edge_ai
           token: ${{ secrets.SAI_REPO_TOKEN }}
+          persist-credentials: false
           path: sai-src
       - uses: actions/setup-python@v5
         if: env.HAS_SAI_TOKEN == 'true'
@@ -58,8 +62,8 @@ jobs:
           export SAI_MD6605_GCC=/opt/xpack/xpack-riscv-none-elf-gcc-13.2.0-2/bin/riscv-none-elf-gcc
           export SAI_PLATFORM_DATA="$PWD/var-nightly"
           python -m backend.regression
-      - name: Save results for the next comparison
-        if: always() && env.HAS_SAI_TOKEN == 'true'
+      - name: Save results as the next baseline (only when the regression passed)
+        if: success() && env.HAS_SAI_TOKEN == 'true'
         uses: actions/cache/save@v4
         with:
           path: var-nightly

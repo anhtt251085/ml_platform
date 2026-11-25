@@ -64,6 +64,8 @@ def available(port: str) -> bool:
 
 
 def write_vectors(path: Path, x: np.ndarray):
+    if len(x) == 0:
+        raise HilError("no test vectors")
     x = np.ascontiguousarray(x.reshape(len(x), -1), dtype=np.int8)
     rows = ",\n".join("  {" + ",".join(str(int(v)) for v in r) + "}" for r in x)
     path.write_text("/* Generated: SAI HIL test vectors (int8, model input layout). */\n#include <stdint.h>\n"
@@ -94,27 +96,44 @@ def build(sai_build: Path, port: str, vectors: np.ndarray, out: Path) -> dict:
     return {"elf": str(elf), "port": port, "text": text, "data": data, "bss": bss}
 
 
-LINE = re.compile(r"^(SAI-HIL|OUT|CYC|STACK|DONE)\b(.*)$")
+LINE = re.compile(r"^(SAI-HIL|CFG|OUT|CYC|STACK|DONE)\b(.*)$")
 
 
-def parse(stdout: str, out_bytes: int | None = None) -> dict:
-    res = {"outputs": [], "cycles": None, "stack_painted": None, "status": None, "header": None}
-    for raw in stdout.replace("\r", "").splitlines():
-        m = LINE.match(raw.strip())
-        if not m:
-            continue
-        kind, rest = m.group(1), m.group(2).split()
-        if kind == "SAI-HIL":
-            res["header"] = [int(v) for v in rest]
-        elif kind == "OUT":
-            b = bytes.fromhex(rest[1])
-            res["outputs"].append(np.frombuffer(b, dtype=np.int8).astype(int).tolist())
-        elif kind == "CYC":
-            res["cycles"], res["cycles_min"], res["cycles_max"] = map(int, rest)
-        elif kind == "STACK":
-            res["stack_painted"] = int(rest[0])
-        elif kind == "DONE":
-            res["status"] = rest[0] if rest else "?"
+def parse(stdout: str) -> dict:
+    """Parse the harness line protocol strictly: lines before the SAI-HIL header are ignored (boot noise), outputs
+    are placed by index, and the result must hold exactly the header's vector count of the header's size."""
+    res = {"outputs": [], "cycles": None, "stack_painted": None, "status": None, "header": None, "config": {}}
+    outs: dict[int, list] = {}
+    try:
+        for raw in stdout.replace("\r", "").splitlines():
+            m = LINE.match(raw.strip())
+            if not m:
+                continue
+            kind, rest = m.group(1), m.group(2).split()
+            if kind == "SAI-HIL":
+                res["header"], outs, res["status"] = [int(v) for v in rest[:4]], {}, None
+            elif res["header"] is None:
+                continue
+            elif kind == "CFG":
+                res["config"] = dict(kv.split("=", 1) for kv in rest if "=" in kv)
+            elif kind == "OUT":
+                i, hexs = int(rest[0]), rest[1]
+                if res["header"] and len(hexs) != 2 * res["header"][3]:
+                    raise HilError(f"OUT {i}: {len(hexs) // 2} bytes, expected {res['header'][3]}")
+                outs[i] = np.frombuffer(bytes.fromhex(hexs), dtype=np.int8).astype(int).tolist()
+            elif kind == "CYC":
+                res["cycles"], res["cycles_min"], res["cycles_max"] = map(int, rest[:3])
+            elif kind == "STACK":
+                res["stack_painted"] = int(rest[0])
+            elif kind == "DONE":
+                res["status"] = rest[0] if rest else "?"
+    except (ValueError, IndexError) as e:
+        raise HilError(f"garbled harness output: {e}") from None
+    if res["status"] == "ok":
+        n = res["header"][1] if res["header"] else 0
+        if sorted(outs) != list(range(n)):
+            raise HilError(f"harness reported {len(outs)} of {n} outputs (lost UART lines?)")
+    res["outputs"] = [outs[i] for i in sorted(outs)]
     return res
 
 
@@ -122,13 +141,16 @@ def run_emulated(elf: str, port: str, timeout: int = 120) -> dict:
     p = PORTS[port]
     if not p["emulator"]:
         raise HilError(f"{port} is a physical board; a lab agent flashes it")
+    stderr = ""
     try:
         proc = subprocess.run([*p["emulator"], elf], capture_output=True, text=True, timeout=timeout,
                               stdin=subprocess.DEVNULL)
-        stdout = proc.stdout
+        stdout, stderr = proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as e:
         stdout = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stderr = f"timeout after {timeout} s"
     res = parse(stdout)
     if res["status"] != "ok":
-        raise HilError(f"{port}: harness did not finish ({res['status']}); output tail: {stdout[-400:]!r}")
+        raise HilError(f"{port}: harness did not finish ({res['status']}); output tail: {stdout[-300:]!r}; "
+                       f"qemu: {stderr.strip()[-300:]!r}")
     return res

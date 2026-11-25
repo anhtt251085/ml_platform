@@ -2,6 +2,7 @@
    the board's UART:
 
      SAI-HIL 1 <n_vectors> <in_bytes> <out_bytes>
+     CFG <port configuration>          clock and caches the cycles were counted with
      OUT <i> <hex bytes>              one per vector (bit-exact output check, server side)
      CYC <median> <min> <max>         cycles of vector 0: median of 31 runs after 4 warm-up, net of an empty call
      STACK <bytes>                    painted stack high-water mark of the inference calls
@@ -13,6 +14,9 @@
 #include "sai_model.h"
 #include "sai_hil_port.h"
 #include "hil_vectors.h"          /* generated: SAI_HIL_N, sai_hil_inputs[SAI_HIL_N][SAI_MODEL_INPUT0_BYTES] */
+
+_Static_assert(SAI_HIL_N > 0, "at least one test vector");
+_Static_assert(sizeof sai_hil_inputs[0] == SAI_MODEL_INPUT0_BYTES, "test vectors must match the model input size");
 
 #define REPS 31
 #define WARMUP 4
@@ -49,13 +53,14 @@ static void sort(uint32_t *a, int n) {
 
 __attribute__((noinline)) static uint32_t empty_call(void) { uint32_t t0 = port_cycles(); return port_cycles() - t0; }
 
-/* Paint from the stack bottom up to just below main's frame; after the calls, the first unpainted byte from the
-   bottom is the deepest stack the inference reached. Reported: bytes from there up to main's marker, i.e. the
-   frames of run() + sai_model_invoke + SAI kernels (what SAI's static bound covers, plus run()'s small frame). */
+/* Paint from the stack bottom up to just below this function's own frame (its frame address, minus a margin for
+   its locals); after the calls, the first unpainted byte from the bottom is the deepest stack the inference reached.
+   Reported: bytes from there up to main's marker, i.e. run() + sai_model_invoke + SAI kernels (what SAI's static
+   bound covers, plus run()'s small frame). The port's interrupts are masked meanwhile (no ISR frames counted). */
 static uint8_t *volatile g_marker;
 
 __attribute__((noinline)) static void paint_stack(void) {
-    uint8_t *p = _stack_bottom, *end = g_marker - 64;     /* 64 B: this function's own frame */
+    uint8_t *p = _stack_bottom, *end = (uint8_t *)__builtin_frame_address(0) - 32;
     while (p < end) *p++ = PAINT;
 }
 
@@ -72,9 +77,11 @@ int main(void) {
     sai_run_context_t ctx = { workspace, SAI_MODEL_WORKSPACE_BYTES, 0 };
     puts_("SAI-HIL 1 "); putu(SAI_HIL_N); port_putc(' '); putu(SAI_MODEL_INPUT0_BYTES); port_putc(' ');
     putu(SAI_MODEL_OUTPUT0_BYTES); puts_("\n");
+    puts_("CFG "); puts_(port_config()); puts_("\n");
     if (sai_model_init(&model, &ctx) != SAI_OK) { puts_("DONE init_failed\n"); port_exit(1); }
 
     /* outputs, with the stack painted around the calls */
+    port_quiet(1);
     paint_stack();
     for (uint32_t i = 0; i < SAI_HIL_N; i++) {
         if (run(sai_hil_inputs[i]) != SAI_OK) { puts_("DONE invoke_failed\n"); port_exit(1); }
@@ -83,6 +90,7 @@ int main(void) {
         puts_("\n");
     }
     uint32_t stack = stack_used();
+    port_quiet(0);
 
     /* timing: vector 0, median of REPS after WARMUP, net of an empty call */
     uint32_t t[REPS], overhead = empty_call();

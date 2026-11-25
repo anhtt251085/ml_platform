@@ -9,6 +9,9 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   unit:
     name: unit (no SAI)
@@ -46,6 +49,7 @@ jobs:
         with:
           repository: anhtt251085/mcu_edge_ai
           token: ${{ secrets.SAI_REPO_TOKEN }}
+          persist-credentials: false
           path: sai-src
       - name: Build image
         if: env.HAS_SAI_TOKEN == 'true'
@@ -76,6 +80,7 @@ jobs:
         with:
           repository: anhtt251085/mcu_edge_ai
           token: ${{ secrets.SAI_REPO_TOKEN }}
+          persist-credentials: false
           path: sai-src
       - uses: actions/setup-python@v5
         if: env.HAS_SAI_TOKEN == 'true'
