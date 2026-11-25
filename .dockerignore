@@ -1,0 +1,8 @@
+var/
+venv/
+.venv/
+**/__pycache__/
+.pytest_cache/
+.git/
+docs/screenshots/
+agent_work/

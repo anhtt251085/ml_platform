@@ -1,6 +1,7 @@
 # SAI Platform – implementation plan
 
-Status 25 Nov 2026: prototype v0.1 works end to end (this repository). This plan takes it to a product.
+Status 25 Nov 2026: M1–M6 implemented (PRs #10–#15). See "Status after M1–M6" below for what is done and what
+still needs hardware, data or business decisions.
 
 ## 1. Users and jobs to be done
 
@@ -126,8 +127,8 @@ fits on the first run · INT8-vs-float drop (target < 1 %) · calibration error 
    (internal_error + traceback) instead of a structured `toolchain_missing` error.
 3. A 1-D graph with a strided conv lowers on the 2-D path, so `explore --one-axis` reports `explore.two_axes`;
    the platform retries without the flag. Worth documenting for API users.
-4. With the dev RV32 toolchain the MD6605 stack bound came back `unavailable` (Cortex-M7 gives
-   `proven_upper_bound`); to re-check with the production xPack toolchain.
+4. ~~With the dev RV32 toolchain the MD6605 stack bound came back `unavailable`~~ Resolved in M1: with the pinned
+   xPack `riscv-none-elf-gcc` 13.2.0-2 SAI proves the MD6605 stack bound (`proven_upper_bound`); the dev shim was the cause.
 
 ## 8. Open decisions for the owner
 
@@ -136,3 +137,15 @@ fits on the first run · INT8-vs-float drop (target < 1 %) · calibration error 
 3. Which six pool models first, and what data can be licensed for them?
 4. Pricing anchor: per seat, per project, or per deployed unit?
 5. Will Standard vs Professional be visible side by side in the platform (upsell), or only the purchased tier?
+
+
+## Status after M1–M6 (25 Nov 2026)
+
+| Milestone | Built and tested | Still needs |
+|---|---|---|
+| M1 foundation | Auth/roles/orgs, isolation, admin, per-agent tokens, audit, migrations, DB job queue + workers, provenance + byte-identical rebuild, Standard vs Professional, Docker (SaaS + single-org), pinned xPack | Postgres and S3 swaps, OIDC wiring |
+| M2 data & training | C MFCC/band-energy front ends shared by training and MCU, WAV/CSV-mapping/NPZ ingest, recording-level splits, quality report, licences, base weights + fine-tuning, LR search, CUDA path | GPU workers in production, more connectors (S3, MQTT, logger) |
+| M3 compiler | Explored-plan builds, certify re-check, measured evidence by plan digest, SAI contract tests, findings repro | SAI fixes for #9 items 1–3 |
+| M4 board farm | HIL harness firmware, emulated Cortex-M7 + RV32 boards in the platform and CI, pyOCD/J-Link drivers, quarantine, nightly regression | First physical NUCLEO-H753ZI and MD6605 EVB (validate ports, MD6605 UART from the SDK), power measurement hardware |
+| M5 pool | Real-data HAR model card (UCI HAR, 95.4 % by subject), leaderboard, versioning | Data for KWS (download), bearing (licence review), battery (importer), arc fault and thermal (capture campaigns) — `docs/POOL_PROGRAM.md` |
+| M6 commercial | Plans/quotas, deployment rights, signed packages + verifier, plan & usage page, white-label | Prices and royalty terms (decision #8), billing integration, SLA/support process |

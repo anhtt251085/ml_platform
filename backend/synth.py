@@ -204,43 +204,56 @@ def gas(rng, n_per, T=32):
     return np.array(X)[:, :, None, :], np.array(y), labels
 
 
-def vib_anomaly(rng, n_per, W=64):
-    """Label 0 = normal (the only class the autoencoder trains on), 1 = anomaly (test only)."""
+def vib_anomaly(rng, n_per, T=256, fs=3200):
+    """Raw accelerometer windows; the band-energy front end turns them into the model input.
+    Label 0 = normal (the autoencoder trains on it only), 1 = anomaly (test only)."""
     X, y = [], []
-    peaks = [5, 11, 17, 23]
+    t = np.arange(T) / fs
     for cls in (0, 1):
         for _ in range(n_per * (3 if cls == 0 else 1)):
-            f = np.arange(W)
-            spec = -3 + 0.02 * f + rng.normal(0, 0.15, W)
-            for p in peaks:
-                spec += rng.uniform(1.5, 2.5) * np.exp(-((f - p * rng.uniform(.98, 1.02)) / 0.8) ** 2)
+            f0 = rng.uniform(24, 26)
+            sig = sum(rng.uniform(0.6, 1.0) / h * np.sin(2 * np.pi * f0 * h * t + rng.uniform(0, 6.3)) for h in (1, 2, 3, 4))
+            sig = sig + rng.normal(0, 0.05, T)
             if cls:
                 kind = rng.integers(0, 3)
-                if kind == 0:
-                    spec += rng.uniform(1.5, 3) * np.exp(-((f - rng.uniform(30, 60)) / 1.0) ** 2)
-                elif kind == 1:
-                    spec += rng.uniform(0.6, 1.2)
-                else:
-                    spec[peaks[0] - 2:peaks[0] + 3] += rng.uniform(1.5, 2.5)
-            X.append(spec[None])
+                if kind == 0:      # new resonance (looseness, bearing)
+                    sig += rng.uniform(0.4, 0.8) * np.sin(2 * np.pi * rng.uniform(600, 1400) * t)
+                elif kind == 1:    # raised broadband floor (cavitation, rubbing)
+                    sig += rng.normal(0, rng.uniform(0.25, 0.5), T)
+                else:              # imbalance: 1x grows
+                    sig += rng.uniform(1.5, 2.5) * np.sin(2 * np.pi * f0 * t)
+            X.append(sig[None])
             y.append(cls)
     return np.array(X)[:, :, None, :], np.array(y), ["normal", "anomaly"]
 
 
-def kws(rng, n_per, H=49, W=10):
+def kws(rng, n_per, L=16000, fs=16000):
+    """Raw 1 s clips: each word is a sequence of formant-like tone glides (class-specific), with speaker pitch,
+    timing and loudness variation plus background noise. The MFCC front end produces the model input."""
     labels = ["silence", "unknown", "yes", "no", "up", "down"]
-    templates = rng.normal(0, 1, (6, H, W))
-    for k in range(6):
-        templates[k] = np.cumsum(templates[k], axis=0) / 4
-    templates[0] *= 0.1
+    words = {2: [(700, 1100), (1100, 2300), (2300, 2600)], 3: [(400, 300), (300, 900)],
+             4: [(600, 600), (600, 250)], 5: [(900, 500), (500, 400), (400, 1200)]}
     X, y = [], []
     for cls in range(6):
         for _ in range(n_per):
-            shift = rng.integers(-6, 7)
-            m = np.roll(templates[cls] if cls != 1 else rng.normal(0, 1, (H, W)).cumsum(0) / 4, shift, axis=0)
-            X.append((m * rng.uniform(0.7, 1.3) + rng.normal(0, 0.6, (H, W)))[None])
+            a = rng.normal(0, rng.uniform(0.002, 0.01), L)
+            if cls >= 1:
+                segs = words.get(cls) or [(rng.uniform(250, 2500), rng.uniform(250, 2500)) for _ in range(rng.integers(1, 4))]
+                pitch = rng.uniform(0.85, 1.15)
+                pos = int(rng.uniform(0.05, 0.35) * L)
+                seg_len = int(rng.uniform(0.12, 0.2) * L)
+                for f_a, f_b in segs:
+                    n = min(seg_len, L - pos)
+                    if n <= 0:
+                        break
+                    f = np.linspace(f_a, f_b, n) * pitch
+                    phase = 2 * np.pi * np.cumsum(f) / fs
+                    env = np.sin(np.linspace(0, np.pi, n)) * rng.uniform(0.2, 0.5)
+                    a[pos:pos + n] += env * (np.sin(phase) + 0.4 * np.sin(2 * phase) + 0.2 * np.sin(3 * phase))
+                    pos += n
+            X.append(np.clip(a, -1, 1)[None])
             y.append(cls)
-    return np.array(X), np.array(y), labels
+    return np.array(X, np.float32)[:, :, None, :], np.array(y), labels
 
 
 def thermal(rng, n_per, H=24, W=32):

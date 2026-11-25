@@ -11,6 +11,8 @@ _BUILTIN = catalog.builtin()
 
 
 def templates(include_drafts: bool = False) -> list[dict]:
+    """Built-ins + published research templates; drafts only for researchers (include_drafts). Deprecated
+    templates stay readable for old projects but are hidden from new ones unless drafts are included."""
     out = list(_BUILTIN.values())
     with db.conn() as c:
         for r in c.execute("SELECT body FROM templates ORDER BY updated DESC"):
@@ -28,15 +30,19 @@ def template(tid: str) -> dict | None:
     return db.uj(r[0]) if r else None
 
 
-def save_template(body: dict) -> dict:
+def save_template(body: dict, org_id: str | None = None) -> dict:
     """Researcher create/update. Validates every variant against the input contract."""
     name = (body.get("name") or "").strip()
     if not name:
         raise ValueError("name is required")
     tid = body.get("id") or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] + "-" + uuid.uuid4().hex[:4]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", str(tid)):
+        raise ValueError("template id: lowercase letters, digits and dashes, at most 48 characters")
     if tid in _BUILTIN:
         raise ValueError("built-in templates are read-only; save a copy under a new name")
     task = body.get("task", "classification")
+    if body.get("status", "draft") not in ("draft", "published", "deprecated"):
+        raise ValueError("status must be draft, published or deprecated")
     if task not in ("classification", "regression", "anomaly"):
         raise ValueError("task must be classification, regression or anomaly")
     inp = body.get("input") or {}
@@ -45,6 +51,8 @@ def save_template(body: dict) -> dict:
         raise ValueError("a classifier needs at least two labels")
     variants = {}
     for size, layers in (body.get("variants") or {}).items():
+        if size not in ("tiny", "small", "base"):
+            raise ValueError("variant sizes are tiny, small and base")
         if not layers:
             continue
         n_out = len(labels) if task == "classification" else 1 if task == "regression" else \
@@ -60,14 +68,21 @@ def save_template(body: dict) -> dict:
                   "height": int(inp.get("height", 1)), "width": int(inp.get("width", 128)),
                   "sample_rate_hz": inp.get("sample_rate_hz"), "channel_names": inp.get("channel_names") or []},
         "labels": labels, "window": int(inp.get("width", 128)) if int(inp.get("height", 1)) == 1 else None,
-        "hop": body.get("hop") or max(1, int(inp.get("width", 128)) // 2), "synth": body.get("synth") or None,
+        "hop": int(body.get("hop") or max(1, int(inp.get("width", 128)) // 2)),
+        "synth": body.get("synth") if body.get("synth") in ("bearing", "motor_current", "arc_fault", "dcdc", "battery",
+                                                            "har", "ecg", "gas", "vib_anomaly", "kws", "thermal") else None,
         "variants": variants, "targets": body.get("targets") or ["md6605", "cortex-m7"],
         "datasets_hint": body.get("datasets_hint") or "", "status": body.get("status", "draft"),
         "author": body.get("author") or "researcher", "source": "studio",
+        "licence": body.get("licence") or "",
     }
+    prev = template(tid)
+    t["version"] = int((prev or {}).get("version", 0)) + (1 if t["status"] == "published" else 0) or 1
+    t["history"] = ((prev or {}).get("history") or [])[-19:] + [{"version": t["version"], "status": t["status"],
+                                                                "ts": db.now(), "author": t["author"]}]
     with db.conn() as c:
-        c.execute("INSERT OR REPLACE INTO templates VALUES (?,?,?,?,?)",
-                  (tid, db.j(t), t["status"], t["author"], db.now()))
+        c.execute("INSERT OR REPLACE INTO templates (id, body, status, author, updated, org_id) VALUES (?,?,?,?,?,?)",
+                  (tid, db.j(t), t["status"], t["author"], db.now(), org_id))
     return t
 
 
@@ -78,14 +93,17 @@ def delete_template(tid: str):
         c.execute("DELETE FROM templates WHERE id=?", (tid,))
 
 
-def add_dataset(meta: dict):
+def add_dataset(meta: dict, org_id: str | None = None):
+    meta["org_id"] = org_id
     with db.conn() as c:
-        c.execute("INSERT OR REPLACE INTO datasets VALUES (?,?,?)", (meta["id"], db.j(meta), db.now()))
+        c.execute("INSERT OR REPLACE INTO datasets (id, body, created, org_id) VALUES (?,?,?,?)",
+                  (meta["id"], db.j(meta), db.now(), org_id))
 
 
-def datasets(template_id: str | None = None) -> list[dict]:
+def datasets(template_id: str | None = None, org_id: str | None = None) -> list[dict]:
     with db.conn() as c:
-        rows = [db.uj(r[0]) for r in c.execute("SELECT body FROM datasets ORDER BY created DESC")]
+        q = "SELECT body, created FROM datasets" + (" WHERE org_id=?" if org_id else "") + " ORDER BY created DESC"
+        rows = [{**db.uj(r[0]), "created": r[1]} for r in c.execute(q, (org_id,) if org_id else ())]
     rows = [r for r in rows if not template_id or r.get("template") == template_id]
     for r in rows:
         r.pop("preview", None)
@@ -94,15 +112,33 @@ def datasets(template_id: str | None = None) -> list[dict]:
 
 def dataset(did: str) -> dict | None:
     with db.conn() as c:
-        r = c.execute("SELECT body FROM datasets WHERE id=?", (did,)).fetchone()
-    return db.uj(r[0]) if r else None
+        r = c.execute("SELECT body, created FROM datasets WHERE id=?", (did,)).fetchone()
+    return {**db.uj(r[0]), "created": r[1]} if r else None
 
 
-def create_project(name, template_id, dataset_id, cfg, job_id) -> dict:
+def dataset_usage(did: str) -> list[dict]:
+    with db.conn() as c:
+        return [db.row(r) for r in c.execute("SELECT p.id, p.name, p.job_id, j.status FROM projects p LEFT JOIN jobs j"
+                                             " ON j.id = p.job_id WHERE p.dataset_id=? ORDER BY p.created DESC", (did,))]
+
+
+def delete_dataset(did: str):
+    """Remove the dataset's rows and files. Finished projects keep their reports, models and packages."""
+    import re
+    import shutil
+    from . import config
+    if not re.fullmatch(r"ds_[0-9a-f]{10}", did):
+        raise ValueError("bad dataset id")
+    with db.conn() as c:
+        c.execute("DELETE FROM datasets WHERE id=?", (did,))
+    shutil.rmtree(config.DATA_DIR / "datasets" / did, ignore_errors=True)
+
+
+def create_project(name, template_id, dataset_id, cfg, job_id, org_id=None) -> dict:
     pid = "prj_" + uuid.uuid4().hex[:10]
     with db.conn() as c:
-        c.execute("INSERT INTO projects VALUES (?,?,?,?,?,?,?)",
-                  (pid, name, template_id, dataset_id, db.j(cfg), job_id, db.now()))
+        c.execute("INSERT INTO projects (id, name, template_id, dataset_id, config, job_id, created, org_id)"
+                  " VALUES (?,?,?,?,?,?,?,?)", (pid, name, template_id, dataset_id, db.j(cfg), job_id, db.now(), org_id))
     return project(pid)
 
 
@@ -114,11 +150,12 @@ def project(pid: str) -> dict | None:
     return r
 
 
-def projects() -> list[dict]:
+def projects(org_id: str | None = None) -> list[dict]:
     with db.conn() as c:
         rows = [db.row(r) for r in c.execute(
             "SELECT p.*, j.status AS job_status, j.progress AS job_progress, j.stage AS job_stage "
-            "FROM projects p LEFT JOIN jobs j ON j.id = p.job_id ORDER BY p.created DESC")]
+            "FROM projects p LEFT JOIN jobs j ON j.id = p.job_id"
+            + (" WHERE p.org_id=?" if org_id else "") + " ORDER BY p.created DESC", (org_id,) if org_id else ())]
     for r in rows:
         r["config"] = db.uj(r["config"], {})
     return rows
