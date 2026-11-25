@@ -1,0 +1,7 @@
+var/
+__pycache__/
+.pytest_cache/
+*.pyc
+venv/
+.venv/
+agent_work/

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Dev-only shim: Ubuntu's riscv64-unknown-elf-gcc ships picolibc, not newlib-nano. Production uses xpack riscv-none-elf-gcc.
+args=""
+for a in "$@"; do
+  case "$a" in
+    --specs=nano.specs|--specs=nosys.specs) ;;
+    *) set -- "$@" "$a" ;;
+  esac
+  shift
+done
+exec /usr/bin/riscv64-unknown-elf-gcc --specs=picolibc.specs "$@"

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAI Platform</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="side" id="side">
+      <a class="brand" href="#/">
+        <span class="logo" aria-hidden="true">◆</span>
+        <span><b>SAI</b> Platform<small>Edge AI for MCUs</small></span>
+      </a>
+      <nav>
+        <div class="nav-h">Build</div>
+        <a href="#/" data-nav="home">Dashboard</a>
+        <a href="#/new" data-nav="new">New project</a>
+        <a href="#/projects" data-nav="projects">Projects</a>
+        <a href="#/pool" data-nav="pool">Model pool</a>
+        <div class="nav-h">Research</div>
+        <a href="#/studio" data-nav="studio">Model Studio</a>
+        <a href="#/explorer" data-nav="explorer">Plan Explorer</a>
+        <div class="nav-h">Hardware</div>
+        <a href="#/boards" data-nav="boards">Board Farm</a>
+        <a href="#/system" data-nav="system">Compiler &amp; targets</a>
+      </nav>
+      <div class="side-foot" id="sideFoot"></div>
+    </aside>
+    <main id="main" class="main"></main>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
