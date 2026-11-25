@@ -770,7 +770,7 @@ def job_download(jid: str, name: str, u: dict = Depends(auth.current)):
     p = _file(jid, name)
     if name in ("package.zip", "model.onnx"):
         commercial.check_package_download(u)
-    if name == "package.zip":                       # compiled sources leave only with a manager's approval
+    if name in approvals.GATED:                     # package, model and report leave only with a manager's approval
         try:
             approvals.check_download(jid)
         except approvals.ApprovalError as e:

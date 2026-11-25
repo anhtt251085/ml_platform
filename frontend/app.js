@@ -180,6 +180,7 @@ function projectsTable(rows) {
   ${rows.map((p) => `<tr><td><a href="#/job/${esc(p.job_id)}">${esc(p.name)}</a></td><td>${esc(p.template_id)}</td><td>${esc(GOAL_LABEL[p.config.goal] || p.config.goal)}</td>
     <td>${statusBadge(p.job_status, p.job_progress)}</td><td class="muted">${ago(p.created)}</td></tr>`).join("")}</tbody></table></div>`;
 }
+const GATED = ["package.zip", "model.onnx", "report.json"];   // downloads that need a manager's approval
 function dur(sec) {
   if (sec === null || sec === undefined || !isFinite(sec)) return "–";
   sec = Math.max(0, Math.round(sec));
@@ -582,7 +583,7 @@ async function refreshPending() {
 route(/^\/packages$/, async (el) => {
   let status = "";
   const ST = { not_requested: ["not requested", ""], pending: ["pending approval", "b-pend"], approved: ["approved", "b-ok"], rejected: ["rejected", "b-bad"], revoked: ["revoked", "b-bad"] };
-  el.innerHTML = `<div class="page-h"><div><h1>Compiled packages</h1><p class="muted">Every compiled package the backend has produced (SAI-generated C sources, runtime, headers, manifest, memory certificate, signature). Downloads leave only with a manager's approval; every request, decision and download is audited.</p></div></div>
+  el.innerHTML = `<div class="page-h"><div><h1>Compiled packages</h1><p class="muted">Every compiled package the backend has produced (SAI-generated C sources, runtime, headers, manifest, memory certificate, signature) with its model and report. These files leave only with a manager's approval; every request, decision and download is audited.</p></div></div>
     <div class="kpis" id="pk"></div><div class="chips" id="pf" style="margin:14px 0">${[["", "All"], ["pending", "Pending"], ["approved", "Approved"], ["not_requested", "Not requested"], ["rejected", "Rejected"], ["revoked", "Revoked"]].map(([k, v]) => `<button class="chip ${k === status ? "on" : ""}" data-s="${k}">${v}</button>`).join("")}</div>
     <div class="card"><div class="tbl-wrap" id="pt"></div></div><div id="pd"></div>`;
   async function load() {
@@ -593,7 +594,7 @@ route(/^\/packages$/, async (el) => {
     $("#pt").innerHTML = list.length ? `<table class="t"><thead><tr><th>Project</th><th>Board · plan</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Accuracy</th><th>SAI</th><th>Built</th><th>Approval</th><th class="n">Downloads</th><th></th></tr></thead><tbody>
       ${list.map((p) => { const a = p.approval, [lab, cls] = ST[a.status];
         const acts = [];
-        if (a.status === "approved") acts.push(`<a class="btn primary sm" href="/api/jobs/${esc(p.job_id)}/download/package.zip">⬇ Download</a>`);
+        if (a.status === "approved") acts.push(`<a class="btn primary sm" href="/api/jobs/${esc(p.job_id)}/download/package.zip" title="compiled package">⬇ package</a><a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/model.onnx">model</a><a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/report.json">report</a>`);
         if (["not_requested", "rejected", "revoked"].includes(a.status)) acts.push(`<button class="btn sm" data-act="request" data-j="${esc(p.job_id)}">Request</button>`);
         if (a.status === "pending" && can && a.requested_by !== ME.id) acts.push(`<button class="btn primary sm" data-act="approve" data-j="${esc(p.job_id)}">Approve</button><button class="btn sm" data-act="reject" data-j="${esc(p.job_id)}">Reject</button>`);
         if (a.status === "pending" && can && a.requested_by === ME.id) acts.push(`<span class="small muted">your request: another manager decides</span>`);
@@ -741,14 +742,14 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     const a = await api(`/api/packages/${jid}`);
     const who = (x) => esc(x || "");
     if (a.status === "approved") {
-      b.innerHTML = `<a class="btn primary sm" href="/api/jobs/${jid}/download/package.zip">⬇ package.zip</a>`;
+      b.innerHTML = GATED.map((d, i) => `<a class="btn ${i ? "" : "primary"} sm" href="/api/jobs/${jid}/download/${d}">${i ? "" : "⬇ "}${d}</a>`).join("");
       $("#pkgnote").innerHTML = `<span class="badge b-ok">approved</span> by ${who(a.decided_by_name)} ${ago(a.decided_at)}${a.decision_note ? ` – “${esc(a.decision_note)}”` : ""} · <a href="#/packages">Compiled packages</a>`;
     } else if (a.status === "pending") {
-      b.innerHTML = `<button class="btn sm" disabled>⏳ package.zip awaiting approval</button>`;
+      b.innerHTML = `<button class="btn sm" disabled>⏳ package, model &amp; report awaiting approval</button>`;
       $("#pkgnote").innerHTML = `Requested by ${who(a.requested_by_name)} ${ago(a.requested_at)}. A manager approves it on <a href="#/packages">Compiled packages</a>.`;
     } else {
-      b.innerHTML = `<button class="btn primary sm" id="pkgreq">Request package download</button>`;
-      $("#pkgnote").innerHTML = a.status === "not_requested" ? `Compiled sources are released after a manager's approval.` : `<span class="badge b-bad">${esc(a.status)}</span> ${esc(a.decision_note || "")} – you can request again.`;
+      b.innerHTML = `<button class="btn primary sm" id="pkgreq">Request download (package, model, report)</button>`;
+      $("#pkgnote").innerHTML = a.status === "not_requested" ? `The compiled package, the model and the report are released after a manager's approval.` : `<span class="badge b-bad">${esc(a.status)}</span> ${esc(a.decision_note || "")} – you can request again.`;
       $("#pkgreq").onclick = async () => {
         const note = prompt("Why do you need the compiled package? (shown to the approving manager)", "");
         if (note === null) return;
@@ -786,7 +787,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
         <div class="stat"><span class="l">INT8 (${esc(v.quant_method || "PTQ")})</span><span class="big">${mt(v.int8)}</span></div>
         <div class="stat"><span class="l">Deployed C, bit-exact</span><span class="big" style="color:var(--ok)">${mt(r.exact)}</span></div></div>
         <p class="small muted" style="margin-top:8px">SAI verify: <b>${r.verify.passed}/${r.verify.total}</b> checks passed (manifest, hashes, memory certificate replay, SBOM, reproducible library…)${r.certificate_check ? ` · certificate re-derived by <code>sai certify --check</code>: <b>${r.certificate_check.passed}/${r.certificate_check.total}</b>` : ""}</p>
-        <div class="row" style="margin-top:10px"><span id="pkgbtn"></span>${r.downloads.filter((d) => d !== "package.zip").map((d) => `<a class="btn sm" href="/api/jobs/${jid}/download/${d}">${esc(d)}</a>`).join("")}</div><div id="pkgnote" class="small" style="margin-top:6px"></div></div></div>
+        <div class="row" style="margin-top:10px"><span id="pkgbtn" class="row" style="gap:8px"></span>${r.downloads.filter((d) => !GATED.includes(d)).map((d) => `<a class="btn sm" href="/api/jobs/${jid}/download/${d}">${esc(d)}</a>`).join("")}</div><div id="pkgnote" class="small" style="margin-top:6px"></div></div></div>
     <div class="card" style="margin-top:16px"><h2>Model sizes</h2><div class="tbl-wrap"><table class="t"><thead><tr><th>Size</th><th class="n">Params</th><th class="n">MACs</th><th class="n">Float</th><th class="n">INT8</th><th>Quant</th><th class="n">Plans that fit</th><th>Best plan for goal</th></tr></thead><tbody>
       ${r.variants.map((x) => { const rec = x.plans.recommended; return `<tr class="${x.size === sel.size ? "rec" : ""}"><td><b>${x.size}</b></td><td class="n">${fmt(x.summary.params)}</td><td class="n">${fmt(x.summary.macs)}</td><td class="n">${mt(x.float)}</td><td class="n">${mt(x.int8)}</td><td>${esc(x.quant_method || "PTQ")}</td><td class="n">${x.plans.feasible}/${x.plans.candidates.length}</td><td class="small">${rec ? `${esc(rec.target)} · ${bytes(rec.ram)} RAM · ${ms(rec.latency.ms)}` : `<span class="muted">${esc(x.plans.advice || "none")}</span>`}</td></tr>`; }).join("")}
     </tbody></table></div></div>

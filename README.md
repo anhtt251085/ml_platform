@@ -27,7 +27,8 @@ SAI_REPO=/path/to/sai-compiler-checkout docker compose up -d --build     # http:
 * Roles (every organisation): **engineer** (projects, datasets, jobs, board runs; no research pages),
   **researcher** (+ Model Studio, Plan Explorer), **manager** (+ approves compiled-package downloads, never their
   own request), **admin** (everything in the organisation, Admin console). Admins of the SAI organisation are the
-  platform admins. Compiled packages (`package.zip`) download only after a manager's approval (Compiled packages).
+  platform admins. The compiled package (`package.zip`), the model (`model.onnx`) and the report (`report.json`) download
+  only after a manager's approval (Compiled packages page); the model card stays freely downloadable.
 * `SAI_PLATFORM_MODE=multi` (default): multi-tenant SaaS. SAI admins create customer organisations and invite users
   (no public sign-up).
 * `SAI_PLATFORM_MODE=single SAI_PLATFORM_ORG_NAME="Acme"`: one customer per install (on-prem / customer VPC).

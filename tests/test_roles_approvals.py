@@ -63,6 +63,9 @@ def _finished_project(org_id: str, name="Motor monitor") -> str:
     d = config.DATA_DIR / "jobs" / jid
     d.mkdir(parents=True, exist_ok=True)
     (d / "package.zip").write_bytes(b"PK-compiled-sources")
+    (d / "model.onnx").write_bytes(b"onnx")
+    (d / "report.json").write_text("{}")
+    (d / "MODEL_CARD.md").write_text("# card")
     return jid
 
 
@@ -129,7 +132,8 @@ def test_package_download_needs_a_managers_approval():
 
         r = dl(eng)
         assert r.status_code == 403 and "approval" in r.text
-        assert c.get(f"/api/jobs/{jid}/download/report.json", headers=eng).status_code in (200, 404)   # not gated
+        for name in ("model.onnx", "report.json"):              # the model and the report need the approval too
+            assert c.get(f"/api/jobs/{jid}/download/{name}", headers=eng).status_code == 403
         row = next(p for p in c.get("/api/packages", headers=eng).json()["packages"] if p["job_id"] == jid)
         assert row["approval"]["status"] == "not_requested" and row["ram"] == 572 and row["plan"] == "row-stream-t16"
 
@@ -148,13 +152,17 @@ def test_package_download_needs_a_managers_approval():
         r = c.post(f"/api/packages/{jid}/approve", headers=mgr, json={"note": "trial approved"})
         assert r.status_code == 200 and r.json()["status"] == "approved" and r.json()["decided_by_name"] == "Manager"
         assert dl(eng).status_code == 200 and dl(eng).content == b"PK-compiled-sources"
-        assert c.get(f"/api/packages/{jid}", headers=eng).json()["downloads"] == 2
+        for name in ("model.onnx", "report.json"):
+            assert c.get(f"/api/jobs/{jid}/download/{name}", headers=eng).status_code == 200
+        assert c.get(f"/api/jobs/{jid}/download/MODEL_CARD.md", headers=eng).status_code == 200   # documentation
+        assert c.get(f"/api/packages/{jid}", headers=eng).json()["downloads"] == 4
 
         # revoke (reason required) stops downloads; a new request starts over
         assert c.post(f"/api/packages/{jid}/revoke", headers=mgr, json={}).status_code == 400
         assert c.post(f"/api/packages/{jid}/revoke", headers=mgr, json={"note": "found a bug"}).json()["status"] == "revoked"
         r = dl(eng)
         assert r.status_code == 403 and "found a bug" in r.text
+        assert c.get(f"/api/jobs/{jid}/download/model.onnx", headers=eng).status_code == 403
         assert c.post(f"/api/packages/{jid}/request", headers=eng, json={"note": "fixed"}).json()["status"] == "pending"
         r = c.post(f"/api/packages/{jid}/reject", headers=hs["admin"], json={"note": "wait for 1.3"})
         assert r.json()["status"] == "rejected" and "wait for 1.3" in dl(eng).text

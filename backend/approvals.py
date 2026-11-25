@@ -1,8 +1,9 @@
 # Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Compiled packages and their release approval.
 
-Every successful project produces a compiled package (package.zip: SAI-generated C sources, runtime library,
-headers, manifest, memory certificate, signature). Downloading it needs a manager's approval:
+Every successful project produces release files: the compiled package (package.zip: SAI-generated C sources,
+runtime library, headers, manifest, memory certificate, signature), the trained INT8 model (model.onnx) and the
+full report (report.json). Downloading any of them (GATED) needs a manager's approval of the project's release:
 
   not requested -> pending (an engineer or anyone with access requests it, with a note)
   pending -> approved | rejected (a manager or admin of the organisation decides, with a note; never their own
@@ -21,6 +22,7 @@ from pathlib import Path
 from . import auth, config, db
 
 STATUSES = ("not_requested", "pending", "approved", "rejected", "revoked")
+GATED = ("package.zip", "model.onnx", "report.json")     # MODEL_CARD.md (documentation) stays freely downloadable
 
 
 class ApprovalError(Exception):
@@ -90,8 +92,8 @@ def revoke(u: dict, job: dict, note: str = "") -> dict:
 def check_download(job_id: str):
     a = get(job_id)
     if a["status"] != "approved":
-        msg = {"not_requested": "this compiled package needs a manager's approval: request it on the Compiled "
-                                "packages page",
+        msg = {"not_requested": "the compiled package, model and report need a manager's approval: request it on "
+                                "the Compiled packages page",
                "pending": "the download request is waiting for a manager's approval",
                "rejected": f"the download was rejected: {a.get('decision_note') or 'no reason given'}",
                "revoked": f"the approval was revoked: {a.get('decision_note') or 'no reason given'}"}[a["status"]]
