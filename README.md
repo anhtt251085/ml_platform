@@ -1,4 +1,4 @@
-# SAI Platform (v1.1: preprocessing, datasets, review fixes)
+# SAI Platform (v1.2)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -25,6 +25,14 @@ SAI_SRC=/path/to/mcu_edge_ai docker compose up -d --build        # http://localh
 * `SAI_PLATFORM_MODE=multi` (default): multi-tenant SaaS. SAI admins create customer organisations and invite users
   (no public sign-up).
 * `SAI_PLATFORM_MODE=single SAI_PLATFORM_ORG_NAME="Acme"`: one customer per install (on-prem / customer VPC).
+* Put it behind a TLS-terminating proxy: with `SAI_PLATFORM_COOKIE_SECURE=auto` (default) session cookies are
+  Secure and HSTS is sent whenever the request arrives over HTTPS (uvicorn runs with `--proxy-headers`; set
+  `FORWARDED_ALLOW_IPS` to the proxy's address), while plain-http localhost keeps working.
+* Large dataset uploads (over `SAI_PLATFORM_INLINE_INGEST`, 16 MB) are streamed to disk and imported by a worker
+  in the background; the cap is `SAI_PLATFORM_MAX_UPLOAD` (2 GB).
+* Storage retention: finished projects keep their package, model, report and build; intermediates go when a job
+  ends; an hourly sweep removes uploads after `SAI_PLATFORM_UPLOAD_TTL_DAYS` (7) and board builds / failed job
+  folders after `SAI_PLATFORM_RETENTION_DAYS` (30). Admin → Job queue → Clean up now.
 * The image pins the toolchains: Arm GNU (Debian) and **xPack `riscv-none-elf-gcc` 13.2.0-2** (checksummed), the
   toolchain SAI's MD6605 measurements use. Behind a TLS-inspecting proxy add
   `--secret id=extra_ca,src=proxy-ca.crt` to `docker build`.
@@ -126,7 +134,8 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * **Emulated lab out of the box**: with QEMU installed the platform runs two in-process boards — Cortex-M7
   (MPS2-AN500) and RV32IMAFC (virt) — executing the real firmware; outputs are checked bit-exactly, cycles are
   labelled emulated. A board run for another target compiles the model for that target on demand.
-* **Physical boards**: NUCLEO-H753ZI (USART3 + DWT) and MD6605 EVB ports link in CI; lab agent drivers for pyOCD
+* **Physical boards**: NUCLEO-H753ZI (PLL1 at 480 MHz on rev V / 400 MHz on rev Y, caches on, USART3 + DWT) and
+  MD6605 EVB ports link in CI; the harness reports the clock it ran at and only reference-clock runs calibrate; lab agent drivers for pyOCD
   and J-Link, uhubctl power cycling, health reporting, quarantine after 3 failures.
 * **Nightly regression** of the whole pool on every board (`python -m backend.regression`, nightly workflow).
 * Protocol and ports: `docs/BOARD_AGENT_PROTOCOL.md`.

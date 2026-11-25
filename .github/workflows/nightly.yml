@@ -20,16 +20,16 @@ jobs:
       - name: SAI token missing
         if: env.HAS_SAI_TOKEN != 'true'
         run: echo "::notice::SAI_REPO_TOKEN is not set; nightly regression skipped."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         if: env.HAS_SAI_TOKEN == 'true'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         if: env.HAS_SAI_TOKEN == 'true'
         with:
           repository: anhtt251085/mcu_edge_ai
           token: ${{ secrets.SAI_REPO_TOKEN }}
           persist-credentials: false
           path: sai-src
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         if: env.HAS_SAI_TOKEN == 'true'
         with:
           python-version: "3.12"
@@ -51,7 +51,7 @@ jobs:
           pip install ./sai-src
       - name: Restore previous results
         if: env.HAS_SAI_TOKEN == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: var-nightly
           key: nightly-${{ github.run_id }}
@@ -64,11 +64,11 @@ jobs:
           python -m backend.regression
       - name: Save results as the next baseline (only when the regression passed)
         if: success() && env.HAS_SAI_TOKEN == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: var-nightly
           key: nightly-${{ github.run_id }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always() && env.HAS_SAI_TOKEN == 'true'
         with:
           name: regression-report

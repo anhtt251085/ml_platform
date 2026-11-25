@@ -30,6 +30,7 @@ STAGES = {
     "analyze": [("inspect", "Inspect model"), ("plan", "SAI plan search")],
     "rebuild": [("compile", "Recompile"), ("compare", "Compare with the original build")],
     "basetrain": [("data", "Prepare data"), ("train", "Train base weights"), ("save", "Store in the pool")],
+    "ingest": [("ingest", "Parse and validate"), ("store", "Store dataset")],
     "regression": [("plans", "Pool x boards plan check"), ("hil", "Emulated HIL smoke"), ("compare", "Compare with last run")],
 }
 KINDS = tuple(STAGES)
@@ -212,6 +213,9 @@ def work_forever(name: str, kinds: list[str] | None = None, stop: threading.Even
             if time.time() - last_reap > 60:
                 requeue_stale()
                 last_reap = time.time()
+                if time.time() - float((db.get_setting("retention_last") or {}).get("at", 0)) > 3600:
+                    from . import retention
+                    retention.sweep()
             if paused():
                 stop.wait(1.0)
                 continue
@@ -248,7 +252,7 @@ def _run(jid: str, kind: str, params: dict):
         return
     try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
-         "basetrain": run_basetrain, "regression": _regression}[kind](ctx, params)
+         "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -572,7 +576,11 @@ def run_train(ctx: Ctx, p: dict):
     ctx.stage("package", "done")
     report["downloads"] = ["package.zip", "model.onnx", "report.json", "MODEL_CARD.md"]
     report["signature"] = sig
-    report["selected_model_path"] = str(v["onnx"])
+    report["selected_model_path"] = str(ctx.dir / "model.onnx")
+    from . import retention
+    freed = retention.job_intermediates(ctx.dir)
+    if freed:
+        ctx.log(f"removed {freed / 1e6:.1f} MB of intermediates (per-size models, evaluation build)")
     ctx.result(report)
 
 
@@ -885,6 +893,30 @@ int sai_infer(const float *raw) {{
     {"return sai_app_argmax(output);" if pre["task"] == "classification" else "return 0; /* decode output[] with sai_app.h */"}
 }}
 """
+
+
+def run_ingest(ctx: Ctx, p: dict):
+    """Large uploads are parsed by a worker, not by the API process: the file was streamed to uploads/."""
+    from . import store
+    path = Path(p["path"])
+    if config.DATA_DIR / "uploads" not in path.resolve().parents:
+        raise ValueError("bad staged upload path")
+    ctx.stage("ingest")
+    tpl = get_template(p["template_id"])
+    ctx.log(f"parsing {p['filename']} ({path.stat().st_size / 1e6:.1f} MB) for {tpl['name']}")
+    try:
+        meta = data.ingest_bytes(path.read_bytes(), p["filename"], tpl, window=p.get("window"), hop=p.get("hop"),
+                                 mapping=p.get("mapping"), licence=p.get("licence") or "unknown")
+    finally:
+        path.unlink(missing_ok=True)
+    ctx.log(f"{meta['n']:,} windows, input {meta['shape']}, {len(meta.get('warnings', []))} warning(s)")
+    ctx.stage("ingest", "done")
+    ctx.stage("store")
+    with db.conn() as c:
+        org_id = (c.execute("SELECT org_id FROM jobs WHERE id=?", (ctx.id,)).fetchone() or [None])[0]
+    store.add_dataset(meta, org_id)
+    ctx.stage("store", "done")
+    ctx.result({"dataset": {k: v for k, v in meta.items() if k != "preview"}, "dataset_id": meta["id"]})
 
 
 def _regression(ctx, p):

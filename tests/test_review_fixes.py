@@ -172,3 +172,67 @@ def test_api_hardening():
             c.post("/api/auth/login", json={"email": "m@cyber.test", "password": "nope"})
         r = c.post("/api/auth/login", json={"email": "m@cyber.test", "password": "password-2"})
         assert r.status_code == 401 and "too many" in r.json()["detail"]
+
+
+# ---- follow-ups: cookies, retention, queued ingest ---------------------------------------------------------------
+def test_session_cookie_secure_follows_https():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    body = {"email": os.environ["SAI_PLATFORM_ADMIN_EMAIL"], "password": os.environ["SAI_PLATFORM_ADMIN_PASSWORD"]}
+    with TestClient(app) as c:
+        r = c.post("/api/auth/login", json=body)
+        assert "secure" not in r.headers["set-cookie"].lower()            # plain-http localhost keeps working
+    with TestClient(app, base_url="https://platform.test") as c:
+        r = c.post("/api/auth/login", json=body)
+        assert "secure" in r.headers["set-cookie"].lower()
+        assert "max-age" in c.get("/api/health").headers["strict-transport-security"]
+
+
+def test_retention_sweep_keeps_packages_and_removes_rebuildables():
+    from backend import config, retention
+    old = __import__("time").time() - (retention.RETENTION_DAYS + 2) * 86400
+    jobs = config.DATA_DIR / "jobs"
+    for jid, status in (("job_ret_ok", "succeeded"), ("job_ret_bad", "failed")):
+        d = jobs / jid
+        (d / "build").mkdir(parents=True, exist_ok=True)
+        (d / "package.zip").write_bytes(b"pkg")
+        (d / "hil_build_md6605").mkdir(exist_ok=True)
+        (d / "hil_build_md6605" / "x").write_bytes(b"0" * 1000)
+        with db.conn() as c:
+            c.execute("INSERT OR REPLACE INTO jobs (id, kind, status, created, updated) VALUES (?,?,?,?,?)",
+                      (jid, "train", status, old, old))
+    up_old, up_new = config.DATA_DIR / "uploads" / "old.onnx", config.DATA_DIR / "uploads" / "new.onnx"
+    up_old.write_bytes(b"x" * 500)
+    up_new.write_bytes(b"y")
+    os.utime(up_old, (old, old))
+    r = retention.sweep()
+    assert not up_old.exists() and up_new.exists()
+    assert (jobs / "job_ret_ok" / "package.zip").exists() and not (jobs / "job_ret_ok" / "hil_build_md6605").exists()
+    assert not (jobs / "job_ret_bad").exists()
+    assert r["freed_bytes"] >= 1500 and db.get_setting("retention_last")["freed_bytes"] == r["freed_bytes"]
+
+
+def test_large_upload_becomes_a_background_import(monkeypatch):
+    import time
+    from fastapi.testclient import TestClient
+    from backend import config
+    from backend.app import app
+    monkeypatch.setattr(config, "INLINE_INGEST_BYTES", 1000)
+    X = np.random.default_rng(3).normal(size=(60, 8, 32)).astype(np.float32)
+    buf = io.BytesIO()
+    np.savez(buf, X=X, y=np.arange(60) % 5)
+    with TestClient(app) as c:
+        h = _login(c)
+        r = c.post("/api/datasets/upload", headers=h, data={"template_id": "gas-sense", "licence": "proprietary"},
+                   files={"file": ("big.npz", buf.getvalue(), "application/octet-stream")})
+        assert r.status_code == 202, r.text
+        jid = r.json()["job"]["id"]
+        for _ in range(60):
+            j = c.get(f"/api/jobs/{jid}", headers=h).json()
+            if j["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.5)
+        assert j["status"] == "succeeded", j["error"]
+        d = c.get(f"/api/datasets/{j['result']['dataset_id']}", headers=h).json()
+        assert d["n"] == 60 and d["licence"] == "proprietary"
+        assert not list((config.DATA_DIR / "uploads").glob("ingest_*"))     # staged file removed

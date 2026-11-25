@@ -335,8 +335,20 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
     }
     async function doIngest(fn) {
       $("#dsinfo").innerHTML = `<div class="callout info" style="margin-top:12px">Ingesting…</div>`;
-      try { st.ds = await fn(); toast("Dataset ready"); stepData(b); }
-      catch (e) { $("#dsinfo").innerHTML = `<div class="callout bad" style="margin-top:12px">${esc(e.message)}</div>`; }
+      try {
+        let r = await fn();
+        if (r && r.job) {                       // large file: parsed by a worker in the background
+          for (;;) {
+            const j = await api(`/api/jobs/${r.job.id}`);
+            const last = (j.logs || []).slice(-1)[0];
+            $("#dsinfo").innerHTML = `<div class="callout info" style="margin-top:12px">Large file: importing in the background (${esc(j.status)})${last ? ` · ${esc(last.line)}` : ""}</div>`;
+            if (j.status === "succeeded") { r = await api(`/api/datasets/${j.result.dataset_id}`); break; }
+            if (j.status === "failed" || j.status === "cancelled") throw new Error(j.error || "import failed");
+            await new Promise((res) => setTimeout(res, 1500));
+          }
+        }
+        st.ds = r; toast("Dataset ready"); stepData(b);
+      } catch (e) { if (!(e instanceof Stale)) $("#dsinfo").innerHTML = `<div class="callout bad" style="margin-top:12px">${esc(e.message)}</div>`; }
     }
     if (st.ds) $("#dsinfo").innerHTML = datasetSummary(st.ds);
     wire();
@@ -968,7 +980,11 @@ route(/^\/admin$/, async (el) => {
     }
     if (tab === "queue") {
       const q = await api("/api/admin/queue");
-      box.innerHTML = `<div class="card"><div class="kpis">${Object.entries(q.by_status).map(([k, v]) => `<div class="kpi"><div class="l">${esc(k)}</div><div class="v">${v}</div></div>`).join("")}</div><p class="small muted" style="margin-top:10px">Busy workers: ${q.busy_workers.map(esc).join(", ") || "none"}</p></div>`;
+      const rt = q.retention;
+      box.innerHTML = `<div class="card"><div class="kpis">${Object.entries(q.by_status).map(([k, v]) => `<div class="kpi"><div class="l">${esc(k)}</div><div class="v">${fmt(v)}</div></div>`).join("")}</div><p class="small muted" style="margin-top:10px">Busy workers: ${q.busy_workers.map(esc).join(", ") || "none"}${q.paused ? " · <b>paused</b>" : ""}</p></div>
+        <div class="card" style="margin-top:16px"><h2>Storage retention</h2><p class="small">Finished projects keep their package, model, report and build. Intermediates are removed when a job ends; the hourly sweep removes uploads older than ${fmt(q.upload_ttl_days)} days, and board builds and failed/cancelled job folders older than ${fmt(q.retention_days)} days.</p>
+        <p class="small muted">Last sweep: ${rt ? `${ago(rt.at)}, freed ${bytes(rt.freed_bytes)}` : "never"}</p><button class="btn" id="sweep">Clean up now</button><span id="sweepres" class="small" style="margin-left:10px"></span></div>`;
+      $("#sweep").onclick = async () => { const r = await api("/api/admin/retention", { method: "POST" }); $("#sweepres").textContent = `freed ${bytes(r.freed_bytes)} (${Object.entries(r.removed).map(([k, v]) => `${k}: ${v}`).join(", ") || "nothing to remove"})`; };
     }
   };
   draw();
