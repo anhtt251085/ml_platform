@@ -135,7 +135,7 @@ route(/^\/$/, async (el) => {
   <div class="grid g4">
     <div class="card stat"><span class="v">${projects.length}</span><span class="l">Projects</span></div>
     <div class="card stat"><span class="v">${cat.length}</span><span class="l">Model types in the pool</span></div>
-    <div class="card stat"><span class="v">${online}/${b.boards.length}</span><span class="l">Boards online${b.boards.some((x) => x.simulated) ? " (simulated)" : ""}</span></div>
+    <div class="card stat"><span class="v">${online}/${b.boards.length}</span><span class="l">Boards online${b.boards.every((x) => x.kind !== "physical") && b.boards.length ? ` (${esc(b.boards[0].kind)})` : ""}</span></div>
     <div class="card stat"><span class="v mono" style="font-size:16px">${esc(sys.sai.sai || "?")}</span><span class="l">SAI compiler · ABI ${esc(sys.sai.abi || "?")}</span></div>
   </div>
   <div class="grid g2" style="margin-top:16px">
@@ -391,7 +391,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
       logs = logs.concat(job.logs); if (job.logs.length) last = job.logs[job.logs.length - 1].seq;
       drawHead();
       if (["succeeded", "failed", "cancelled"].includes(job.status)) {
-        if (job.kind === "rebuild" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawPlansOnly(job.result); }
+        if (["rebuild", "regression", "basetrain"].includes(job.kind) && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawPlansOnly(job.result); }
         if (rendered !== job.status) { rendered = job.status; drawResult(); }
         return;
       }
@@ -400,7 +400,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
   }
   onLeave(() => clearTimeout(timer));
   function drawHead() {
-    const title = job.kind === "train" ? (job.params.name || "Project") : job.kind === "fitcheck" ? "Studio fit check" : job.kind === "rebuild" ? "Reproducibility rebuild" : `Analyze ${job.params.filename || "model"}`;
+    const title = job.kind === "train" ? (job.params.name || "Project") : job.kind === "fitcheck" ? "Studio fit check" : job.kind === "rebuild" ? "Reproducibility rebuild" : job.kind === "regression" ? "Nightly regression" : job.kind === "basetrain" ? "Pool base weights" : `Analyze ${job.params.filename || "model"}`;
     $("#head").innerHTML = `<div class="page-h"><div><h1>${esc(title)}</h1><div class="row small muted">${statusBadge(job.status, job.progress)} <span class="mono">${esc(job.id)}</span>${job.kind === "train" ? ` · ${esc(job.params.template_id)} · goal ${esc(GOAL_LABEL[job.params.goal] || job.params.goal)}` : ""}</div></div>
       ${job.status === "running" || job.status === "queued" ? `<button class="btn" id="cancel">Cancel</button>` : ""}</div>
       <div class="card"><div class="progress" style="margin-bottom:12px"><i style="width:${Math.round((job.progress || 0) * 100)}%"></i></div>
@@ -456,9 +456,9 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     $("#hil").innerHTML = `<div class="row"><h2 style="margin:0">Run on a board</h2><span class="spacer"></span>
       <select id="hb"><option value="">any ${esc(sel.target)} board</option>${avail.map((x) => `<option value="${esc(x.id)}" data-t="${x.target}">${esc(x.name)} – ${esc(x.status)}</option>`).join("")}</select>
       <button class="btn primary" id="hrun">Flash & measure</button></div>
-      <p class="small muted" style="margin:8px 0">The board runs ${"32"} test vectors through the package; the server compares outputs with the bit-exact host result and, for real boards, adds the cycle count to the latency calibration.</p>
+      <p class="small muted" style="margin:8px 0">The board builds the HIL harness firmware around the SAI package for its own target, runs the test vectors, and reports outputs, cycles and painted stack. Outputs are compared bit-exactly with the host build; real boards turn the plan's latency into <b>measured</b>. Emulated boards (QEMU) prove the program on the target ISA; their cycles are not latency.</p>
       ${runs.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Run</th><th>Board</th><th>Status</th><th class="n">Estimated</th><th class="n">Measured</th><th class="n">Error</th><th>Outputs</th><th>Stack (painted)</th></tr></thead><tbody>
-      ${runs.map((x) => { const res = x.result || {}, est = x.request.estimated_ms, got = res.latency_ms; return `<tr><td class="mono small">${esc(x.id)}</td><td>${esc(x.board_id || "queued")} ${res.simulated ? `<span class="badge b-warn">simulated</span>` : ""}</td><td>${statusBadge(x.status)}</td><td class="n">${ms(est)}</td><td class="n">${ms(got)}</td><td class="n">${est && got ? `${((got - est) / est * 100).toFixed(1)}%` : "–"}</td><td>${res.outputs_match === undefined ? "–" : res.outputs_match ? `<span class="badge b-ok">✓ ${res.n_vectors} match</span>` : `<span class="badge b-bad">mismatch</span>`}</td><td>${bytes(res.stack_painted)}</td></tr>`; }).join("")}</tbody></table></div>` : ""}`;
+      ${runs.map((x) => { const res = x.result || {}, est = x.request.estimated_ms, got = res.latency_ms; return `<tr><td class="mono small">${esc(x.id)}</td><td>${esc(x.board_id || "queued")} ${res.simulated ? `<span class="badge b-warn">simulated</span>` : res.emulated ? `<span class="badge b-info" title="real firmware on QEMU: outputs are real, cycles are QEMU's instruction clock">emulated</span>` : ""}</td><td>${statusBadge(x.status)}</td><td class="n">${ms(est)}</td><td class="n">${res.emulated ? `<span class="small muted">${fmt(res.cycles)} emu. cycles</span>` : ms(got)}</td><td class="n">${est && got && !res.emulated ? `${((got - est) / est * 100).toFixed(1)}%` : "–"}</td><td>${res.outputs_match === undefined ? "–" : res.outputs_match ? `<span class="badge b-ok">✓ ${res.n_vectors} match</span>` : `<span class="badge b-bad">mismatch</span>`}</td><td>${bytes(res.stack_painted)}</td></tr>`; }).join("")}</tbody></table></div>` : ""}`;
     $("#hrun").onclick = async () => {
       const o = $("#hb").selectedOptions[0];
       try { await api("/api/boards/runs", { json: { job_id: jid, board_id: o.value || null, target: o.dataset.t || null } }); toast("Queued on the board farm"); }
@@ -467,6 +467,14 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     };
   }
   function drawPlansOnly(r) {
+    if (job.kind === "regression" || job.kind === "basetrain") {
+      $("#res").innerHTML = job.kind === "regression" ? `<div class="card" style="margin-top:16px"><h2>Regression ${esc(r.run_id)}</h2>
+        ${r.alerts.length ? r.alerts.map((a) => `<div class="callout bad">${esc(a)}</div>`).join("") : `<div class="callout ok">No regressions against the previous run.</div>`}
+        <div class="tbl-wrap" style="margin-top:10px"><table class="t"><thead><tr><th>Model type</th><th>Board</th><th class="n">RAM</th><th class="n">prev</th><th class="n">Flash</th><th class="n">prev</th><th>HIL</th></tr></thead><tbody>
+        ${r.rows.map((x) => `<tr><td>${esc(x.template)}</td><td>${esc(x.target)}</td><td class="n">${bytes(x.ram)}</td><td class="n muted">${bytes(x.prev && x.prev.ram)}</td><td class="n">${bytes(x.flash)}</td><td class="n muted">${bytes(x.prev && x.prev.flash)}</td><td>${x.hil_match === null ? "–" : x.hil_match ? "bit-exact" : "MISMATCH"}</td></tr>`).join("")}</tbody></table></div></div>`
+        : `<div class="card" style="margin-top:16px"><h2>Base weights for ${esc(r.template)}</h2><p class="small">Sizes: ${Object.entries(r.sizes).map(([k, v]) => `${esc(k)} (val loss ${v.best_val_loss})`).join(", ")} · licence ${esc(r.licence)}. Customer projects can now fine-tune from them.</p></div>`;
+      return;
+    }
     if (job.kind === "rebuild") {
       $("#res").innerHTML = `<div class="card" style="margin-top:16px"><h2>Rebuild of <a href="#/job/${esc(job.params.job_id)}">${esc(job.params.job_id)}</a></h2>
         <div class="callout ${r.identical ? "ok" : "bad"}">${r.identical ? "Byte-identical: the package rebuilds exactly from the recorded inputs." : "The rebuild differs from the recorded build."}</div>
@@ -665,22 +673,35 @@ route(/^\/explorer$/, async (el) => {
 /* ------------------------------------------------------------------------------------------------ board farm */
 route(/^\/boards$/, async (el) => {
   const draw = async () => {
-    const b = await api("/api/boards");
-    el.innerHTML = `<div class="page-h"><div><h1>Board Farm</h1><p class="muted">Real MCU boards on lab agents. Every run checks outputs bit-exactly; real runs calibrate the latency model.</p></div></div>
-    ${b.boards.some((x) => x.simulated) ? `<div class="callout" style="margin-bottom:16px">The boards below are <b>simulated</b> by an in-process agent: outputs come from the bit-exact host build, cycles from the planning model ±4%. Simulated cycles never enter calibration. Connect a lab agent to add real boards.</div>` : ""}
-    <div class="grid g2"><div class="card"><h2>Boards</h2><div class="tbl-wrap"><table class="t"><thead><tr><th>Board</th><th>Target</th><th>Agent</th><th>Probe</th><th>Status</th></tr></thead><tbody>
-      ${b.boards.map((x) => `<tr><td>${esc(x.name)} ${x.simulated ? `<span class="badge b-warn">sim</span>` : ""}</td><td><span style="color:${TARGET_COLOR[x.target]}">●</span> ${esc(x.target)}</td><td class="mono small">${esc(x.agent_id)}</td><td class="small">${esc(x.info.probe || "")}</td><td><span class="dot ${x.status === "busy" ? "busy" : x.online ? "on" : "off"}"></span> ${esc(x.status)}</td></tr>`).join("") || `<tr><td colspan="5" class="empty">No boards registered</td></tr>`}
-    </tbody></table></div></div>
-    <div class="card"><h2>Latency calibration</h2>${Object.keys(b.calibration).length ? `<table class="t"><thead><tr><th>Target : objective</th><th class="n">cycles/MAC</th><th class="n">overhead</th><th class="n">runs</th></tr></thead><tbody>${Object.entries(b.calibration).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.cycles_per_mac.toFixed(3)}</td><td class="n">${fmt(v.overhead)}</td><td class="n">${v.samples}</td></tr>`).join("")}</tbody></table>` : `<p class="small muted">No real-board measurements yet. Until then latency comes from SAI's kernel cost model where it has one, else a MACs × cycles/MAC heuristic, and is labelled that way everywhere.</p>`}
-      <h3 style="margin-top:14px">Connect a lab agent</h3><p class="small">On a PC with boards on USB (ST-LINK, J-Link, CMSIS-DAP):</p>
-      <div class="log">pip install requests pyocd
+    const [b, reg] = await Promise.all([api("/api/boards"), api("/api/regressions")]);
+    const kind = (x) => x.kind === "physical" ? "" : `<span class="badge ${x.kind === "emulated" ? "b-info" : "b-warn"}">${esc(x.kind)}</span>`;
+    const dot = (x) => x.status === "quarantined" ? "off" : x.status === "busy" ? "busy" : x.online ? "on" : "off";
+    el.innerHTML = `<div class="page-h"><div><h1>Board Farm</h1><p class="muted">MCU boards on lab agents. Every run builds the HIL harness around the SAI package, checks outputs bit-exactly, and — on physical boards — measures cycles and stack.</p></div>
+      ${ME.perms.farm_admin ? `<button class="btn" id="regrun">Run regression now</button>` : ""}</div>
+    ${b.boards.length && b.boards.every((x) => x.kind !== "physical") ? `<div class="callout info" style="margin-bottom:16px">No physical boards are connected yet. The <b>emulated</b> boards run the real cross-compiled firmware on QEMU (Cortex-M7, RV32IMAFC): outputs are real and checked bit-exactly; QEMU cycles are not latency and never calibrate. Connect a lab agent (Admin → Lab agents) to add NUCLEO-H753ZI or MD6605 EVB boards.</div>` : ""}
+    <div class="grid g2"><div class="card"><h2>Boards</h2><div class="tbl-wrap"><table class="t"><thead><tr><th>Board</th><th>Target</th><th>Agent</th><th>Health</th><th>Status</th><th></th></tr></thead><tbody>
+      ${b.boards.map((x) => `<tr><td>${esc(x.name)} ${kind(x)}</td><td><span style="color:${TARGET_COLOR[x.target]}">●</span> ${esc(x.target)}</td><td class="mono small">${esc(x.agent_id)}</td>
+        <td class="small">${esc(x.health.probe || x.info.probe || "")}${x.fail_count ? ` · ${x.fail_count} fail(s)` : ""}</td><td><span class="dot ${dot(x)}"></span> ${esc(x.status)}</td>
+        <td>${x.status === "quarantined" && ME.perms.farm_admin ? `<button class="btn sm" data-reset="${esc(x.id)}">Reset</button>` : ""}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">No boards registered</td></tr>`}
+    </tbody></table></div><p class="small muted" style="margin-top:8px">A board that fails 3 runs in a row is quarantined until the lab resets it; agents power-cycle a failing board once (uhubctl) before reporting.</p></div>
+    <div class="card"><h2>Latency calibration</h2>${Object.keys(b.calibration).length ? `<table class="t"><thead><tr><th>Target : objective</th><th class="n">cycles/MAC</th><th class="n">overhead</th><th class="n">runs</th></tr></thead><tbody>${Object.entries(b.calibration).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.cycles_per_mac.toFixed(3)}</td><td class="n">${fmt(v.overhead)}</td><td class="n">${v.samples}</td></tr>`).join("")}</tbody></table>` : `<p class="small muted">No physical-board measurements yet. Until then latency comes from SAI's kernel cost model where it has one, else a MACs × cycles/MAC heuristic, and is labelled that way everywhere.</p>`}
+      <h3 style="margin-top:14px">Connect a lab agent</h3><p class="small">Create a token in Admin → Lab agents, list the boards in <code>boards.json</code> (driver <code>pyocd</code>, <code>jlink</code> or <code>qemu</code>), then on the lab PC:</p>
+      <div class="log">pip install numpy pyserial pyocd
 python agent/board_agent.py --server ${esc(location.origin)} \\
-  --token $SAI_PLATFORM_AGENT_TOKEN --boards boards.yaml</div></div></div>
-    <div class="card" style="margin-top:16px"><h2>Recent runs</h2>${b.runs.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Run</th><th>Job</th><th>Board</th><th>Status</th><th class="n">Estimated</th><th class="n">Measured</th><th>Outputs</th><th>When</th></tr></thead><tbody>
-      ${b.runs.map((x) => { const r = x.result || {}; return `<tr><td class="mono small">${esc(x.id)}</td><td><a href="#/job/${x.job_id}">${esc(x.job_id)}</a></td><td>${esc(x.board_id || "–")}</td><td>${statusBadge(x.status)}</td><td class="n">${ms(x.request.estimated_ms)}</td><td class="n">${ms(r.latency_ms)}${r.simulated ? " (sim)" : ""}</td><td>${r.outputs_match === undefined ? "–" : r.outputs_match ? `<span class="badge b-ok">match</span>` : `<span class="badge b-bad">mismatch</span>`}</td><td class="muted">${ago(x.created)}</td></tr>`; }).join("")}</tbody></table></div>` : `<div class="empty small">No runs yet. Open a finished project and press “Flash &amp; measure”.</div>`}</div>`;
+  --token $SAI_AGENT_TOKEN --boards boards.json</div></div></div>
+    <div class="card" style="margin-top:16px"><h2>Nightly regression</h2>${reg.latest.length ? `<p class="small muted">Run ${esc(reg.runs[0].run_id)} · SAI ${esc(reg.runs[0].sai_version)} · ${ago(reg.runs[0].created)}</p>
+      <div class="tbl-wrap"><table class="t"><thead><tr><th>Model type (tiny)</th><th>Board</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Plans that fit</th><th>Emulated HIL</th></tr></thead><tbody>
+      ${reg.latest.map((r) => `<tr><td>${esc(r.template)}</td><td>${esc(r.target)}</td><td class="n">${bytes(r.ram)}</td><td class="n">${bytes(r.flash)}</td><td class="n">${r.feasible}</td><td>${r.hil_match === null ? "–" : r.hil_match ? `<span class="badge b-ok">bit-exact</span>` : `<span class="badge b-bad">mismatch</span>`}</td></tr>`).join("")}</tbody></table></div>` : `<p class="small muted">No regression run yet. It checks every pool model type on every board against the current SAI release and alerts on RAM/flash growth, lost fits or HIL mismatches (also nightly in CI).</p>`}</div>
+    <div class="card" style="margin-top:16px"><h2>Recent runs</h2>${b.runs.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Run</th><th>Job</th><th>Board</th><th>Status</th><th class="n">Estimated</th><th class="n">Result</th><th>Outputs</th><th class="n">Stack</th><th>When</th></tr></thead><tbody>
+      ${b.runs.map((x) => { const r = x.result || {}; return `<tr><td class="mono small">${esc(x.id)}</td><td><a href="#/job/${x.job_id}">${esc(x.job_id)}</a></td><td>${esc(x.board_id || "–")}</td><td>${statusBadge(x.status)}</td><td class="n">${ms(x.request.estimated_ms)}</td>
+        <td class="n">${r.emulated ? `<span class="small muted">${fmt(r.cycles)} emu. cycles</span>` : r.simulated ? `${ms(r.latency_ms)} (sim)` : ms(r.latency_ms)}</td>
+        <td>${r.outputs_match === undefined ? (r.error ? `<span class="badge b-bad" title="${esc(r.error)}">error</span>` : "–") : r.outputs_match ? `<span class="badge b-ok">match</span>` : `<span class="badge b-bad">mismatch</span>`}</td><td class="n">${bytes(r.stack_painted)}</td><td class="muted">${ago(x.created)}</td></tr>`; }).join("")}</tbody></table></div>` : `<div class="empty small">No runs yet. Open a finished project and press “Flash &amp; measure”.</div>`}</div>`;
+    $$("[data-reset]").forEach((bt) => (bt.onclick = async () => { await api(`/api/boards/${bt.dataset.reset}/reset`, { method: "POST" }); draw(); }));
+    const rr = $("#regrun");
+    if (rr) rr.onclick = async () => { const j = await api("/api/admin/regression", { json: {} }); location.hash = `#/job/${j.id}`; };
   };
   await draw();
-  const t = setInterval(draw, 3000); onLeave(() => clearInterval(t));
+  const t = setInterval(draw, 4000); onLeave(() => clearInterval(t));
 });
 
 /* ------------------------------------------------------------------------------------------------ system */

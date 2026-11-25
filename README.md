@@ -1,4 +1,4 @@
-# SAI Platform (v0.4: compiler integration depth)
+# SAI Platform (v0.5: board farm v1)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -61,6 +61,8 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 | `backend/auth.py` | Orgs, users, roles, sessions, agent tokens, audit log, usage metering |
 | `backend/worker.py` | Standalone job worker (DB-backed queue) |
 | `frontends/` + `backend/features.py` | C feature front ends (MFCC, band energy) and their Python binding |
+| `harness/` + `backend/hil.py` | HIL harness firmware, board ports, QEMU runner |
+| `backend/regression.py` | Nightly pool x boards regression |
 | `Dockerfile`, `docker-compose.yml` | Image with SAI + pinned toolchains; API + worker services |
 | `backend/pipeline.py` | Job orchestration: train / fitcheck / analyze, packaging, model card, `sai_app.h` |
 | `backend/sai_engine.py` | The only door into SAI: `sai estimate/explore/compile/verify/inspect`; budgets, goals, latency labels |
@@ -82,6 +84,18 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * Latency is a planning number until a real board measures the build. Simulated board runs are flagged and never
   enter calibration.
 * Synthetic demo data is labelled as synthetic in the dataset, the job page and the model card.
+
+## Board farm (M4)
+
+* **HIL harness firmware** (`harness/`): bare-metal C + startup + linker scripts per board, linked with the SAI
+  package library using SAI's own target flags; prints outputs, cycles (median of 31) and painted stack.
+* **Emulated lab out of the box**: with QEMU installed the platform runs two in-process boards — Cortex-M7
+  (MPS2-AN500) and RV32IMAFC (virt) — executing the real firmware; outputs are checked bit-exactly, cycles are
+  labelled emulated. A board run for another target compiles the model for that target on demand.
+* **Physical boards**: NUCLEO-H753ZI (USART3 + DWT) and MD6605 EVB ports link in CI; lab agent drivers for pyOCD
+  and J-Link, uhubctl power cycling, health reporting, quarantine after 3 failures.
+* **Nightly regression** of the whole pool on every board (`python -m backend.regression`, nightly workflow).
+* Protocol and ports: `docs/BOARD_AGENT_PROTOCOL.md`.
 
 ## Compiler integration (M3)
 
@@ -124,4 +138,4 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 ## Known limitations
 
 SQLite (one host; Postgres is a later swap of `db.conn`), local file storage, CPU training, one input/one output
-models, board farm simulated (M4). See `docs/IMPLEMENTATION_PLAN.md`.
+models; physical boards need a lab agent (the emulated lab runs without one). See `docs/IMPLEMENTATION_PLAN.md`.

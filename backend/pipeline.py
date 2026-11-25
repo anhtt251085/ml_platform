@@ -29,6 +29,7 @@ STAGES = {
     "analyze": [("inspect", "Inspect model"), ("plan", "SAI plan search")],
     "rebuild": [("compile", "Recompile"), ("compare", "Compare with the original build")],
     "basetrain": [("data", "Prepare data"), ("train", "Train base weights"), ("save", "Store in the pool")],
+    "regression": [("plans", "Pool x boards plan check"), ("hil", "Emulated HIL smoke"), ("compare", "Compare with last run")],
 }
 KINDS = tuple(STAGES)
 STALE_RUNNING_S = 6 * 3600
@@ -205,7 +206,7 @@ def _run(jid: str, kind: str, params: dict):
     t0 = time.time()
     try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
-         "basetrain": run_basetrain}[kind](ctx, params)
+         "basetrain": run_basetrain, "regression": _regression}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -545,11 +546,20 @@ def start_board_run(job_id: str, target: str | None, board_id: str | None, org_i
         next((c for c in cands if c["objective"] == sel["objective"]), cands[0] if cands else sel)
     vec = np.load(config.DATA_DIR / "jobs" / job_id / "hil_vectors.npz")
     macs = next(v["summary"]["macs"] for v in res["variants"] if v["size"] == sel["size"])
+    jobdir = config.DATA_DIR / "jobs" / job_id
+    if target == sel["target"]:
+        build_dir = jobdir / "build"
+    else:   # the board runs the same model compiled for its own target (SAI is bit-exact across targets)
+        build_dir = jobdir / f"hil_build_{target}"
+        if not (build_dir / "manifest.json").exists():
+            sai_engine.compile_build(jobdir / "model.onnx", target, cand.get("objective") if cand.get("objective")
+                                     in sai_engine.OBJECTIVES else "fast", build_dir,
+                                     cand.get("plan_name"), cand.get("candidate_id"))
     req = {"model_path": res["selected_model_path"], "objective": cand.get("objective"), "macs": macs,
            "schedule": cand.get("schedule"), "estimated_cycles": cand["latency"]["cycles"],
            "estimated_ms": cand["latency"]["ms"], "estimate_evidence": cand["latency"]["evidence"],
            "stack_bound": cand.get("stack"), "expected_outputs": vec["expected"].tolist(),
-           "plan_digest": cand.get("plan_digest"), "plan_name": cand.get("plan_name"),
+           "plan_digest": cand.get("plan_digest"), "plan_name": cand.get("plan_name"), "build_dir": str(build_dir),
            "package": f"/api/jobs/{job_id}/download/package.zip"}
     return boards_mod.request_run(job_id, target, board_id, req, org_id)
 
@@ -753,6 +763,11 @@ int sai_infer(const float *raw) {{
     {"return sai_app_argmax(output);" if pre["task"] == "classification" else "return 0; /* decode output[] with sai_app.h */"}
 }}
 """
+
+
+def _regression(ctx, p):
+    from . import regression
+    regression.run(ctx, p)
 
 
 def pool_weights(tid: str, size: str) -> dict | None:

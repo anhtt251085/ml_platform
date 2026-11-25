@@ -13,7 +13,7 @@ RUN --mount=type=secret,id=extra_ca,required=false \
 
 RUN apt-get update -q && apt-get install -y -q --no-install-recommends \
         gcc libc6-dev git \
-        gcc-arm-none-eabi libnewlib-arm-none-eabi curl \
+        gcc-arm-none-eabi libnewlib-arm-none-eabi curl qemu-system-arm qemu-system-misc \
     && rm -rf /var/lib/apt/lists/*
 
 # MD6605: the xPack RISC-V toolchain SAI's MD6605 measurements use (pinned + checksum). Debian's
