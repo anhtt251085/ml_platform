@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 import numpy as np
 
-from . import archspec, auth, boards, commercial, config, data, db, pipeline, sai_engine, store
+from . import approvals, archspec, auth, boards, commercial, config, data, db, pipeline, sai_engine, store
 
 app = FastAPI(title=config.BRAND_NAME, version=config.PLATFORM_VERSION)
 FRONT = config.ROOT / "frontend"
@@ -93,7 +93,7 @@ def logout(response: Response, u: dict = Depends(auth.current)):
 
 @app.get("/api/me")
 def me(u: dict = Depends(auth.current)):
-    perms = {k: u["role"] in v for k, v in auth.PERMS.items()}
+    perms = auth.perms(u)
     s = commercial.settings(u["org_id"])
     return {**{k: v for k, v in u.items() if k != "token"}, "perms": perms, "mode": config.MODE,
             "brand": {"product_name": config.BRAND_NAME, **s["brand"]}, "plan": commercial.plan_of(u),
@@ -129,14 +129,14 @@ class OrgIn(BaseModel):
 class UserIn(BaseModel):
     email: str
     name: str
-    role: str = "member"
+    role: str = "engineer"
     password: str
     org_id: str | None = None
 
 
 @app.get("/api/admin/orgs")
 def admin_orgs(u: dict = Depends(auth.require("org_admin"))):
-    rows = auth.orgs() if u["role"] == "platform_admin" else [auth.org(u["org_id"])]
+    rows = auth.orgs() if auth.has(u, "platform_admin") else [auth.org(u["org_id"])]
     for r in rows:
         r["usage"] = auth.usage(r["id"])
         r["deployment"] = commercial.settings(r["id"])["deployment"]
@@ -202,9 +202,7 @@ def admin_users(u: dict = Depends(auth.require("org_admin"))):
 
 @app.post("/api/admin/users")
 def admin_user_create(body: UserIn, u: dict = Depends(auth.require("org_admin"))):
-    org_id = body.org_id if u["role"] == "platform_admin" and body.org_id else u["org_id"]
-    if u["role"] != "platform_admin" and body.role not in ("org_admin", "member"):
-        raise HTTPException(403, "org admins can create org_admin and member users only")
+    org_id = body.org_id if auth.has(u, "platform_admin") and body.org_id else u["org_id"]
     if not auth.org(org_id):
         raise HTTPException(400, "unknown organisation")
     try:
@@ -289,7 +287,7 @@ def system(u: dict = Depends(auth.current)):
 @app.get("/api/catalog")
 def catalog(drafts: bool = False, u: dict = Depends(auth.current)):
     out = []
-    for t in store.templates(include_drafts=drafts and u["role"] in auth.PERMS["studio"]):
+    for t in store.templates(include_drafts=drafts and auth.has(u, "studio")):
         t = dict(t)
         t["sizes"] = {}
         for size, layers in t["variants"].items():
@@ -308,14 +306,14 @@ def catalog(drafts: bool = False, u: dict = Depends(auth.current)):
 @app.get("/api/catalog/{tid}")
 def catalog_item(tid: str, u: dict = Depends(auth.current)):
     t = store.template(tid)
-    if not t or (t.get("status") == "draft" and u["role"] not in auth.PERMS["studio"]):
+    if not t or (t.get("status") == "draft" and not auth.has(u, "studio")):
         raise HTTPException(404, "unknown model type")
     return t
 
 
 @app.post("/api/catalog")
 def catalog_save(body: dict, u: dict = Depends(auth.require("studio"))):
-    if body.get("status") == "published" and u["role"] not in auth.PERMS["publish"]:
+    if body.get("status") == "published" and not auth.has(u, "publish"):
         raise HTTPException(403, "only researchers publish to the pool")
     body["author"] = body.get("author") or u["name"]
     try:
@@ -340,7 +338,7 @@ def catalog_delete(tid: str, u: dict = Depends(auth.require("studio"))):
 def _tpl(tid, u: dict | None = None):
     """A template the caller may use: customers get published (and deprecated, for old projects) ones only."""
     t = store.template(tid)
-    if not t or (u is not None and t.get("status") == "draft" and u["role"] not in auth.PERMS["studio"]):
+    if not t or (u is not None and t.get("status") == "draft" and not auth.has(u, "studio")):
         raise HTTPException(404, "unknown model type")
     return t
 
@@ -625,7 +623,7 @@ def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
             _bad(e)
         if name not in cfg["sizes"]:
             cfg["sizes"].append(name)
-    if cfg.get("pool_benchmark") and u["role"] not in auth.PERMS["publish"]:
+    if cfg.get("pool_benchmark") and not auth.has(u, "publish"):
         raise HTTPException(403, "only SAI research publishes pool benchmarks")
     plan = commercial.check_project(u)
     job = pipeline.create("train", cfg, org_id=u["org_id"], user_id=u["id"], priority=plan["priority"])
@@ -717,12 +715,67 @@ def _file(jid: str, name: str) -> Path:
     return p
 
 
+# ---- compiled packages & approvals ---------------------------------------------------------------------------------
+class NoteIn(BaseModel):
+    note: str = ""
+
+
+def _approval_call(fn, *a):
+    try:
+        return fn(*a)
+    except approvals.ApprovalError as e:
+        raise HTTPException(e.status, str(e)) from None
+
+
+@app.get("/api/packages")
+def packages_list(status: str | None = None, u: dict = Depends(auth.current)):
+    if status and status not in approvals.STATUSES:
+        raise HTTPException(400, f"status must be one of {approvals.STATUSES}")
+    return {"packages": approvals.packages(auth.scope(u), status), "can_approve": auth.has(u, "approve")}
+
+
+@app.get("/api/packages/{jid}")
+def package_get(jid: str, u: dict = Depends(auth.current)):
+    j = _job(jid, u)
+    hist = [a for a in auth.audit_log(None if auth.has(u, "platform_admin") else u["org_id"], limit=1000)
+            if a["target"] == jid and (a["action"].startswith("package_") or a["action"] == "download")]
+    return {**approvals.get(jid), "available": j["kind"] == "train" and j["status"] == "succeeded"
+            and (config.DATA_DIR / "jobs" / jid / "package.zip").exists(), "history": hist,
+            "can_approve": auth.has(u, "approve")}
+
+
+@app.post("/api/packages/{jid}/request")
+def package_request(jid: str, body: NoteIn, u: dict = Depends(auth.current)):
+    return _approval_call(approvals.request, u, _job(jid, u), body.note)
+
+
+@app.post("/api/packages/{jid}/approve")
+def package_approve(jid: str, body: NoteIn, u: dict = Depends(auth.require("approve"))):
+    return _approval_call(approvals.decide, u, _job(jid, u), True, body.note)
+
+
+@app.post("/api/packages/{jid}/reject")
+def package_reject(jid: str, body: NoteIn, u: dict = Depends(auth.require("approve"))):
+    return _approval_call(approvals.decide, u, _job(jid, u), False, body.note)
+
+
+@app.post("/api/packages/{jid}/revoke")
+def package_revoke(jid: str, body: NoteIn, u: dict = Depends(auth.require("approve"))):
+    return _approval_call(approvals.revoke, u, _job(jid, u), body.note)
+
+
 @app.get("/api/jobs/{jid}/download/{name}")
 def job_download(jid: str, name: str, u: dict = Depends(auth.current)):
     _job(jid, u)
     p = _file(jid, name)
     if name in ("package.zip", "model.onnx"):
         commercial.check_package_download(u)
+    if name == "package.zip":                       # compiled sources leave only with a manager's approval
+        try:
+            approvals.check_download(jid)
+        except approvals.ApprovalError as e:
+            raise HTTPException(e.status, str(e)) from None
+        approvals.count_download(jid)
     auth.audit(u, "download", jid, {"file": name})
     auth.meter(u["org_id"], "download", 1, f"{jid}/{name}")
     return FileResponse(p, media_type=DOWNLOADS[name], filename=f"{jid}_{name}")
@@ -730,7 +783,7 @@ def job_download(jid: str, name: str, u: dict = Depends(auth.current)):
 
 # ---- researcher studio & explorer ---------------------------------------------------------------------------------
 @app.post("/api/studio/validate")
-def studio_validate(body: dict, u: dict = Depends(auth.current)):
+def studio_validate(body: dict, u: dict = Depends(auth.require("research"))):
     try:
         spec = archspec.normalize(body)
         return {"ok": True, "spec": spec, "summary": archspec.summary(spec)}
@@ -739,7 +792,7 @@ def studio_validate(body: dict, u: dict = Depends(auth.current)):
 
 
 @app.post("/api/studio/fitcheck")
-def studio_fitcheck(body: dict, u: dict = Depends(auth.require("studio"))):
+def studio_fitcheck(body: dict, u: dict = Depends(auth.require("research"))):
     try:
         archspec.normalize(body.get("spec") or {})
     except archspec.SpecError as e:
@@ -778,7 +831,7 @@ def pool_weights(u: dict = Depends(auth.current)):
 @app.post("/api/explorer/analyze")
 async def explorer_analyze(file: UploadFile = File(...), targets: str = Form("md6605,cortex-m7"),
                            goal: str = Form("balanced"), max_ram: int | None = Form(None),
-                           u: dict = Depends(auth.current)):
+                           u: dict = Depends(auth.require("research"))):
     name = (file.filename or "model.onnx").lower()
     if not name.endswith((".onnx", ".tflite")):
         raise HTTPException(400, "upload an INT8 .onnx or .tflite model")

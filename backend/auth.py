@@ -1,12 +1,14 @@
 # Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
 """Identity: organisations, users, roles, sessions, lab-agent tokens, audit log, usage metering.
 
-Roles
-  platform_admin  SAI staff: everything, every org
-  researcher      SAI staff: Model Studio, publish to the pool, sees the pool's drafts
-  lab             SAI staff: board farm, agent tokens
-  org_admin       customer admin: manage the org's users, everything inside the org
-  member          customer engineer: projects, datasets, board runs inside the org
+Roles (every organisation has the same four; the SAI organisation's admins are the platform admins)
+  engineer    projects, datasets, jobs, board runs; requests compiled-package downloads. No research pages.
+  researcher  + Model Studio and Plan Explorer (fit checks, model analysis); in the SAI organisation also pool
+              templates, drafts and publishing
+  manager     + research pages; approves or rejects compiled-package downloads (never their own request)
+  admin       everything in the organisation, including the Admin console (users, audit, branding); in the SAI
+              organisation also every organisation, the board farm, lab agents, the job queue and retention
+Legacy role names are accepted and mapped: platform_admin / org_admin -> admin, member / lab -> engineer.
 
 Org tiers (commercial edition, M6): free (pool, fit check, estimates; no package download), standard, professional.
 Passwords: scrypt. Sessions: random 32-byte tokens, only their SHA-256 is stored. OIDC plugs in by mapping an ID
@@ -26,19 +28,38 @@ from fastapi import Depends, Header, HTTPException, Request
 
 from . import config, db
 
-ROLES = ("platform_admin", "researcher", "lab", "org_admin", "member")
-STAFF = ("platform_admin", "researcher", "lab")
+ROLES = ("engineer", "researcher", "manager", "admin")
+LEGACY_ROLES = {"platform_admin": "admin", "org_admin": "admin", "member": "engineer", "lab": "engineer"}
 TIERS = ("free", "standard", "professional")
 SESSION_S = 7 * 24 * 3600
 PLATFORM_ORG = "org_sai"
 
+# permission -> (roles that have it, only inside the SAI organisation?)
 PERMS = {
-    "studio": ("platform_admin", "researcher"),
-    "publish": ("platform_admin", "researcher"),
-    "farm_admin": ("platform_admin", "lab"),
-    "org_admin": ("platform_admin", "org_admin"),
-    "platform_admin": ("platform_admin",),
+    "research": (("researcher", "manager", "admin"), False),   # Model Studio + Plan Explorer pages, fit checks
+    "studio": (("researcher", "admin"), True),                 # pool templates and drafts
+    "publish": (("researcher", "admin"), True),                # publish to the pool, base weights, benchmarks
+    "approve": (("manager", "admin"), False),                  # approve compiled-package downloads
+    "org_admin": (("admin",), False),                          # Admin console of the organisation
+    "farm_admin": (("admin",), True),                          # board farm, lab agents, regression
+    "platform_admin": (("admin",), True),                      # every organisation, queue, retention
 }
+
+
+def norm_role(role: str) -> str:
+    role = LEGACY_ROLES.get(role, role)
+    if role not in ROLES:
+        raise ValueError(f"role must be one of {', '.join(ROLES)}")
+    return role
+
+
+def has(u: dict, perm: str) -> bool:
+    roles, platform_only = PERMS[perm]
+    return u.get("role") in roles and (not platform_only or u.get("org_id") == PLATFORM_ORG)
+
+
+def perms(u: dict) -> dict:
+    return {k: has(u, k) for k in PERMS}
 
 
 def hash_pw(pw: str) -> str:
@@ -91,10 +112,7 @@ def set_tier(oid: str, tier: str):
 
 
 def create_user(org_id: str, email: str, name: str, role: str, password: str) -> dict:
-    if role not in ROLES:
-        raise ValueError(f"role must be one of {ROLES}")
-    if role in STAFF and org_id != PLATFORM_ORG:
-        raise ValueError("staff roles belong to the SAI organisation")
+    role = norm_role(role)
     if len(password) < 8:
         raise ValueError("password must have at least 8 characters")
     uid = "usr_" + uuid.uuid4().hex[:10]
@@ -169,7 +187,7 @@ def bootstrap():
         return
     email = os.environ.get("SAI_PLATFORM_ADMIN_EMAIL", "admin@sai.local")
     pw = os.environ.get("SAI_PLATFORM_ADMIN_PASSWORD") or secrets.token_urlsafe(12)
-    create_user(PLATFORM_ORG, email, "Platform admin", "platform_admin", pw)
+    create_user(PLATFORM_ORG, email, "Platform admin", "admin", pw)
     if not os.environ.get("SAI_PLATFORM_ADMIN_PASSWORD"):
         p = config.DATA_DIR / "ADMIN_PASSWORD"
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -198,24 +216,24 @@ def current(request: Request, authorization: str | None = Header(None)) -> dict:
         raise HTTPException(401, "account disabled")
     o = org(u["org_id"]) or {}
     return {**u, "org": {"id": o.get("id"), "name": o.get("name"), "tier": o.get("tier")}, "token": token,
-            "staff": u["role"] in STAFF}
+            "staff": u["org_id"] == PLATFORM_ORG}
 
 
 def require(perm: str):
     def dep(u: dict = Depends(current)) -> dict:
-        if u["role"] not in PERMS[perm]:
+        if not has(u, perm):
             raise HTTPException(403, f"your role ({u['role']}) cannot do this")
         return u
     return dep
 
 
 def can_see(u: dict, org_id: str | None) -> bool:
-    return u["role"] == "platform_admin" or org_id == u["org_id"] or (org_id is None and u["staff"])
+    return has(u, "platform_admin") or org_id == u["org_id"] or (org_id is None and u["staff"])
 
 
 def scope(u: dict) -> str | None:
     """org filter for list queries; None = all orgs (platform admin)."""
-    return None if u["role"] == "platform_admin" else u["org_id"]
+    return None if has(u, "platform_admin") else u["org_id"]
 
 
 # ---- agents ------------------------------------------------------------------------------------------------------

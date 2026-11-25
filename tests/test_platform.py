@@ -15,6 +15,8 @@ ADMIN = (os.environ["SAI_PLATFORM_ADMIN_EMAIL"], os.environ["SAI_PLATFORM_ADMIN_
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
+
+from tests.approval_helper import release  # noqa: E402
 import torch  # noqa: E402
 
 from backend import archspec, catalog, data, qexport, sai_engine, trainer  # noqa: E402
@@ -162,6 +164,9 @@ def test_api_end_to_end_with_board_run():
         jd = _cfg.DATA_DIR / "jobs" / jid
         assert (jd / "model.onnx").exists() and not list(jd.glob("model_*.onnx")) and not (jd / "exact").exists()
         assert res["selected"]["fits"]
+        pz = c.get(f"/api/jobs/{jid}/download/package.zip")
+        assert pz.status_code == 403 and "approval" in pz.text           # compiled sources need a manager's approval
+        release(c, jid)
         assert c.get(f"/api/jobs/{jid}/download/package.zip").status_code == 200
         run = c.post("/api/boards/runs", json={"job_id": jid}).json()
         for _ in range(60):
@@ -348,6 +353,7 @@ def test_kws_frontend_package_finetune_and_evaluation_marker():
         assert "fine-tuning from pool base weights" in logs
         res = j["result"]
         assert res["deployable"] is False and res["split_mode"] == "recording"
+        release(c, j["id"])
         z = zipfile.ZipFile(io.BytesIO(c.get(f"/api/jobs/{j['id']}/download/package.zip").content))
         names = set(z.namelist())
         assert {"sai_package/frontend/sai_features.c", "sai_package/frontend/sai_frontend_config.h",
@@ -435,6 +441,7 @@ def test_deployment_rights_signature_and_package_gate():
         c.post(f"/api/admin/orgs/{org['id']}/deployment", headers=h, json={"model": "royalty", "units": 10000})
         j2 = wait_job(c, c.post("/api/projects", headers=hs, json=body).json()["job"]["id"], hs)
         assert j2["result"]["deployable"] is True
+        release(c, j2["id"], hs)
         pkg = c.get(f"/api/jobs/{j2['id']}/download/package.zip", headers=hs)
         assert pkg.status_code == 200
         pem = c.get("/api/signing/public-key").json()["public_key_pem"]
