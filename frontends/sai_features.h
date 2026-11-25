@@ -1,5 +1,6 @@
-/* SAI feature front ends: the same C runs on the MCU and (through a Python binding) in training, so the features a
-   model was trained on are bit-for-bit the features it sees in the field.
+/* SAI feature front ends: the same C runs on the MCU and (through a Python binding) in training. The arithmetic is
+   identical (no FMA contraction, fixed summation order); sinf/cosf/logf come from each toolchain's libm, so values
+   may differ in the last bit between the host and an MCU libm - far below the model's INT8 input resolution.
 
    No heap, no libc beyond <math.h> (sinf, cosf, logf, sqrtf). Work memory is the caller's (SAI_FEAT_WORK_FLOATS). */
 #ifndef SAI_FEATURES_H

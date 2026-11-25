@@ -1,4 +1,4 @@
-# SAI Platform (v0.3: data & training depth)
+# SAI Platform (v1.2)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -25,6 +25,14 @@ SAI_SRC=/path/to/mcu_edge_ai docker compose up -d --build        # http://localh
 * `SAI_PLATFORM_MODE=multi` (default): multi-tenant SaaS. SAI admins create customer organisations and invite users
   (no public sign-up).
 * `SAI_PLATFORM_MODE=single SAI_PLATFORM_ORG_NAME="Acme"`: one customer per install (on-prem / customer VPC).
+* Put it behind a TLS-terminating proxy: with `SAI_PLATFORM_COOKIE_SECURE=auto` (default) session cookies are
+  Secure and HSTS is sent whenever the request arrives over HTTPS (uvicorn runs with `--proxy-headers`; set
+  `FORWARDED_ALLOW_IPS` to the proxy's address), while plain-http localhost keeps working.
+* Large dataset uploads (over `SAI_PLATFORM_INLINE_INGEST`, 16 MB) are streamed to disk and imported by a worker
+  in the background; the cap is `SAI_PLATFORM_MAX_UPLOAD` (2 GB).
+* Storage retention: finished projects keep their package, model, report and build; intermediates go when a job
+  ends; an hourly sweep removes uploads after `SAI_PLATFORM_UPLOAD_TTL_DAYS` (7) and board builds / failed job
+  folders after `SAI_PLATFORM_RETENTION_DAYS` (30). Admin → Job queue → Clean up now.
 * The image pins the toolchains: Arm GNU (Debian) and **xPack `riscv-none-elf-gcc` 13.2.0-2** (checksummed), the
   toolchain SAI's MD6605 measurements use. Behind a TLS-inspecting proxy add
   `--secret id=extra_ca,src=proxy-ca.crt` to `docker build`.
@@ -61,6 +69,8 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 | `backend/auth.py` | Orgs, users, roles, sessions, agent tokens, audit log, usage metering |
 | `backend/worker.py` | Standalone job worker (DB-backed queue) |
 | `frontends/` + `backend/features.py` | C feature front ends (MFCC, band energy) and their Python binding |
+| `harness/` + `backend/hil.py` | HIL harness firmware, board ports, QEMU runner |
+| `backend/regression.py` | Nightly pool x boards regression |
 | `Dockerfile`, `docker-compose.yml` | Image with SAI + pinned toolchains; API + worker services |
 | `backend/pipeline.py` | Job orchestration: train / fitcheck / analyze, packaging, model card, `sai_app.h` |
 | `backend/sai_engine.py` | The only door into SAI: `sai estimate/explore/compile/verify/inspect`; budgets, goals, latency labels |
@@ -83,6 +93,65 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
   enter calibration.
 * Synthetic demo data is labelled as synthetic in the dataset, the job page and the model card.
 
+## Preprocessing & datasets (v1.1)
+
+* **Preprocess step** in the wizard (between Data and Board & goal), with a live before/after preview:
+  channel selection, decimation (block average), per-window mean removal — run by the same C
+  (`frontends/sai_prep.c`) in training and on the MCU — then per-channel normalization (z-score, robust,
+  min-max, none) fit on the train split, optional clipping, training-only augmentation (gain, noise, time shift),
+  class weights and split ratios / unit (recording or window).
+* Packages ship `sai_app_prepare.h` + `sai_prep.[ch]`: raw window in, the model's exact int8 input out — tested
+  bit-for-bit against the training path.
+* **Datasets** pages: every dataset of the organisation with licence, shape, recordings and quality; a detail page
+  with class and channel statistics, a sample browser per class, usage, delete, and "Use in a new project".
+
+## Commercial (M6)
+
+* **Plans**: Free (pool, fit check, estimates; 3 projects/month, no packages, no board farm), Standard (packages,
+  emulated board farm), Professional (physical boards with measured latency, priority queue). Quotas are enforced
+  (HTTP 402 with the reason); Plan & usage page per organisation. Prices are quoted by SAI, not in the software.
+* **Deployment rights** per organisation (none / royalty / buyout, set by SAI admins): without them — or with
+  data not licensed for commercial use — packages are evaluation-only.
+* **Signed packages**: every `package.zip` carries `SIGNATURE.json` (SHA-256 of every file + Ed25519 signature);
+  `tools/verify_package.py` + `/api/signing/public-key` detect any modification. Key: `SAI_PLATFORM_SIGNING_KEY`
+  (PEM) or generated on first start.
+* **White-label**: org admins set product name, accent colour and logo letters; installs set `SAI_PLATFORM_BRAND`.
+
+## Model pool program (M5)
+
+* **First real-data model**: activity recognition on UCI HAR (CC BY 4.0), split by subject — 95.4 % bit-exact on
+  held-out people with a 746-parameter model in 1.7 KB RAM / 5.4 KB flash on Cortex-M7
+  ([model card](docs/model_cards/har-imu_uci-har.md), importer `tools/import_uci_har.py`).
+* **Leaderboard** on the Model pool page: pool-benchmark projects (SAI research only) per model type, real data
+  ranked before synthetic, linked to full reports.
+* **Template versioning**: published versions, history, deprecation; every report records the template version.
+* Status of the six production model types and their data/licences: `docs/POOL_PROGRAM.md`.
+
+## Board farm (M4)
+
+* **HIL harness firmware** (`harness/`): bare-metal C + startup + linker scripts per board, linked with the SAI
+  package library using SAI's own target flags; prints outputs, cycles (median of 31) and painted stack.
+* **Emulated lab out of the box**: with QEMU installed the platform runs two in-process boards — Cortex-M7
+  (MPS2-AN500) and RV32IMAFC (virt) — executing the real firmware; outputs are checked bit-exactly, cycles are
+  labelled emulated. A board run for another target compiles the model for that target on demand.
+* **Physical boards**: NUCLEO-H753ZI (PLL1 at 480 MHz on rev V / 400 MHz on rev Y, caches on, USART3 + DWT) and
+  MD6605 EVB ports link in CI; the harness reports the clock it ran at and only reference-clock runs calibrate; lab agent drivers for pyOCD
+  and J-Link, uhubctl power cycling, health reporting, quarantine after 3 failures.
+* **Nightly regression** of the whole pool on every board (`python -m backend.regression`, nightly workflow).
+* Protocol and ports: `docs/BOARD_AGENT_PROTOCOL.md`.
+
+## Compiler integration (M3)
+
+* **Explored plans become candidates**: the Pareto frontier (workspace vs SAI rank) of `sai explore` is built
+  with `sai compile --plan NAME --candidate-id ID`, so intermediate RAM/latency trade-offs get exact flash and a
+  proven stack bound and can be selected; rebuilds replay the same plan.
+* **Certificate re-check**: every package's memory certificate is re-derived by `sai certify --check`.
+* **`measured` evidence**: a real board-farm run stores cycles per `target:plan_digest`; every later plan search
+  that produces the same program shows that measurement instead of an estimate.
+* **SAI contract tests** (`tests/test_sai_contract.py`) pin the JSON fields and schema versions the platform reads;
+  newer schemas surface as compatibility warnings on the Compiler & targets page.
+* `tools/sai_findings_repro.sh` reproduces the open SAI findings (issue #9) for upstream.
+
 ## Data & training (M2)
 
 * **C feature front ends** (`frontends/sai_features.[ch]`): MFCC and log band energies in portable C (no heap,
@@ -99,7 +168,7 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * **Pool base weights**: researchers train base weights per model type; customers fine-tune from them.
 * **Learning-rate search** (optional) and CUDA training when a GPU worker has one.
 
-## Security model (M1)
+## Security model
 
 * Sign-in with email + password (scrypt); sessions are random tokens stored as SHA-256; HttpOnly cookie or bearer.
 * Roles: `platform_admin`, `researcher`, `lab` (SAI staff), `org_admin`, `member` (customers).
@@ -108,8 +177,14 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * Audit log of sign-ins, uploads, projects, downloads, admin actions; usage metering per org.
 * Reproducibility: every package records SAI version, toolchain and digests, dataset SHA-256, seeds;
   "Rebuild & compare" proves the package rebuilds byte for byte.
+* URL ingest only reaches public HTTPS addresses (resolved and pinned, no redirects); uploads are streamed with a
+  cap and NPZ sizes are checked before decompression; non-finite values are refused.
+* Lab agents can only act on runs claimed on their own boards; outputs are always compared server side; runs
+  have a lease; only physical boards at SAI's reference clock produce `measured` evidence and calibration.
+* CSP and security headers; login throttling; password change signs out other sessions; 500s return a reference
+  id, not internals; failed `sai verify` / `sai certify --check` fail the job.
 
 ## Known limitations
 
 SQLite (one host; Postgres is a later swap of `db.conn`), local file storage, CPU training, one input/one output
-models, board farm simulated (M4). See `docs/IMPLEMENTATION_PLAN.md`.
+models; physical boards need a lab agent (the emulated lab runs without one). See `docs/IMPLEMENTATION_PLAN.md`.
