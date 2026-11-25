@@ -76,6 +76,11 @@ MIGRATIONS: list[str] = [
     """
     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
     """,
+    # 6: training monitoring - per-epoch metrics of every training run (live curves)
+    """
+    CREATE TABLE job_metrics (job_id TEXT, seq INTEGER, ts REAL, series TEXT, data TEXT);
+    CREATE INDEX job_metrics_i ON job_metrics(job_id, seq);
+    """,
 ]
 
 

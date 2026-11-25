@@ -76,6 +76,7 @@ The SAI-dependent tests and the pool x board regression run on a machine with th
 | `backend/worker.py` | Standalone job worker (DB-backed queue) |
 | `frontends/` + `backend/features.py` | C feature front ends (MFCC, band energy) and their Python binding |
 | `harness/` + `backend/hil.py` | HIL harness firmware, board ports, QEMU runner |
+| `backend/trainer.py` | Training (settings in `TRAIN_DEFAULTS`: optimizer, LR and schedule, batch, early stopping, clip, label smoothing, seed, QAT), per-epoch metrics for the live monitor |
 | `backend/recommend.py` | Architecture recommender: data profile → rules → candidates → exact SAI cost per board → pick for the goal |
 | `backend/regression.py` | Nightly pool x boards regression |
 | `Dockerfile`, `docker-compose.yml` | Image with SAI + pinned toolchains; API + worker services |

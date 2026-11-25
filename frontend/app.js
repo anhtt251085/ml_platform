@@ -180,6 +180,16 @@ function projectsTable(rows) {
   ${rows.map((p) => `<tr><td><a href="#/job/${esc(p.job_id)}">${esc(p.name)}</a></td><td>${esc(p.template_id)}</td><td>${esc(GOAL_LABEL[p.config.goal] || p.config.goal)}</td>
     <td>${statusBadge(p.job_status, p.job_progress)}</td><td class="muted">${ago(p.created)}</td></tr>`).join("")}</tbody></table></div>`;
 }
+function dur(sec) {
+  if (sec === null || sec === undefined || !isFinite(sec)) return "–";
+  sec = Math.max(0, Math.round(sec));
+  return sec < 60 ? `${sec} s` : sec < 3600 ? `${Math.floor(sec / 60)} min ${sec % 60} s` : `${Math.floor(sec / 3600)} h ${Math.floor(sec % 3600 / 60)} min`;
+}
+function jobTitle(job) {
+  const p = job.params || {};
+  return { train: p.name || "Project", fitcheck: "Studio fit check", rebuild: "Reproducibility rebuild", regression: "Pool regression",
+    basetrain: "Pool base weights", recommend: "Architecture recommendation", ingest: `Import ${p.filename || "dataset"}` }[job.kind] || `Analyze ${p.filename || "model"}`;
+}
 function statusBadge(s, p) {
   const c = { succeeded: "b-ok", failed: "b-bad", running: "b-acc", queued: "", cancelled: "b-warn" }[s] || "";
   return `<span class="badge ${c}">${esc(s || "?")}${s === "running" && p !== undefined ? ` ${Math.round(p * 100)}%` : ""}</span>`;
@@ -249,7 +259,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
   const pre = qp.get("template");
   const [cat, sys] = await Promise.all([api("/api/catalog"), system()]);
   const st = { step: pre ? 1 : 0, tpl: pre ? cat.find((t) => t.id === pre) : null, ds: null, prep: {},
-    targets: [], goal: "balanced", budgets: {}, metric: "", sizes: ["tiny", "small", "base"], epochs: 30, name: "" };
+    targets: [], goal: "balanced", budgets: {}, metric: "", sizes: ["tiny", "small", "base"], epochs: 30, name: "", training: {} };
   if (st.tpl) st.targets = [...st.tpl.targets];
   if (qp.get("dataset")) { try { st.ds = await api(`/api/datasets/${encodeURIComponent(qp.get("dataset"))}`); st.step = 2; } catch { /* stays on Data */ } }
   const STEPS = ["Model type", "Data", "Preprocess", "Board & goal", "Review"];
@@ -435,6 +445,8 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         <label class="check small"><input type="checkbox" id="ifp" ${st.initPool ? "checked" : ""} ${(SYS.pool_weights || {})[st.tpl.id] ? "" : "disabled"}>Fine-tune from the pool's base weights ${(SYS.pool_weights || {})[st.tpl.id] ? `<span class="badge b-ok">available</span>` : `<span class="muted">(none trained yet for this model type)</span>`}</label>
         <label class="check small"><input type="checkbox" id="lrs" ${st.lrSearch ? "checked" : ""}>Learning-rate search (2 runs per size, keeps the best on validation)</label>
         ${ME && ME.perms.publish ? `<label class="check small"><input type="checkbox" id="pbm" ${st.poolBench ? "checked" : ""}>Pool benchmark: publish the result on the pool leaderboard (SAI research)</label>` : ""}</div>
+      <details id="tadv" style="margin-top:10px" ${Object.keys(st.training).length ? "open" : ""}><summary class="small"><b>Advanced training settings</b> <span class="muted">(leave blank for automatic)</span></summary>
+        ${trainingForm(st.training, st.tpl.task)}</details>
       <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label>`).join("")}
         <label class="check" id="autolbl" style="${st.auto ? "" : "display:none"}"><input type="checkbox" name="sz" value="auto" ${st.sizes.includes("auto") ? "checked" : ""}>auto <span class="badge b-ok">recommended</span></label></div>
       </div></div>
@@ -449,6 +461,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
       st.targets = $$("input[name=tgt]:checked").map((x) => x.value); st.sizes = $$("input[name=sz]:checked").map((x) => x.value);
       st.budgets = { max_ram: +$("#mr").value || null, max_flash: +$("#mf").value || null, max_latency_ms: +$("#ml").value || null };
       st.metric = $("#mt").value; st.epochs = +$("#ep").value || 30; st.initPool = $("#ifp").checked; st.lrSearch = $("#lrs").checked; st.poolBench = !!($("#pbm") && $("#pbm").checked);
+      st.training = readTrainingForm();
     };
     $("#back").onclick = () => { save(); st.step--; draw(); };
     $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length) return toast("Pick at least one size"); st.step++; draw(); };
@@ -477,6 +490,35 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
     };
   }
 
+  function trainingForm(t, task) {
+    const sel = (id, opts, v, auto) => `<select id="${id}">${auto ? `<option value="">${auto}</option>` : ""}${opts.map((o) => `<option ${v === o ? "selected" : ""}>${o}</option>`).join("")}</select>`;
+    const num = (id, v, ph, step = "any") => `<input id="${id}" type="number" step="${step}" value="${v ?? ""}" placeholder="${ph}">`;
+    return `<div class="grid g3" style="margin-top:8px">
+      <label class="f">Optimizer${sel("t_opt", ["adam", "adamw", "sgd"], t.optimizer, "adam (default)")}</label>
+      <label class="f">Learning rate${num("t_lr", t.lr, "auto (5e-3)")}</label>
+      <label class="f">LR schedule${sel("t_sch", ["cosine", "step", "constant"], t.schedule, "cosine (default)")}</label>
+      <label class="f">Batch size${num("t_bs", t.batch_size, "auto", 1)}</label>
+      <label class="f">Weight decay${num("t_wd", t.weight_decay, "1e-4")}</label>
+      <label class="f">Early-stop patience (epochs, 0 = off)${num("t_pat", t.patience, "auto", 1)}</label>
+      <label class="f">Gradient clip (0 = off)${num("t_clip", t.grad_clip, "2.0")}</label>
+      ${task === "classification" ? `<label class="f">Label smoothing (0–0.5)${num("t_ls", t.label_smoothing, "0")}</label>` : ""}
+      <label class="f">Random seed${num("t_seed", t.seed, "0", 1)}</label>
+      <label class="f">Quantization-aware training${sel("t_qat", ["auto", "always", "off"], t.qat)}</label>
+      <label class="f">QAT epochs${num("t_qe", t.qat_epochs, "auto", 1)}</label>
+      <label class="check small" style="align-self:end"><input type="checkbox" id="t_ext" ${t.extend_small_data === false ? "" : "checked"}>Extend epochs for small datasets (to 1,500 steps)</label></div>`;
+  }
+  function readTrainingForm() {
+    const v = (id) => { const e = $("#" + id); return e ? e.value.trim() : ""; };
+    const t = {}, n = (k, id) => { if (v(id) !== "") t[k] = +v(id); };
+    if (v("t_opt")) t.optimizer = v("t_opt");
+    if (v("t_sch")) t.schedule = v("t_sch");
+    if (v("t_qat") && v("t_qat") !== "auto") t.qat = v("t_qat");
+    n("lr", "t_lr"); n("batch_size", "t_bs"); n("weight_decay", "t_wd"); n("patience", "t_pat"); n("grad_clip", "t_clip");
+    n("label_smoothing", "t_ls"); n("seed", "t_seed"); n("qat_epochs", "t_qe");
+    if ($("#t_ext") && !$("#t_ext").checked) t.extend_small_data = false;
+    return t;
+  }
+
   function recTable(r) {
     const arch = (layers) => layers.map((l) => l.op + (l.out ? l.out : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "")).join(" → ");
     const rec = r.recommended;
@@ -497,13 +539,14 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         <div class="kpi"><div class="l">Data</div><div class="v" style="font-size:15px">${fmt(st.ds.n)} windows${st.ds.synthetic ? ` <span class="badge b-warn">synthetic</span>` : ""}</div></div>
         <div class="kpi"><div class="l">Boards</div><div class="v" style="font-size:15px">${st.targets.join(", ")}</div></div>
         <div class="kpi"><div class="l">Goal</div><div class="v" style="font-size:15px">${GOAL_LABEL[st.goal]}</div></div></div>
+      ${Object.keys(st.training).length ? `<p class="small" style="margin-top:14px">Training settings: ${Object.entries(st.training).map(([k, v]) => `<code>${esc(k)}=${esc(String(v))}</code>`).join(" ")} (the rest automatic)</p>` : ""}
       <p class="small muted" style="margin-top:14px">The pipeline trains ${st.sizes.length} size(s), quantizes each to INT8 (with quantization-aware fine-tuning when INT8 loses more than 1%), asks SAI for every plan on every board, picks the best that fits, then compiles, verifies and measures the deployed program's accuracy bit-exactly.</p>
       ${nav(true, true, true, "Build my model →")}</div>`;
     $("#back").onclick = () => { st.name = $("#nm").value; st.step--; draw(); };
     $("#next").onclick = async () => {
       $("#next").disabled = true;
       try {
-        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, custom_variants: st.sizes.includes("auto") && st.auto ? { auto: st.auto } : {}, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
+        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, training: st.training, custom_variants: st.sizes.includes("auto") && st.auto ? { auto: st.auto } : {}, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
         location.hash = `#/job/${r.job.id}`;
       } catch (e) { toast(e.message); $("#next").disabled = false; }
     };
@@ -527,16 +570,43 @@ function datasetSummary(d) {
 }
 
 /* ------------------------------------------------------------------------------------------------ job page */
+route(/^\/jobs$/, async (el) => {
+  let timer = null, kind = "", status = "";
+  el.innerHTML = `<div class="page-h"><div><h1>Jobs &amp; logs</h1><p class="muted">Every training run, recommendation, import, rebuild and regression, live. Open a job for its training monitor and full log.</p></div></div>
+    <div class="row" style="margin-bottom:12px"><select id="jk"><option value="">All kinds</option>${["train", "recommend", "ingest", "fitcheck", "analyze", "rebuild", "basetrain", "regression"].map((k) => `<option>${k}</option>`).join("")}</select>
+    <select id="js"><option value="">Any status</option>${["running", "queued", "succeeded", "failed", "cancelled"].map((k) => `<option>${k}</option>`).join("")}</select><span class="spacer"></span><span class="small muted" id="jupd"></span></div>
+    <div class="card"><div class="tbl-wrap" id="jt"></div></div>`;
+  async function load() {
+    try {
+      const jobs = (await api(`/api/jobs${kind ? `?kind=${kind}` : ""}`)).filter((j) => !status || j.status === status);
+      const active = jobs.filter((j) => j.status === "running" || j.status === "queued").length;
+      $("#jt").innerHTML = jobs.length ? `<table class="t"><thead><tr><th>Job</th><th>Kind</th><th>Status</th><th>Stage</th><th>Last log line</th><th class="n">Warnings</th><th class="n">Duration</th><th>Started</th></tr></thead><tbody>
+        ${jobs.map((j) => `<tr><td><a href="#/job/${esc(j.id)}">${esc(jobTitle(j))}</a><div class="mono small muted">${esc(j.id)}</div></td><td>${esc(j.kind)}</td><td>${statusBadge(j.status, j.progress)}${j.status === "running" ? `<div class="progress" style="height:5px;margin-top:4px;width:90px"><i style="width:${Math.round((j.progress || 0) * 100)}%"></i></div>` : ""}</td>
+          <td class="small">${esc(j.stage || "–")}</td><td class="mono small" style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(j.last_log || "")}">${esc(j.error || j.last_log || "")}</td>
+          <td class="n">${j.warnings ? `<span class="badge b-warn">${j.warnings}</span>` : "–"}</td><td class="n">${dur((["running", "queued"].includes(j.status) ? Date.now() / 1000 : j.updated) - j.created)}</td><td class="small muted">${ago(j.created)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty small">No jobs yet.</div>`;
+      $("#jupd").textContent = `${active} active · updated ${new Date().toLocaleTimeString()}`;
+    } catch (e) { if (e instanceof Stale) return; toast(e.message); }
+    timer = setTimeout(load, 3000);
+  }
+  $("#jk").onchange = () => { kind = $("#jk").value; clearTimeout(timer); load(); };
+  $("#js").onchange = () => { status = $("#js").value; clearTimeout(timer); load(); };
+  onLeave(() => clearTimeout(timer));
+  load();
+});
+
 route(/^\/job\/([\w]+)$/, async (el, jid) => {
-  let logs = [], last = 0, timer = null, job = null, rendered = null;
+  let logs = [], last = 0, timer = null, job = null, rendered = null, metrics = [], mlast = 0;
   const sys = await system();
-  el.innerHTML = `<div id="head"></div><div id="res"></div>`;
+  el.innerHTML = `<div id="head"></div><div id="live"></div><div id="logbox"></div><div id="res"></div>`;
   async function poll() {
     try {
-      job = await api(`/api/jobs/${jid}?log_after=${last}`);
+      job = await api(`/api/jobs/${jid}?log_after=${last}&metrics_after=${mlast}`);
       logs = logs.concat(job.logs); if (job.logs.length) last = job.logs[job.logs.length - 1].seq;
-      drawHead();
+      metrics = metrics.concat(job.metrics || []); if ((job.metrics || []).length) mlast = job.metrics[job.metrics.length - 1].seq;
+      drawHead(); drawLive(); drawLog();
       if (["succeeded", "failed", "cancelled"].includes(job.status)) {
+        if (job.kind === "recommend" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawRecommend(job.result); }
+        if (job.kind === "ingest" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; $("#res").innerHTML = `<div class="callout ok" style="margin-top:16px">Dataset imported: <a href="#/data/${esc(job.result.dataset_id)}">open it</a>.</div>`; return; }
         if (["rebuild", "regression", "basetrain"].includes(job.kind) && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawPlansOnly(job.result); }
         if (rendered !== job.status) { rendered = job.status; drawResult(); }
         return;
@@ -545,20 +615,75 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     timer = setTimeout(poll, 1000);
   }
   onLeave(() => clearTimeout(timer));
-  let logOpen = null, logFollow = true, logTop = 0;
+  let logOpen = null, logFollow = true, logTop = 0, logFilter = "", logWarn = false, logShown = -1, monOpen = null;
   function drawHead() {
     if (logOpen === null) logOpen = job.status !== "succeeded";
-    const title = job.kind === "train" ? (job.params.name || "Project") : job.kind === "fitcheck" ? "Studio fit check" : job.kind === "rebuild" ? "Reproducibility rebuild" : job.kind === "regression" ? "Nightly regression" : job.kind === "basetrain" ? "Pool base weights" : `Analyze ${job.params.filename || "model"}`;
+    const title = jobTitle(job);
     $("#head").innerHTML = `<div class="page-h"><div><h1>${esc(title)}</h1><div class="row small muted">${statusBadge(job.status, job.progress)} <span class="mono">${esc(job.id)}</span>${job.kind === "train" ? ` · ${esc(job.params.template_id)} · goal ${esc(GOAL_LABEL[job.params.goal] || job.params.goal)}` : ""}</div></div>
       ${job.status === "running" || job.status === "queued" ? `<button class="btn" id="cancel">Cancel</button>` : ""}</div>
       <div class="card"><div class="progress" style="margin-bottom:12px"><i style="width:${Math.round((job.progress || 0) * 100)}%"></i></div>
       <div class="timeline">${(job.stages || []).map((s) => `<div class="tl ${s.status}"><div>${esc(s.title)}</div><div class="s">${esc(s.status)}${s.note ? " · " + esc(s.note) : ""}</div></div>`).join("")}</div>
       ${job.error ? `<div class="callout bad" style="margin-top:12px">${esc(job.error)}</div>` : ""}
-      <details id="logd" style="margin-top:12px" ${logOpen ? "open" : ""}><summary class="small muted">Pipeline log (${logs.length} lines)</summary><div class="log" id="log">${esc(logs.map((l) => l.line).join("\n"))}</div></details></div>`;
-    const lg = $("#log");
-    if (lg) { lg.scrollTop = logFollow ? lg.scrollHeight : logTop; lg.onscroll = () => { logFollow = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 8; logTop = lg.scrollTop; }; }
-    const ld = $("#logd"); if (ld) ld.ontoggle = () => { logOpen = ld.open; };
+      <div class="small muted" style="margin-top:10px">${job.worker ? `worker ${esc(job.worker)} · ` : ""}started ${ago(job.created)} · ${dur(((["succeeded", "failed", "cancelled"].includes(job.status) ? job.updated : Date.now() / 1000) - job.created))} elapsed</div></div>`;
     const c = $("#cancel"); if (c) c.onclick = () => api(`/api/jobs/${jid}/cancel`, { method: "POST" }).then(() => toast("Cancelling…"));
+  }
+  // ---- live training monitor: one card per training run (size), updated every poll --------------------------
+  function drawLive() {
+    if (!metrics.length) return;
+    const done = ["succeeded", "failed", "cancelled"].includes(job.status);
+    if (monOpen === null) monOpen = !done;
+    const groups = {};
+    metrics.forEach((m) => (groups[m.series] = groups[m.series] || []).push(m));
+    const names = Object.keys(groups), latest = metrics[metrics.length - 1].series;
+    const card = (name) => {
+      const pts = groups[name], p = pts[pts.length - 1], [kind, size] = name.split(":");
+      const avg = pts.reduce((a, x) => a + x.seconds, 0) / pts.length;
+      const best = pts.reduce((b, x) => (x.val_loss < b.val_loss ? x : b), pts[0]);
+      const active = !done && name === latest;
+      const state = active ? `<span class="badge b-acc">epoch ${p.epoch}/${p.epochs}</span>` : p.epoch < p.epochs ? `<span class="badge">stopped early at ${p.epoch}/${p.epochs}</span>` : `<span class="badge b-ok">done · ${p.epochs} epochs</span>`;
+      const acc = pts.some((x) => x.val_acc !== null && x.val_acc !== undefined);
+      return `<div class="card"><div class="row"><b>${kind === "qat" ? "QAT fine-tune" : "Training"} · ${esc(size)}</b><span class="spacer"></span>${state}</div>
+        ${active ? `<div class="progress" style="margin:8px 0"><i style="width:${Math.round(p.epoch / p.epochs * 100)}%"></i></div>` : ""}
+        <div class="kv"><div>train loss<b>${fmt(p.train_loss, 4)}</b></div><div>val loss<b>${fmt(p.val_loss, 4)}</b></div><div>best val<b>${fmt(best.val_loss, 4)}</b><span class="muted">epoch ${best.epoch}</span></div>${acc ? `<div>val accuracy<b>${pct(p.val_acc)}</b></div>` : `<div></div>`}
+          <div>learning rate<b>${Number(p.lr).toExponential(1)}</b></div><div>per epoch<b>${fmt(avg, 2)} s</b></div><div>${active ? "remaining" : "total"}<b>${active ? "≈ " + dur((p.epochs - p.epoch) * avg) : dur(avg * pts.length)}</b></div><div></div></div>
+        ${pts.length < 2 ? `<p class="small muted" style="margin:16px 0">Curves appear after the second epoch.</p>` : `${lineChart([{ values: pts.map((x) => x.train_loss), color: "var(--c1)" }, { values: pts.map((x) => x.val_loss), color: "var(--c2)" }], { h: 150, xLabel: "epoch", yLabel: "loss" })}
+        ${acc ? lineChart([{ values: pts.map((x) => x.val_acc ?? 0), color: "var(--c3)" }], { h: 110, xLabel: "epoch", yLabel: "validation accuracy" }) : ""}`}
+        <div class="legend"><span><i style="background:var(--c1)"></i>train loss</span><span><i style="background:var(--c2)"></i>validation loss</span>${acc ? `<span><i style="background:var(--c3)"></i>validation accuracy</span>` : ""}</div></div>`;
+    };
+    const tc = (job.params || {}).training || {};
+    $("#live").innerHTML = `<details class="card" id="mond" style="margin-top:16px" ${monOpen ? "open" : ""}><summary><b>Training monitor</b> <span class="small muted">${names.length} run(s), ${metrics.length} epochs logged${Object.keys(tc).length ? ` · custom settings: ${Object.entries(tc).map(([k, v]) => `${esc(k)}=${esc(String(v))}`).join(", ")}` : " · automatic settings"}</span></summary>
+      <div class="mon" style="margin-top:12px">${names.map(card).join("")}</div></details>`;
+    $("#mond").ontoggle = () => { monOpen = $("#mond").open; };
+  }
+  // ---- log viewer: built once, lines appended; filter, warnings-only, follow, download -----------------------
+  function drawLog() {
+    if (!$("#logd")) {
+      $("#logbox").innerHTML = `<details class="card" id="logd" style="margin-top:16px" ${logOpen ? "open" : ""}><summary><b>Pipeline log</b> <span class="small muted" id="logcount"></span></summary>
+        <div class="logbar"><input type="search" id="logq" placeholder="Filter lines…"><label class="check small"><input type="checkbox" id="logw">warnings &amp; errors only</label>
+        <label class="check small"><input type="checkbox" id="logf" checked>follow</label><a class="btn sm" href="/api/jobs/${jid}/log.txt">⬇ Download log</a></div>
+        <div class="log" id="log" style="max-height:420px"></div></details>`;
+      $("#logd").ontoggle = () => { logOpen = $("#logd").open; };
+      $("#logq").oninput = () => { logFilter = $("#logq").value.toLowerCase(); logShown = -1; drawLog(); };
+      $("#logw").onchange = () => { logWarn = $("#logw").checked; logShown = -1; drawLog(); };
+      $("#logf").onchange = () => { logFollow = $("#logf").checked; if (logFollow) $("#log").scrollTop = $("#log").scrollHeight; };
+      const lg = $("#log");
+      lg.onscroll = () => { const atEnd = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 8; if (atEnd !== logFollow) { logFollow = atEnd; $("#logf").checked = atEnd; } logTop = lg.scrollTop; };
+    }
+    const cls = (t) => /error|traceback|failed|exception/i.test(t) ? "le" : /warning|evaluation only|does not fit|diverged/i.test(t) ? "lw" : t.startsWith("== ") ? "ls" : "";
+    const warns = logs.filter((l) => cls(l.line) === "lw" || cls(l.line) === "le").length;
+    $("#logcount").textContent = `(${logs.length} lines${warns ? `, ${warns} warning/error` : ""})`;
+    if (logShown === logs.length) return;
+    const show = logs.filter((l) => (!logWarn || ["lw", "le"].includes(cls(l.line))) && (!logFilter || l.line.toLowerCase().includes(logFilter)));
+    const hl = (t) => { const e = esc(t); if (!logFilter) return e; const q = esc(logFilter).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); return e.replace(new RegExp(q, "gi"), (m) => `<mark>${m}</mark>`); };
+    const lg = $("#log");
+    lg.innerHTML = show.map((l) => `<div class="${cls(l.line)}"><span class="muted">${new Date(l.ts * 1000).toLocaleTimeString()}</span>  ${hl(l.line)}</div>`).join("") || `<span class="muted">no matching lines</span>`;
+    lg.scrollTop = logFollow ? lg.scrollHeight : logTop;
+    logShown = logs.length;
+  }
+  function drawRecommend(r) {
+    const rec = r.recommended;
+    $("#res").innerHTML = `<div class="card" style="margin-top:16px"><h2>Recommendation</h2>${rec ? `<div class="callout ok"><b>${esc(rec.id)}</b>: ${esc(r.why)}. ${fmt(rec.params)} params, ${fmt(rec.macs)} MACs; worst board ${bytes(rec.ram)} RAM, ${bytes(rec.flash)} flash, ${ms(rec.latency_ms)}.</div>` : `<div class="callout warn">${esc(r.why)}</div>`}
+      <ul class="small" style="margin-top:10px">${r.rules.reasons.map((x) => `<li>${esc(x)}</li>`).join("")}</ul><p class="small muted">${r.candidates.length} candidates costed by SAI on ${r.targets.map(esc).join(", ")}. Use it from the new-project wizard (Board &amp; goal step).</p></div>`;
   }
   function drawResult() {
     if (job.status !== "succeeded") return;

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import math
+import time
 
 import numpy as np
 import torch
@@ -91,24 +92,107 @@ def build_spec(layers, X, task, n_labels):
                                "layers": layers, "outputs": n_out})
 
 
+class TrainCfgError(ValueError):
+    pass
+
+
+# Training settings a customer can change. None = automatic (chosen from the data, as before this existed).
+TRAIN_DEFAULTS = {
+    "optimizer": "adam",          # adam | adamw | sgd (momentum 0.9, Nesterov)
+    "lr": None,                   # learning rate; auto: 5e-3 (2e-3 when fine-tuning from pool weights)
+    "schedule": "cosine",         # cosine | step (x0.3 every third of the run) | constant
+    "weight_decay": 1e-4,
+    "batch_size": None,           # auto: n_train / 25, between 16 and 64
+    "epochs": 30,
+    "extend_small_data": True,    # small datasets: raise epochs to reach 1500 optimizer steps (max 300 epochs)
+    "patience": None,             # early stopping, epochs without validation improvement; auto: max(10, epochs/5); 0 = off
+    "grad_clip": 2.0,             # gradient-norm clip; 0 = off
+    "label_smoothing": 0.0,       # classification only
+    "seed": 0,
+    "qat": "auto",                # auto (when INT8 loses > 1 point) | always | off
+    "qat_epochs": None,           # auto: max(5, epochs / 3)
+}
+OPTIMIZERS, SCHEDULES, QAT_MODES = ("adam", "adamw", "sgd"), ("cosine", "step", "constant"), ("auto", "always", "off")
+
+
+def normalize_training(cfg: dict | None, epochs: int | None = None) -> dict:
+    """Validate a training config; unknown keys are rejected so a typo never silently falls back to a default."""
+    out = dict(TRAIN_DEFAULTS)
+    if epochs:
+        out["epochs"] = int(epochs)
+    cfg = {k: v for k, v in (cfg or {}).items() if v is not None and v != ""}
+    unknown = set(cfg) - set(TRAIN_DEFAULTS)
+    if unknown:
+        raise TrainCfgError(f"unknown training setting(s): {', '.join(sorted(unknown))}")
+    out.update(cfg)
+
+    def num(key, typ, lo, hi, allow_none=False):
+        if out[key] is None and allow_none:
+            return
+        try:
+            out[key] = typ(out[key])
+        except (TypeError, ValueError):
+            raise TrainCfgError(f"{key} must be a number") from None
+        if not lo <= out[key] <= hi:
+            raise TrainCfgError(f"{key} must be between {lo} and {hi}")
+    if out["optimizer"] not in OPTIMIZERS:
+        raise TrainCfgError(f"optimizer must be one of {', '.join(OPTIMIZERS)}")
+    if out["schedule"] not in SCHEDULES:
+        raise TrainCfgError(f"schedule must be one of {', '.join(SCHEDULES)}")
+    if out["qat"] not in QAT_MODES:
+        raise TrainCfgError(f"qat must be one of {', '.join(QAT_MODES)}")
+    num("lr", float, 1e-6, 1.0, True)
+    num("weight_decay", float, 0.0, 0.5)
+    num("batch_size", int, 4, 4096, True)
+    num("epochs", int, 1, 300)
+    num("patience", int, 0, 300, True)
+    num("grad_clip", float, 0.0, 100.0)
+    num("label_smoothing", float, 0.0, 0.5)
+    num("seed", int, 0, 2 ** 31 - 1)
+    num("qat_epochs", int, 1, 100, True)
+    out["extend_small_data"] = bool(out["extend_small_data"])
+    return out
+
+
 def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500, log=lambda m: None, progress=lambda p: None,
-          cancelled=lambda: False, y_stats=None, net=None, augment=None, class_weights=True):
-    torch.manual_seed(0)
+          cancelled=lambda: False, y_stats=None, net=None, augment=None, class_weights=True, cfg=None,
+          metric=lambda d: None):
+    cfg = {**TRAIN_DEFAULTS, "epochs": epochs, **(cfg or {})}
+    lr = cfg["lr"] or lr
+    seed = int(cfg["seed"])
+    torch.manual_seed(seed)
     net = (net if net is not None else archspec.SpecNet(spec)).to(DEVICE)
     n_train = len(idx["train"])
-    batch = batch or int(min(64, max(16, n_train // 25)))
-    # small datasets need more passes: at least `min_steps` optimizer updates in total
-    epochs = max(epochs, math.ceil(min_steps / max(1, math.ceil(n_train / batch))))
-    epochs = min(epochs, 300)
-    opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(epochs, 1))
+    batch = cfg["batch_size"] or batch or int(min(64, max(16, n_train // 25)))
+    epochs = int(cfg["epochs"])
+    if cfg["extend_small_data"]:
+        # small datasets need more passes: at least `min_steps` optimizer updates in total
+        epochs = min(max(epochs, math.ceil(min_steps / max(1, math.ceil(n_train / batch)))), 300)
+    wd = float(cfg["weight_decay"])
+    if cfg["optimizer"] == "sgd":
+        opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=wd)
+    elif cfg["optimizer"] == "adamw":
+        opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd)
+    else:
+        opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=wd)
+    if cfg["schedule"] == "step":
+        sched = torch.optim.lr_scheduler.StepLR(opt, max(1, epochs // 3), gamma=0.3)
+    elif cfg["schedule"] == "constant":
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda e: 1.0)
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(epochs, 1))
+    patience = max(10, epochs // 5) if cfg["patience"] is None else int(cfg["patience"])
+    clip = float(cfg["grad_clip"])
+    log(f"  training: {cfg['optimizer']} lr {lr:g} ({cfg['schedule']}), batch {batch}, {epochs} epochs, "
+        f"weight decay {wd:g}, early stop {'off' if patience == 0 else f'after {patience} epochs'}, "
+        f"grad clip {clip or 'off'}, seed {seed}")
     Xt = torch.from_numpy(Xn).to(DEVICE)
     if task == "classification":
         counts = np.bincount(y[idx["train"]], minlength=spec["outputs"]).astype(np.float32)
         w = torch.tensor(np.where(counts > 0, counts.sum() / np.maximum(counts, 1) / len(counts), 0), dtype=torch.float32)
         if not class_weights:
             w = torch.ones_like(w)
-        loss_fn = nn.CrossEntropyLoss(weight=w.to(DEVICE))
+        loss_fn = nn.CrossEntropyLoss(weight=w.to(DEVICE), label_smoothing=float(cfg["label_smoothing"]))
         yt = torch.from_numpy(y.astype(np.int64)).to(DEVICE)
     elif task == "regression":
         loss_fn = nn.MSELoss()
@@ -121,8 +205,10 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
     for ep in range(epochs):
         if cancelled():
             raise InterruptedError("cancelled")
+        t0 = time.time()
+        cur_lr = opt.param_groups[0]["lr"]
         net.train()
-        perm = np.random.default_rng(ep).permutation(idx["train"])
+        perm = np.random.default_rng(ep + seed * 100003).permutation(idx["train"])
         tot = 0.0
         for s in range(0, len(perm), batch):
             b = perm[s:s + batch]
@@ -138,17 +224,23 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
             opt.zero_grad()
             loss = loss_fn(net(xb), yt[b])
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 2.0)
+            if clip:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
             opt.step()
             tot += float(loss.detach()) * len(b)
         sched.step()
         net.eval()
         with torch.no_grad():
-            vl = float(loss_fn(net(Xt[idx["val"]]), yt[idx["val"]]))
+            vo = net(Xt[idx["val"]])
+            vl = float(loss_fn(vo, yt[idx["val"]]))
+            vacc = float((vo.argmax(1) == yt[idx["val"]]).float().mean()) if task == "classification" else None
         if not math.isfinite(vl):
             log(f"  diverged at epoch {ep + 1}" + ("; keeping the best weights so far" if best_state else ""))
             break
         history.append({"epoch": ep + 1, "train_loss": round(tot / max(len(perm), 1), 5), "val_loss": round(vl, 5)})
+        metric({"epoch": ep + 1, "epochs": epochs, "train_loss": history[-1]["train_loss"], "val_loss": round(vl, 5),
+                "val_acc": None if vacc is None else round(vacc, 4), "lr": round(cur_lr, 8),
+                "seconds": round(time.time() - t0, 3), "best": vl < best - 1e-5})
         progress((ep + 1) / epochs)
         if ep % 5 == 4 or ep == epochs - 1:
             log(f"  epoch {ep + 1}/{epochs} train {tot / max(len(perm), 1):.4f} val {vl:.4f}")
@@ -156,7 +248,7 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
             best, best_state, bad = vl, {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}, 0
         else:
             bad += 1
-            if bad >= max(10, epochs // 5):
+            if patience and bad >= patience:
                 log(f"  early stop at epoch {ep + 1}")
                 break
     net = net.cpu()
@@ -179,13 +271,16 @@ def init_from(net, state: dict) -> list[str]:
     return copied
 
 
-def qat_finetune(net, act_q, Xn, y, idx, task, epochs=10, log=lambda m: None, cancelled=lambda: False, y_stats=None):
+def qat_finetune(net, act_q, Xn, y, idx, task, epochs=10, log=lambda m: None, cancelled=lambda: False, y_stats=None,
+                 cfg=None, metric=lambda d: None):
     """Quantization-aware fine-tuning on the BN-folded network with the calibrated activation ranges fixed and
     weights fake-quantized per channel, the way the exporter and SAI's INT8 kernels will compute."""
     net.set_qat(act_q)
     try:
+        base = cfg or TRAIN_DEFAULTS
+        qcfg = {**base, "epochs": epochs, "lr": (base["lr"] or 5e-3) / 10, "schedule": "cosine", "patience": None}
         net, hist = train(net.spec, Xn, y, idx, task, epochs=epochs, lr=5e-4, min_steps=300, log=log,
-                          cancelled=cancelled, y_stats=y_stats, net=net)
+                          cancelled=cancelled, y_stats=y_stats, net=net, cfg=qcfg, metric=metric)
     finally:
         net.set_qat(None)
     return net, hist

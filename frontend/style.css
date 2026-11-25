@@ -122,6 +122,15 @@ table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
 .progress > i { display: block; height: 100%; background: var(--accent); transition: width .3s; }
 
 .log { background: #0f1216; color: #cdd3dc; font: 12px/1.5 var(--mono); border-radius: 8px; padding: 10px 12px; max-height: 280px; overflow: auto; white-space: pre-wrap; }
+.log .lw { color: #f5c26b; }
+.log .le { color: #ff8a80; }
+.log .ls { color: #8ab4ff; font-weight: 600; }
+.log mark { background: #5a4a00; color: inherit; }
+.logbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 8px 0; }
+.logbar input[type=search] { flex: 1; min-width: 160px; }
+.mon { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 14px; }
+.mon .kv { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px 12px; font-size: 12px; margin: 6px 0 4px; }
+.mon .kv b { display: block; font-size: 14px; font-family: var(--mono); }
 .drop { border: 2px dashed var(--line); border-radius: var(--radius); padding: 26px; text-align: center; color: var(--muted); cursor: pointer; }
 .drop.hover { border-color: var(--accent); background: var(--accent-soft); }
 .callout { border-left: 3px solid var(--warn); background: var(--warn-soft); padding: 8px 12px; border-radius: 6px; font-size: 13px; }
