@@ -14,6 +14,7 @@ async function api(path, opts = {}) {
   const init = { ...opts };
   if (opts.json !== undefined) { init.method = init.method || "POST"; init.headers = { "Content-Type": "application/json" }; init.body = JSON.stringify(opts.json); }
   const r = await fetch(path, init);
+  if (r.status === 401 && !path.startsWith("/api/auth/")) { showLogin(); throw new Error("Please sign in"); }
   const ct = r.headers.get("content-type") || "";
   const body = ct.includes("json") ? await r.json() : await r.text();
   if (!r.ok) throw new Error(body && body.detail ? body.detail : `HTTP ${r.status}`);
@@ -353,6 +354,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
       logs = logs.concat(job.logs); if (job.logs.length) last = job.logs[job.logs.length - 1].seq;
       drawHead();
       if (["succeeded", "failed", "cancelled"].includes(job.status)) {
+        if (job.kind === "rebuild" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawPlansOnly(job.result); }
         if (rendered !== job.status) { rendered = job.status; drawResult(); }
         return;
       }
@@ -361,7 +363,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
   }
   onLeave(() => clearTimeout(timer));
   function drawHead() {
-    const title = job.kind === "train" ? (job.params.name || "Project") : job.kind === "fitcheck" ? "Studio fit check" : `Analyze ${job.params.filename || "model"}`;
+    const title = job.kind === "train" ? (job.params.name || "Project") : job.kind === "fitcheck" ? "Studio fit check" : job.kind === "rebuild" ? "Reproducibility rebuild" : `Analyze ${job.params.filename || "model"}`;
     $("#head").innerHTML = `<div class="page-h"><div><h1>${esc(title)}</h1><div class="row small muted">${statusBadge(job.status, job.progress)} <span class="mono">${esc(job.id)}</span>${job.kind === "train" ? ` · ${esc(job.params.template_id)} · goal ${esc(GOAL_LABEL[job.params.goal] || job.params.goal)}` : ""}</div></div>
       ${job.status === "running" || job.status === "queued" ? `<button class="btn" id="cancel">Cancel</button>` : ""}</div>
       <div class="card"><div class="progress" style="margin-bottom:12px"><i style="width:${Math.round((job.progress || 0) * 100)}%"></i></div>
@@ -401,7 +403,11 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
       <div class="card">${task === "classification" ? `<h2>Confusion matrix (bit-exact program)</h2>${confusion(r.exact.confusion, r.dataset.labels)}` : `<h2>Training curve (${esc(sel.size)})</h2>`}
         ${lineChart([{ values: v.history.map((h) => h.train_loss), color: "var(--c1)" }, { values: v.history.map((h) => h.val_loss), color: "var(--c2)" }], { xLabel: "epoch", yLabel: "loss" })}<div class="legend"><span><i style="background:var(--c1)"></i>train loss</span><span><i style="background:var(--c2)"></i>validation loss</span></div></div></div>
     <div class="card" style="margin-top:16px"><h2>Every plan SAI produced for the ${esc(sel.size)} model</h2>${planTable(v.plans.candidates)}${spaceNote(v.plans)}</div>
+    ${tierCard(r)}
+    ${provCard(r, jid)}
     <div class="card" style="margin-top:16px" id="hil"></div>`;
+    const rb = $("#rebuild");
+    if (rb) rb.onclick = async () => { const j = await api(`/api/jobs/${jid}/rebuild`, { method: "POST" }); toast("Rebuild queued"); location.hash = `#/job/${j.id}`; };
     drawHil();
   }
   async function drawHil() {
@@ -422,6 +428,13 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     };
   }
   function drawPlansOnly(r) {
+    if (job.kind === "rebuild") {
+      $("#res").innerHTML = `<div class="card" style="margin-top:16px"><h2>Rebuild of <a href="#/job/${esc(job.params.job_id)}">${esc(job.params.job_id)}</a></h2>
+        <div class="callout ${r.identical ? "ok" : "bad"}">${r.identical ? "Byte-identical: the package rebuilds exactly from the recorded inputs." : "The rebuild differs from the recorded build."}</div>
+        <p class="small" style="margin-top:10px">Build digest <code>${esc(r.build_digest)}</code> · recorded <code>${esc(r.recorded)}</code> · SAI ${esc(r.sai_version)} (recorded ${esc(r.recorded_sai)})</p>
+        <div class="tbl-wrap"><table class="t"><tbody>${Object.entries(r.files).map(([f, ok]) => `<tr><td class="mono small">${esc(f)}</td><td>${ok ? `<span class="badge b-ok">same</span>` : `<span class="badge b-bad">differs</span>`}</td></tr>`).join("")}</tbody></table></div></div>`;
+      return;
+    }
     const s = r.summary;
     $("#res").innerHTML = `${job.kind === "analyze" ? `<div class="card" style="margin-top:16px"><h2>Model</h2><div class="kpis">
         <div class="kpi"><div class="l">Format</div><div class="v">${esc(r.inspect.format)}</div></div><div class="kpi"><div class="l">Nodes</div><div class="v">${fmt(r.inspect.nodes)}</div></div>
@@ -433,6 +446,25 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
   }
   poll();
 });
+
+function tierCard(r) {
+  const tc = r.tier_compare || {};
+  const rows = Object.entries(tc).filter(([, v]) => v.standard && v.professional && !v.standard.error);
+  if (!rows.length) return "";
+  const gain = (a, b) => a && b ? `${(((a - b) / a) * 100).toFixed(0)}%` : "–";
+  return `<div class="card" style="margin-top:16px"><h2>SAI Standard vs Professional</h2>
+    <p class="small muted">The same model, FAST objective, in SAI's two optimization levels. Professional adds SAI's ISA kernels and schedules (SMLAD/SXTB16, RV32 two-channel pack, static requant specialization, packed FC…).</p>
+    <div class="tbl-wrap"><table class="t"><thead><tr><th>Board</th><th>Level</th><th>Plan</th><th class="n">Workspace</th><th class="n">Flash</th></tr></thead><tbody>
+    ${rows.map(([t, v]) => `<tr><td rowspan="2">${esc(t)}</td><td>Standard</td><td class="mono small">${esc(v.standard.schedule)}</td><td class="n">${bytes(v.standard.workspace)}</td><td class="n">${bytes(v.standard.flash)}</td></tr>
+      <tr class="rec"><td><b>Professional</b></td><td class="mono small">${esc(v.professional.schedule)}</td><td class="n">${bytes(v.professional.workspace)}</td><td class="n">${bytes(v.professional.flash)}</td></tr>`).join("")}
+    </tbody></table></div><p class="small muted">Professional typically trades some flash for speed (specialized kernels); its latency gain is measured per model on the board farm. Packages are built at Professional, the level SAI supports for MCU builds today.</p></div>`;
+}
+function provCard(r, jid) {
+  const p = r.provenance; if (!p) return "";
+  const rows = [["Platform", p.platform_version], ["SAI", p.sai_version], ["Toolchain", p.toolchain], ["Toolchain digest", p.toolchain_digest], ["Build digest", p.build_digest], ["Plan digest", p.plan_digest], ["Dataset SHA-256", p.dataset_sha256], ["Python / torch", `${p.python} / ${p.torch}`], ["Seeds", JSON.stringify(p.seeds)]];
+  return `<div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Provenance</h2><span class="spacer"></span><button class="btn sm" id="rebuild">Rebuild & compare</button></div>
+    <div class="tbl-wrap" style="margin-top:8px"><table class="t"><tbody>${rows.map(([k, v]) => `<tr><td class="muted" style="width:170px">${k}</td><td class="mono small" style="word-break:break-all">${esc(v ?? "–")}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
 
 function planTable(c) {
   return `<div class="tbl-wrap"><table class="t"><thead><tr><th></th><th>Board</th><th>SAI objective</th><th>Plan</th><th class="n">Workspace</th><th class="n">Stack</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Latency</th><th>Fits?</th></tr></thead><tbody>
@@ -624,8 +656,85 @@ route(/^\/system$/, async (el) => {
   <h3 style="margin-top:14px">Evidence labels</h3><div class="tbl-wrap"><table class="t"><tbody>${Object.entries(EVIDENCE).map(([k]) => `<tr><td>${ev(k)}</td><td class="small">${esc(EVIDENCE[k][2])}</td></tr>`).join("")}</tbody></table></div></div></div>`;
 });
 
-/* ------------------------------------------------------------------------------------------------ boot */
-(async () => {
-  try { const s = await system(); $("#sideFoot").innerHTML = `SAI ${esc(s.sai.sai || "?")} · ${s.targets.filter((t) => t.toolchain === "available").length} toolchains`; } catch { /* rendered pages show errors */ }
+/* ------------------------------------------------------------------------------------------------ admin */
+route(/^\/admin$/, async (el) => {
+  const m = ME;
+  if (!m.perms.org_admin && !m.perms.farm_admin) { el.innerHTML = `<div class="callout bad">Your role cannot open the admin console.</div>`; return; }
+  const tabs = [m.perms.org_admin && ["orgs", "Organisations"], m.perms.org_admin && ["users", "Users"], m.perms.farm_admin && ["agents", "Lab agents"], m.perms.org_admin && ["audit", "Audit log"], m.perms.platform_admin && ["queue", "Job queue"]].filter(Boolean);
+  let tab = tabs[0][0];
+  const draw = async () => {
+    el.innerHTML = `<div class="page-h"><div><h1>Admin</h1><p class="muted">${m.mode === "single" ? "Single-organisation install" : "Multi-tenant"} · signed in as ${esc(m.email)} (${esc(m.role)})</p></div></div>
+      <div class="tabs">${tabs.map(([k, t]) => `<button class="tab ${k === tab ? "on" : ""}" data-t="${k}">${t}</button>`).join("")}</div><div id="adm"></div>`;
+    $$(".tabs .tab", el).forEach((b) => (b.onclick = () => { tab = b.dataset.t; draw(); }));
+    const box = $("#adm");
+    if (tab === "orgs") {
+      const orgs = await api("/api/admin/orgs");
+      box.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="t"><thead><tr><th>Organisation</th><th>Tier</th><th class="n">Users</th><th>Usage (all time)</th><th>Created</th></tr></thead><tbody>
+        ${orgs.map((o) => `<tr><td><b>${esc(o.name)}</b><div class="small muted mono">${esc(o.id)}</div></td><td>${m.perms.platform_admin ? `<select data-org="${esc(o.id)}">${["free", "standard", "professional"].map((t) => `<option ${t === o.tier ? "selected" : ""}>${t}</option>`).join("")}</select>` : esc(o.tier)}</td><td class="n">${o.users}</td>
+          <td class="small">${Object.entries(o.usage).map(([k, v]) => `${esc(k)}: ${fmt(v.qty, 1)}`).join(" · ") || "–"}</td><td class="muted">${ago(o.created)}</td></tr>`).join("")}</tbody></table></div>
+        ${m.perms.platform_admin && m.mode !== "single" ? `<div class="row" style="margin-top:12px"><input id="on" placeholder="New customer organisation"><select id="ot"><option>free</option><option>standard</option><option selected>professional</option></select><button class="btn primary" id="oc">Create</button></div>` : ""}</div>`;
+      $$("select[data-org]", box).forEach((x) => (x.onchange = async () => { await api(`/api/admin/orgs/${x.dataset.org}/tier`, { json: { tier: x.value } }); toast("Tier updated"); }));
+      if ($("#oc")) $("#oc").onclick = async () => { try { await api("/api/admin/orgs", { json: { name: $("#on").value, tier: $("#ot").value } }); toast("Organisation created"); draw(); } catch (e) { toast(e.message); } };
+    }
+    if (tab === "users") {
+      const [us, orgs] = await Promise.all([api("/api/admin/users"), api("/api/admin/orgs")]);
+      const on = Object.fromEntries(orgs.map((o) => [o.id, o.name]));
+      const roles = m.perms.platform_admin ? ["member", "org_admin", "researcher", "lab", "platform_admin"] : ["member", "org_admin"];
+      box.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="t"><thead><tr><th>User</th><th>Organisation</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>
+        ${us.map((x) => `<tr><td><b>${esc(x.name)}</b><div class="small muted">${esc(x.email)}</div></td><td>${esc(on[x.org_id] || x.org_id)}</td><td><span class="badge">${esc(x.role)}</span></td><td>${x.disabled ? `<span class="badge b-bad">disabled</span>` : `<span class="badge b-ok">active</span>`}</td><td>${!x.disabled && x.id !== m.id ? `<button class="btn sm ghost" data-dis="${x.id}">Disable</button>` : ""}</td></tr>`).join("")}</tbody></table></div>
+        <h3 style="margin-top:14px">Invite a user</h3><div class="grid g4"><label class="f">Name<input id="un"></label><label class="f">Email<input id="ue" type="email"></label><label class="f">Initial password<input id="up" type="text" placeholder="≥ 8 characters"></label>
+        <label class="f">Role<select id="ur">${roles.map((r) => `<option>${r}</option>`).join("")}</select></label></div>
+        ${m.perms.platform_admin ? `<label class="f" style="margin-top:8px;max-width:320px">Organisation<select id="uo">${orgs.map((o) => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join("")}</select></label>` : ""}
+        <div class="row" style="margin-top:10px"><button class="btn primary" id="uc">Create user</button></div></div>`;
+      $$("[data-dis]", box).forEach((b) => (b.onclick = async () => { await api(`/api/admin/users/${b.dataset.dis}/disable`, { method: "POST" }); draw(); }));
+      $("#uc").onclick = async () => { try { await api("/api/admin/users", { json: { name: $("#un").value, email: $("#ue").value, password: $("#up").value, role: $("#ur").value, org_id: $("#uo")?.value } }); toast("User created"); draw(); } catch (e) { toast(e.message); } };
+    }
+    if (tab === "agents") {
+      const ag = await api("/api/admin/agents");
+      box.innerHTML = `<div class="card"><p class="small muted">Each lab PC gets its own token. Tokens are shown once and stored hashed.</p><div class="tbl-wrap"><table class="t"><thead><tr><th>Agent</th><th>Created</th><th>Last seen</th><th>Status</th><th></th></tr></thead><tbody>
+        ${ag.map((a) => `<tr><td><b>${esc(a.name)}</b><div class="mono small muted">${esc(a.id)}</div></td><td class="muted">${ago(a.created)}</td><td class="muted">${a.last_seen ? ago(a.last_seen) : "never"}</td><td>${a.disabled ? `<span class="badge b-bad">disabled</span>` : `<span class="badge b-ok">active</span>`}</td><td>${a.disabled ? "" : `<button class="btn sm ghost" data-ad="${a.id}">Revoke</button>`}</td></tr>`).join("") || `<tr><td colspan="5" class="empty">No agents yet</td></tr>`}</tbody></table></div>
+        <div class="row" style="margin-top:12px"><input id="an" placeholder="e.g. Lab 1 - bench PC"><button class="btn primary" id="ac">Create agent token</button></div><div id="atok"></div></div>`;
+      $$("[data-ad]", box).forEach((b) => (b.onclick = async () => { await api(`/api/admin/agents/${b.dataset.ad}/disable`, { method: "POST" }); draw(); }));
+      $("#ac").onclick = async () => { const a = await api("/api/admin/agents", { json: { name: $("#an").value } }); $("#atok").innerHTML = `<div class="callout ok" style="margin-top:10px">Token for <b>${esc(a.name)}</b> (copy now, it will not be shown again):<div class="log" style="margin-top:6px">${esc(a.token)}</div></div>`; };
+    }
+    if (tab === "audit") {
+      const log = await api("/api/admin/audit");
+      box.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="t"><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead><tbody>
+        ${log.map((x) => `<tr><td class="muted small">${new Date(x.ts * 1000).toLocaleString()}</td><td class="small">${esc(x.email || "–")}</td><td><span class="badge">${esc(x.action)}</span></td><td class="mono small">${esc(x.target)}</td><td class="mono small">${esc(x.detail ? JSON.stringify(x.detail) : "")}</td></tr>`).join("")}</tbody></table></div></div>`;
+    }
+    if (tab === "queue") {
+      const q = await api("/api/admin/queue");
+      box.innerHTML = `<div class="card"><div class="kpis">${Object.entries(q.by_status).map(([k, v]) => `<div class="kpi"><div class="l">${esc(k)}</div><div class="v">${v}</div></div>`).join("")}</div><p class="small muted" style="margin-top:10px">Busy workers: ${q.busy_workers.map(esc).join(", ") || "none"}</p></div>`;
+    }
+  };
+  draw();
+});
+
+/* ------------------------------------------------------------------------------------------------ login */
+let ME = null;
+function showLogin(msg) {
+  document.body.classList.add("signed-out");
+  $("#main").innerHTML = `<div class="login card"><div class="brand" style="padding:0 0 12px"><span class="logo">◆</span><span><b>SAI</b> Platform<small>Sign in to continue</small></span></div>
+    <form id="lf" class="stack"><label class="f">Email<input id="le" type="email" autocomplete="username" required></label>
+    <label class="f">Password<input id="lp" type="password" autocomplete="current-password" required></label>
+    <div id="lerr">${msg ? `<div class="callout bad">${esc(msg)}</div>` : ""}</div><button class="btn primary" type="submit">Sign in</button>
+    <p class="small muted">Accounts are created by your administrator.</p></form></div>`;
+  $("#lf").onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api("/api/auth/login", { json: { email: $("#le").value, password: $("#lp").value } }); document.body.classList.remove("signed-out"); boot(); }
+    catch (err) { $("#lerr").innerHTML = `<div class="callout bad">${esc(err.message)}</div>`; }
+  };
+}
+
+async function boot() {
+  try { ME = await api("/api/me"); } catch { return; }
+  document.body.classList.remove("signed-out");
+  $$("[data-perm]").forEach((a) => (a.hidden = !a.dataset.perm.split("|").some((p) => ME.perms[p])));
+  $("#sideFoot").innerHTML = `<div><b>${esc(ME.name)}</b></div><div>${esc(ME.org.name)} · <span class="badge b-acc">${esc(ME.org.tier)}</span></div><div>${esc(ME.role)}</div><a href="#" id="signout">Sign out</a><div id="sysline" style="margin-top:6px"></div>`;
+  $("#signout").onclick = async (e) => { e.preventDefault(); await api("/api/auth/logout", { method: "POST" }); SYS = null; history.replaceState(null, "", "#/"); showLogin(); };
+  try { const s = await system(); $("#sysline").textContent = `SAI ${s.sai.sai || "?"} · platform ${s.platform_version}`; } catch { /* shown per page */ }
   render();
-})();
+}
+
+/* ------------------------------------------------------------------------------------------------ boot */
+boot();

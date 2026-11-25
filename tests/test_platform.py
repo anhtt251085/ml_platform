@@ -9,6 +9,9 @@ import tempfile
 import time
 
 os.environ.setdefault("SAI_PLATFORM_DATA", tempfile.mkdtemp(prefix="saiplat-"))
+os.environ.setdefault("SAI_PLATFORM_ADMIN_EMAIL", "admin@test.local")
+os.environ.setdefault("SAI_PLATFORM_ADMIN_PASSWORD", "admin-pass-123")
+ADMIN = (os.environ["SAI_PLATFORM_ADMIN_EMAIL"], os.environ["SAI_PLATFORM_ADMIN_PASSWORD"])
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -124,20 +127,32 @@ def test_plan_pick_respects_goal():
     assert sai_engine._pick(rows, "min-flash")["id"] == "c"
 
 
+def login(c, email=None, pw=None):
+    r = c.post("/api/auth/login", json={"email": email or ADMIN[0], "password": pw or ADMIN[1]})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['token']}"}
+
+
+def wait_job(c, jid, h=None, timeout=300):
+    for _ in range(timeout):
+        j = c.get(f"/api/jobs/{jid}", headers=h).json()
+        if j["status"] in ("succeeded", "failed", "cancelled"):
+            return j
+        time.sleep(1)
+    raise AssertionError("job timeout")
+
+
 @need_sai
 def test_api_end_to_end_with_board_run():
     from fastapi.testclient import TestClient
     from backend.app import app
     with TestClient(app) as c:
+        c.headers.update(login(c))
         ds = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 60}).json()
         r = c.post("/api/projects", json={"name": "t", "template_id": "gas-sense", "dataset_id": ds["id"],
                                           "sizes": ["tiny"], "epochs": 5, "goal": "min-ram"}).json()
         jid = r["job"]["id"]
-        for _ in range(300):
-            j = c.get(f"/api/jobs/{jid}").json()
-            if j["status"] in ("succeeded", "failed"):
-                break
-            time.sleep(1)
+        j = wait_job(c, jid)
         assert j["status"] == "succeeded", j["error"]
         res = j["result"]
         assert res["verify"]["passed"] == res["verify"]["total"]
@@ -153,13 +168,92 @@ def test_api_end_to_end_with_board_run():
         assert rr["result"]["simulated"] is True
         # simulated runs never calibrate latency
         assert c.get("/api/boards").json()["calibration"] == {}
+        # M1: provenance recorded and a rebuild is byte-identical
+        prov = res["provenance"]
+        assert prov["build_digest"] and prov["dataset_sha256"] and prov["sai_version"]
+        rb = wait_job(c, c.post(f"/api/jobs/{jid}/rebuild").json()["id"])
+        assert rb["status"] == "succeeded" and rb["result"]["identical"] is True, rb["result"]
+        # Standard vs Professional comparison from SAI
+        tc = res["tier_compare"][res["selected"]["target"]]
+        assert tc["standard"]["schedule"] and tc["professional"]["schedule"]
 
 
-def test_agent_endpoints_require_token():
+def test_agent_tokens_are_per_agent():
     from fastapi.testclient import TestClient
     from backend.app import app
     with TestClient(app) as c:
-        assert c.post("/api/agent/poll", json={"agent_id": "x"}).status_code == 401
-        ok = c.post("/api/agent/register", json={"agent_id": "lab9", "boards": [{"id": "L9", "target": "md6605"}]},
-                    headers={"Authorization": "Bearer dev-agent-token"})
-        assert ok.status_code == 200 and ok.json()["boards"][0]["id"] == "L9"
+        assert c.post("/api/agent/poll", json={}).status_code == 401
+        # the shared dev token is refused unless explicitly enabled
+        assert c.post("/api/agent/poll", json={}, headers={"Authorization": "Bearer dev-agent-token"}).status_code == 401
+        h = login(c)
+        tok = c.post("/api/admin/agents", json={"name": "lab9"}, headers=h).json()
+        ah = {"Authorization": f"Bearer {tok['token']}"}
+        ok = c.post("/api/agent/register", json={"boards": [{"id": "L9", "target": "md6605"}]}, headers=ah)
+        assert ok.status_code == 200 and ok.json()["agent_id"] == tok["id"]
+        assert c.post("/api/agent/poll", json={}, headers=ah).json() == {"run": None}
+        c.post(f"/api/admin/agents/{tok['id']}/disable", headers=h)
+        assert c.post("/api/agent/poll", json={}, headers=ah).status_code == 401
+
+
+def test_auth_roles_and_org_isolation():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as c:
+        assert c.get("/api/projects").status_code == 401
+        h = login(c)
+        a = c.post("/api/admin/orgs", json={"name": "Acme", "tier": "standard"}, headers=h).json()
+        b = c.post("/api/admin/orgs", json={"name": "Globex", "tier": "free"}, headers=h).json()
+        for org, email in ((a, "eng@acme.test"), (b, "eng@globex.test")):
+            r = c.post("/api/admin/users", headers=h, json={"email": email, "name": "Eng", "role": "member",
+                                                            "password": "password-1", "org_id": org["id"]})
+            assert r.status_code == 200, r.text
+        ha, hb = login(c, "eng@acme.test", "password-1"), login(c, "eng@globex.test", "password-1")
+        ds = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 30}, headers=ha).json()
+        assert c.get(f"/api/datasets/{ds['id']}", headers=ha).status_code == 200
+        assert c.get(f"/api/datasets/{ds['id']}", headers=hb).status_code == 404          # other org: invisible
+        assert all(d["id"] != ds["id"] for d in c.get("/api/datasets", headers=hb).json())
+        assert c.post("/api/projects", headers=hb, json={"name": "x", "template_id": "gas-sense",
+                                                          "dataset_id": ds["id"]}).status_code == 404
+        # members cannot use the Studio, publish, or administer
+        assert c.post("/api/studio/fitcheck", json={"spec": {}}, headers=ha).status_code == 403
+        assert c.post("/api/catalog", json={"name": "x"}, headers=ha).status_code == 403
+        assert c.get("/api/admin/agents", headers=ha).status_code == 403
+        assert c.post("/api/admin/users", headers=ha, json={"email": "x@y.z", "name": "x", "role": "member",
+                                                             "password": "password-1"}).status_code == 403
+        assert c.post("/api/auth/login", json={"email": "eng@acme.test", "password": "wrong"}).status_code == 401
+        me = c.get("/api/me", headers=ha).json()
+        assert me["org"]["tier"] == "standard" and not me["perms"]["studio"]
+        actions = [x["action"] for x in c.get("/api/admin/audit", headers=h).json()]
+        assert "org_created" in actions and "login_failed" in actions
+
+
+def test_queue_claim_is_exclusive_and_cancellable():
+    from backend import db, pipeline
+    db.init()
+    pipeline.pause_workers(True)
+    try:
+        time.sleep(1.2)                                    # let in-process workers notice the pause
+        a = pipeline.create("analyze", {"model_path": "/nonexistent.onnx"}, priority=5)["id"]
+        b = pipeline.create("analyze", {"model_path": "/nonexistent.onnx"}, priority=5)["id"]
+        pipeline.cancel(b)
+        assert pipeline.get(b)["status"] == "cancelled"
+        first = pipeline.claim("w1", ["analyze"])
+        assert first["id"] == a and first["status"] == "running" and first["worker"] == "w1"
+        assert pipeline.claim("w2", ["analyze"]) is None or pipeline.claim("w2", ["analyze"])["id"] not in (a, b)
+    finally:
+        pipeline.pause_workers(False)
+
+
+def test_migration_from_v01_database(tmp_path, monkeypatch):
+    import sqlite3
+    from backend import config, db
+    path = tmp_path / "old.sqlite3"
+    c = sqlite3.connect(path)
+    c.executescript(db.MIGRATIONS[0])
+    c.execute("INSERT INTO jobs (id, kind, status, created, updated) VALUES ('job_old', 'train', 'succeeded', 0, 0)")
+    c.commit(); c.close()
+    monkeypatch.setattr(config, "DB_PATH", path)
+    db.init()
+    assert db.version() == len(db.MIGRATIONS)
+    with db.conn() as k:
+        assert k.execute("SELECT org_id, cancel_requested FROM jobs WHERE id='job_old'").fetchone()[1] == 0

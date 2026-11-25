@@ -9,7 +9,10 @@ import shutil
 import traceback
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+import os
+import socket
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -18,16 +21,16 @@ import torch
 from . import archspec, config, data, db, exact_eval, qexport, sai_engine, trainer
 from . import boards as boards_mod
 
-POOL = ThreadPoolExecutor(max_workers=config.WORKERS, thread_name_prefix="job")
-_CANCEL: set[str] = set()
-
 STAGES = {
     "train": [("data", "Validate data"), ("train", "Train model sizes"), ("quantize", "INT8 quantization"),
               ("plan", "SAI plan search"), ("select", "Select model + plan"), ("compile", "Compile + verify"),
               ("exact", "Bit-exact accuracy"), ("package", "Package")],
     "fitcheck": [("build", "Build graph"), ("quantize", "INT8 export"), ("plan", "SAI plan search")],
     "analyze": [("inspect", "Inspect model"), ("plan", "SAI plan search")],
+    "rebuild": [("compile", "Recompile"), ("compare", "Compare with the original build")],
 }
+KINDS = tuple(STAGES)
+STALE_RUNNING_S = 6 * 3600
 GOALS = ("balanced", "fastest", "min-ram", "min-flash", "accuracy")
 
 
@@ -68,19 +71,28 @@ class Ctx:
         self._save(progress=(idx + max(0.0, min(frac, 1.0))) / len(self.stages))
 
     def cancelled(self) -> bool:
-        return self.id in _CANCEL
+        with db.conn() as c:
+            r = c.execute("SELECT cancel_requested FROM jobs WHERE id=?", (self.id,)).fetchone()
+        return bool(r and r[0])
 
     def result(self, res: dict):
         self._save(result=db.j(res))
 
 
-def create(kind: str, params: dict, project_id: str | None = None) -> dict:
+def create(kind: str, params: dict, project_id: str | None = None, org_id: str | None = None,
+           user_id: str | None = None, priority: int = 0) -> dict:
+    """Enqueue a job. A worker (in-process thread or `python -m backend.worker`) claims and runs it."""
+    if kind not in KINDS:
+        raise ValueError(f"unknown job kind {kind}")
     jid = "job_" + uuid.uuid4().hex[:10]
     stages = [{"key": k, "title": t, "status": "pending"} for k, t in STAGES[kind]]
     with db.conn() as c:
-        c.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (jid, kind, project_id, "queued", None, 0.0, db.j(stages), None, None, db.j(params), db.now(), db.now()))
-    POOL.submit(_run, jid, kind, params)
+        c.execute("INSERT INTO jobs (id, kind, project_id, status, stage, progress, stages, result, error, params,"
+                  " created, updated, org_id, user_id, priority, attempts, cancel_requested)"
+                  " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)",
+                  (jid, kind, project_id, "queued", None, 0.0, db.j(stages), None, None, db.j(params), db.now(),
+                   db.now(), org_id, user_id, priority))
+    _WAKE.set()
     return get(jid)
 
 
@@ -97,25 +109,101 @@ def get(jid: str, log_after: int = 0) -> dict | None:
     return r
 
 
-def list_jobs(kind: str | None = None, limit: int = 50) -> list[dict]:
+def list_jobs(kind: str | None = None, limit: int = 50, org_id: str | None = None) -> list[dict]:
+    where, args = [], []
+    if kind:
+        where.append("kind=?"); args.append(kind)
+    if org_id:
+        where.append("org_id=?"); args.append(org_id)
+    q = ("SELECT id, kind, project_id, status, stage, progress, error, created, updated, params, org_id, worker"
+         " FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT ?")
     with db.conn() as c:
-        q = "SELECT id, kind, project_id, status, stage, progress, error, created, updated, params FROM jobs"
-        rows = [db.row(r) for r in c.execute(q + (" WHERE kind=?" if kind else "") + " ORDER BY created DESC LIMIT ?",
-                                             ((kind, limit) if kind else (limit,)))]
+        rows = [db.row(r) for r in c.execute(q, (*args, limit))]
     for r in rows:
         r["params"] = db.uj(r["params"], {})
     return rows
 
 
 def cancel(jid: str):
-    _CANCEL.add(jid)
+    with db.conn() as c:
+        c.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (jid,))
+        c.execute("UPDATE jobs SET status='cancelled', error='cancelled before start' WHERE id=? AND status='queued'",
+                  (jid,))
+
+
+def queue_stats() -> dict:
+    with db.conn() as c:
+        rows = c.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall()
+        workers = [r[0] for r in c.execute("SELECT DISTINCT worker FROM jobs WHERE status='running'")]
+    return {"by_status": {r[0]: r[1] for r in rows}, "busy_workers": workers, "paused": _PAUSED.is_set()}
+
+
+# ---- workers -----------------------------------------------------------------------------------------------------
+_WAKE = threading.Event()
+_PAUSED = threading.Event()        # drain for maintenance: running jobs finish, nothing new starts in this process
+
+
+def pause_workers(paused: bool):
+    (_PAUSED.set if paused else _PAUSED.clear)()
+
+
+def claim(worker: str, kinds: list[str] | None = None) -> dict | None:
+    """Atomically take the next queued job (priority, then age). Safe across processes: the UPDATE only succeeds
+    for the worker that still sees the row queued."""
+    kinds = kinds or list(KINDS)
+    marks = ",".join("?" * len(kinds))
+    won = None
+    with db.conn() as c:
+        for r in c.execute(f"SELECT id FROM jobs WHERE status='queued' AND kind IN ({marks})"
+                           " ORDER BY priority DESC, created LIMIT 5", kinds).fetchall():
+            cur = c.execute("UPDATE jobs SET status='running', worker=?, attempts=attempts+1, updated=?"
+                            " WHERE id=? AND status='queued'", (worker, db.now(), r[0]))
+            if cur.rowcount == 1:
+                won = r[0]
+                break
+    return get(won) if won else None          # read after the commit
+
+
+def requeue_stale():
+    """Jobs left 'running' by a dead worker (no update for STALE_RUNNING_S) go back to the queue once."""
+    with db.conn() as c:
+        c.execute("UPDATE jobs SET status='queued', worker=NULL WHERE status='running' AND updated<? AND attempts<2",
+                  (db.now() - STALE_RUNNING_S,))
+        c.execute("UPDATE jobs SET status='failed', error='worker lost twice' WHERE status='running' AND updated<?",
+                  (db.now() - STALE_RUNNING_S,))
+
+
+def work_forever(name: str, kinds: list[str] | None = None, stop: threading.Event | None = None):
+    stop = stop or threading.Event()
+    while not stop.is_set():
+        if _PAUSED.is_set():
+            stop.wait(0.5)
+            continue
+        job = claim(name, kinds)
+        if job:
+            _run(job["id"], job["kind"], job["params"] or {})
+            continue
+        _WAKE.wait(1.0)
+        _WAKE.clear()
+
+
+def start_inprocess_workers(n: int) -> list[threading.Thread]:
+    requeue_stale()
+    host = socket.gethostname()
+    threads = []
+    for i in range(n):
+        t = threading.Thread(target=work_forever, args=(f"{host}:{os.getpid()}:t{i}", config.WORKER_KINDS or None),
+                             daemon=True, name=f"job-worker-{i}")
+        t.start()
+        threads.append(t)
+    return threads
 
 
 def _run(jid: str, kind: str, params: dict):
     ctx = Ctx(jid, kind)
-    ctx._save(status="running")
+    t0 = time.time()
     try:
-        {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze}[kind](ctx, params)
+        {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -128,6 +216,11 @@ def _run(jid: str, kind: str, params: dict):
         ctx._save(status="failed", error=f"{type(e).__name__}: {e}", stages=db.j(ctx.stages))
         ctx.log("ERROR " + "".join(traceback.format_exception_only(type(e), e)).strip())
         ctx.log(traceback.format_exc()[-2000:])
+    finally:
+        from . import auth
+        with db.conn() as c:
+            r = c.execute("SELECT org_id FROM jobs WHERE id=?", (jid,)).fetchone()
+        auth.meter(r[0] if r else None, f"job_seconds:{kind}", time.time() - t0, jid)
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -291,9 +384,11 @@ def run_train(ctx: Ctx, p: dict):
     build = ctx.dir / "build"
     if build.exists():
         shutil.rmtree(build)
-    man = sai_engine.compile_build(v["onnx"], chosen["target"], chosen["objective"], build)
+    final = ctx.dir / "model.onnx"            # the delivered model; rebuilds compile this exact file
+    shutil.copy(v["onnx"], final)
+    man = sai_engine.compile_build(final, chosen["target"], chosen["objective"], build)
     ctx.log(f"sai compile: {man.get('compile_status')} -> build/")
-    ver = sai_engine.verify(build, v["onnx"])
+    ver = sai_engine.verify(build, final)
     checks = ver.get("checks", [])
     passed = sum(1 for c in checks if c.get("passed"))
     ctx.log(f"sai verify: {passed}/{len(checks)} checks passed")
@@ -330,10 +425,11 @@ def run_train(ctx: Ctx, p: dict):
         "selected": {**chosen, "note": note},
         "exact": exact, "verify": {"passed": passed, "total": len(checks), "checks": checks},
         "memory_certificate": cert, "preprocessing": pre, "sai": sai_engine.version(),
+        "provenance": provenance(build, p["dataset_id"], chosen),
+        "tier_compare": sai_engine.tier_compare(v["onnx"], [chosen["target"]]),
     }
     (ctx.dir / "report.json").write_text(json.dumps(report, indent=1, default=str))
     (ctx.dir / "MODEL_CARD.md").write_text(_model_card(report, tpl, meta))
-    shutil.copy(v["onnx"], ctx.dir / "model.onnx")
     with zipfile.ZipFile(ctx.dir / "package.zip", "w", zipfile.ZIP_DEFLATED) as z:
         for f in sorted(build.rglob("*")):
             if f.is_file():
@@ -395,7 +491,7 @@ def run_analyze(ctx: Ctx, p: dict):
 
 
 # ------------------------------------------------------------------------------------------------------------------
-def start_board_run(job_id: str, target: str | None, board_id: str | None) -> dict:
+def start_board_run(job_id: str, target: str | None, board_id: str | None, org_id: str | None = None) -> dict:
     job = get(job_id)
     if not job or job["status"] != "succeeded" or job["kind"] != "train":
         raise ValueError("board runs need a finished training job")
@@ -412,7 +508,57 @@ def start_board_run(job_id: str, target: str | None, board_id: str | None) -> di
            "estimated_ms": cand["latency"]["ms"], "estimate_evidence": cand["latency"]["evidence"],
            "stack_bound": cand.get("stack"), "expected_outputs": vec["expected"].tolist(),
            "package": f"/api/jobs/{job_id}/download/package.zip"}
-    return boards_mod.request_run(job_id, target, board_id, req)
+    return boards_mod.request_run(job_id, target, board_id, req, org_id)
+
+
+def provenance(build: Path, dataset_id: str, chosen: dict) -> dict:
+    """Everything needed to rebuild this package byte for byte and to trace where it came from."""
+    import hashlib
+    import platform as _pf
+    man = _read_json(build / "manifest.json") or {}
+    rep = _read_json(build / "compile-report.json") or {}
+    npz = config.DATA_DIR / "datasets" / dataset_id / "data.npz"
+    return {
+        "platform_version": config.PLATFORM_VERSION, "python": _pf.python_version(), "torch": torch.__version__,
+        "seeds": {"split": 0, "torch": 0, "calibration": 0},
+        "dataset_sha256": hashlib.sha256(npz.read_bytes()).hexdigest() if npz.exists() else None,
+        "sai_version": man.get("compiler_version"), "build_digest": man.get("build_digest"),
+        "plan_digest": man.get("plan_digest"), "semantic_digest": man.get("semantic_digest"),
+        "toolchain_digest": man.get("toolchain_digest"),
+        "toolchain": ((rep.get("toolchain") or {}).get("build_record") or {}).get("toolchain"),
+        "target": chosen["target"], "objective": chosen["objective"], "schedule": chosen["schedule"],
+    }
+
+
+def run_rebuild(ctx: Ctx, p: dict):
+    """Recompile a finished project's model with the recorded target/objective; byte-identical or not."""
+    src = get(p["job_id"])
+    if not src or src["status"] != "succeeded" or src["kind"] != "train":
+        raise ValueError("rebuild needs a finished training job")
+    prov = (src["result"] or {}).get("provenance") or {}
+    model = config.DATA_DIR / "jobs" / p["job_id"] / "model.onnx"
+    ctx.stage("compile")
+    out = ctx.dir / "build"
+    if out.exists():
+        shutil.rmtree(out)
+    sai_engine.compile_build(model, prov["target"], prov["objective"], out)
+    ctx.stage("compile", "done")
+    ctx.stage("compare")
+    man = _read_json(out / "manifest.json") or {}
+    orig = config.DATA_DIR / "jobs" / p["job_id"] / "build"
+    files = {}
+    for f in sorted(x for x in orig.rglob("*") if x.is_file()):
+        g = out / f.relative_to(orig)
+        files[str(f.relative_to(orig))] = g.exists() and g.read_bytes() == f.read_bytes()
+    same = man.get("build_digest") == prov.get("build_digest") and all(files.values())
+    ctx.log(f"build digest {man.get('build_digest')} vs recorded {prov.get('build_digest')}: "
+            f"{'identical' if same else 'DIFFERENT'}")
+    for name, ok in files.items():
+        if not ok:
+            ctx.log(f"  differs: {name}")
+    ctx.stage("compare", "done")
+    ctx.result({"identical": same, "build_digest": man.get("build_digest"), "recorded": prov.get("build_digest"),
+                "files": files, "sai_version": man.get("compiler_version"), "recorded_sai": prov.get("sai_version")})
 
 
 def _read_json(p: Path):

@@ -126,8 +126,8 @@ fits on the first run · INT8-vs-float drop (target < 1 %) · calibration error 
    (internal_error + traceback) instead of a structured `toolchain_missing` error.
 3. A 1-D graph with a strided conv lowers on the 2-D path, so `explore --one-axis` reports `explore.two_axes`;
    the platform retries without the flag. Worth documenting for API users.
-4. With the dev RV32 toolchain the MD6605 stack bound came back `unavailable` (Cortex-M7 gives
-   `proven_upper_bound`); to re-check with the production xPack toolchain.
+4. ~~With the dev RV32 toolchain the MD6605 stack bound came back `unavailable`~~ Resolved in M1: with the pinned
+   xPack `riscv-none-elf-gcc` 13.2.0-2 SAI proves the MD6605 stack bound (`proven_upper_bound`); the dev shim was the cause.
 
 ## 8. Open decisions for the owner
 

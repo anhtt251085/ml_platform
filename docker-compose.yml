@@ -1,0 +1,40 @@
+# docker compose up -d   (set SAI_SRC to a checkout of mcu_edge_ai; default ../mcu_edge_ai)
+# SaaS:     SAI_PLATFORM_MODE=multi  (default) - SAI admins create customer organisations
+# On-prem:  SAI_PLATFORM_MODE=single SAI_PLATFORM_ORG_NAME="Acme" - one customer per install
+x-common: &common
+  image: sai-platform:latest
+  environment: &env
+    SAI_PLATFORM_MODE: ${SAI_PLATFORM_MODE:-multi}
+    SAI_PLATFORM_ORG_NAME: ${SAI_PLATFORM_ORG_NAME:-Customer}
+    SAI_PLATFORM_ADMIN_EMAIL: ${SAI_PLATFORM_ADMIN_EMAIL:-admin@sai.local}
+    SAI_PLATFORM_ADMIN_PASSWORD: ${SAI_PLATFORM_ADMIN_PASSWORD:?set an admin password}
+    SAI_PLATFORM_SIM_BOARDS: ${SAI_PLATFORM_SIM_BOARDS:-1}
+    SAI_PLATFORM_COOKIE_SECURE: ${SAI_PLATFORM_COOKIE_SECURE:-0}
+  volumes:
+    - platform-data:/data
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *common
+    build:
+      context: .
+      additional_contexts:
+        sai: ${SAI_SRC:-../mcu_edge_ai}
+    environment:
+      <<: *env
+      SAI_PLATFORM_INPROC_WORKERS: "0"          # jobs run in the worker service
+    ports:
+      - "${PORT:-8000}:8000"
+
+  worker:
+    <<: *common
+    command: ["python", "-m", "backend.worker", "--threads", "${WORKER_THREADS:-2}"]
+    environment:
+      <<: *env
+      SAI_PLATFORM_SIM_BOARDS: "0"               # the simulated lab agent lives in the API process
+    depends_on:
+      - api
+
+volumes:
+  platform-data:

@@ -37,6 +37,12 @@ def register(agent_id: str, boards: list[dict], simulated: bool = False) -> list
     return out
 
 
+def board_agent(board_id: str | None) -> str | None:
+    with db.conn() as c:
+        r = c.execute("SELECT agent_id FROM boards WHERE id=?", (board_id,)).fetchone()
+    return r[0] if r else None
+
+
 def heartbeat(agent_id: str):
     with db.conn() as c:
         c.execute("UPDATE boards SET last_seen=? WHERE agent_id=?", (db.now(), agent_id))
@@ -55,11 +61,12 @@ def list_boards() -> list[dict]:
     return rows
 
 
-def request_run(job_id: str, target: str, board_id: str | None, request: dict) -> dict:
+def request_run(job_id: str, target: str, board_id: str | None, request: dict, org_id: str | None = None) -> dict:
     rid = "hil_" + uuid.uuid4().hex[:10]
     with db.conn() as c:
-        c.execute("INSERT INTO hil_runs VALUES (?,?,?,?,?,?,?,?,?)",
-                  (rid, job_id, board_id, target, "queued", db.now(), db.now(), db.j(request), None))
+        c.execute("INSERT INTO hil_runs (id, job_id, board_id, target, status, created, updated, request, result, org_id)"
+                  " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (rid, job_id, board_id, target, "queued", db.now(), db.now(), db.j(request), None, org_id))
     return get_run(rid)
 
 
@@ -71,10 +78,15 @@ def get_run(rid: str) -> dict | None:
     return r
 
 
-def list_runs(job_id: str | None = None, limit: int = 50) -> list[dict]:
+def list_runs(job_id: str | None = None, limit: int = 50, org_id: str | None = None) -> list[dict]:
+    where, args = [], []
+    if job_id:
+        where.append("job_id=?"); args.append(job_id)
+    if org_id:
+        where.append("org_id=?"); args.append(org_id)
     with db.conn() as c:
-        q = "SELECT id FROM hil_runs" + (" WHERE job_id=?" if job_id else "") + " ORDER BY created DESC LIMIT ?"
-        ids = [r[0] for r in c.execute(q, ((job_id, limit) if job_id else (limit,)))]
+        q = "SELECT id FROM hil_runs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT ?"
+        ids = [r[0] for r in c.execute(q, (*args, limit))]
     return [get_run(i) for i in ids]
 
 

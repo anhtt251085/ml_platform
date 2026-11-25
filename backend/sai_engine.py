@@ -120,8 +120,32 @@ def inspect(model: Path) -> dict:
     return run(["inspect", str(model)])
 
 
-def estimate(model: Path, target: str, objective: str) -> dict:
-    return run(["estimate", str(model), "--target", target, "--objective", objective])
+def estimate(model: Path, target: str, objective: str, tier: str | None = None) -> dict:
+    return run(["estimate", str(model), "--target", target, "--objective", objective,
+                *(["--tier", tier] if tier else [])])
+
+
+def tier_compare(model: Path, targets: list[str]) -> dict:
+    """SAI Standard (tier core) vs Professional (pro) FAST plan per target: the edition upsell, from SAI itself.
+    Standard is estimated (SAI builds MCU packages at the Professional tier today)."""
+    out = {}
+    for t in targets:
+        if t not in MCU_TARGETS:
+            continue
+        row = {}
+        for tier, key in (("core", "standard"), ("pro", "professional")):
+            try:
+                e = estimate(model, t, "fast", tier)
+            except SaiFailure as err:
+                row[key] = {"error": str(err)}
+                continue
+            res = e.get("resources", {})
+            row[key] = {"schedule": ((e.get("provenance") or {}).get("plan") or {}).get("schedule"),
+                        "workspace": (res.get("tensor_workspace") or {}).get("value"),
+                        "flash": (res.get("linked_sai_flash") or {}).get("value"),
+                        "stack": (res.get("stack") or {}).get("value")}
+        out[t] = row
+    return out
 
 
 def explore(model: Path, target: str, spatial_axes: int, max_seconds: int = 20, top: int = 25) -> dict | None:
