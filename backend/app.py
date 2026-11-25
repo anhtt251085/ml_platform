@@ -561,10 +561,22 @@ class ProjectIn(BaseModel):
     pool_benchmark: bool = False      # SAI research only: publish the result on the pool leaderboard
     lr_search: bool = False           # try two learning rates per size, keep the better validation loss
     preprocess: dict = {}             # preprocessing stage settings (backend/preprocess.py)
+    custom_variants: dict[str, list[dict]] = {}   # e.g. {"auto": layers} from the architecture recommender
 
 
-@app.post("/api/projects")
-def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
+class RecommendIn(BaseModel):
+    template_id: str
+    dataset_id: str
+    targets: list[str] = ["md6605", "cortex-m7"]
+    goal: str = "balanced"
+    budgets: dict = {}
+    preprocess: dict = {}
+    max_candidates: int = 8
+
+
+@app.post("/api/recommend")
+def recommend_start(body: RecommendIn, u: dict = Depends(auth.current)):
+    """Architecture recommendation: a background job; its result lists the candidates and the recommended one."""
     _tpl(body.template_id, u)
     d = _ds(body.dataset_id, u)
     from . import preprocess
@@ -575,7 +587,38 @@ def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
     if body.goal not in pipeline.GOALS:
         raise HTTPException(400, f"goal must be one of {pipeline.GOALS}")
     cfg = body.model_dump()
+    cfg["max_candidates"] = max(2, min(cfg["max_candidates"], 16))
+    job = pipeline.create("recommend", cfg, org_id=u["org_id"], user_id=u["id"], priority=1)
+    auth.audit(u, "recommend_started", job["id"], {"template": body.template_id, "dataset": body.dataset_id})
+    return job
+
+
+@app.post("/api/projects")
+def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
+    _tpl(body.template_id, u)
+    d = _ds(body.dataset_id, u)
+    from . import preprocess
+    try:
+        pcfg = preprocess.normalize_cfg(body.preprocess, d, d["shape"], d.get("task", "classification"))
+    except preprocess.PrepError as e:
+        _bad(e)
+    if body.goal not in pipeline.GOALS:
+        raise HTTPException(400, f"goal must be one of {pipeline.GOALS}")
+    cfg = body.model_dump()
     cfg["epochs"] = max(1, min(cfg["epochs"], 200))
+    c_in, h_in, w_in = (int(v) for v in d["shape"])
+    if pcfg["window_ops"]:                                   # the model sees the window after the C steps
+        c_in, w_in = len(pcfg["channels"] or range(c_in)), w_in // pcfg["decimate"]
+    for name, layers in (cfg.get("custom_variants") or {}).items():
+        if not isinstance(name, str) or not name.isidentifier() or len(name) > 16 or len(layers) > 64:
+            raise HTTPException(400, "custom_variants: short names and at most 64 layers")
+        try:
+            archspec.normalize({"input": {"channels": c_in, "height": h_in, "width": w_in}, "layers": layers,
+                                "outputs": 2})
+        except (archspec.SpecError, AttributeError, TypeError) as e:
+            _bad(e)
+        if name not in cfg["sizes"]:
+            cfg["sizes"].append(name)
     if cfg.get("pool_benchmark") and u["role"] not in auth.PERMS["publish"]:
         raise HTTPException(403, "only SAI research publishes pool benchmarks")
     plan = commercial.check_project(u)

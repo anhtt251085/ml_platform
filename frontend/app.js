@@ -435,8 +435,12 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         <label class="check small"><input type="checkbox" id="ifp" ${st.initPool ? "checked" : ""} ${(SYS.pool_weights || {})[st.tpl.id] ? "" : "disabled"}>Fine-tune from the pool's base weights ${(SYS.pool_weights || {})[st.tpl.id] ? `<span class="badge b-ok">available</span>` : `<span class="muted">(none trained yet for this model type)</span>`}</label>
         <label class="check small"><input type="checkbox" id="lrs" ${st.lrSearch ? "checked" : ""}>Learning-rate search (2 runs per size, keeps the best on validation)</label>
         ${ME && ME.perms.publish ? `<label class="check small"><input type="checkbox" id="pbm" ${st.poolBench ? "checked" : ""}>Pool benchmark: publish the result on the pool leaderboard (SAI research)</label>` : ""}</div>
-      <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label>`).join("")}</div>
-      </div></div>${nav(true, true)}`;
+      <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label>`).join("")}
+        <label class="check" id="autolbl" style="${st.auto ? "" : "display:none"}"><input type="checkbox" name="sz" value="auto" ${st.sizes.includes("auto") ? "checked" : ""}>auto <span class="badge b-ok">recommended</span></label></div>
+      </div></div>
+      <div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Recommended architecture</h2><span class="spacer"></span><button class="btn sm" id="recbtn">${st.rec ? "Recommend again" : "Recommend an architecture"}</button></div>
+        <p class="small muted" style="margin-top:6px">Profiles your data, generates candidate architectures for it, and has SAI cost every candidate exactly on the selected boards before any training: RAM, flash and plan depend on the architecture, not on the weights. Takes a few minutes; the result is added as size <b>auto</b>.</p>
+        <div id="recout">${st.rec ? recTable(st.rec) : ""}</div></div>${nav(true, true)}`;
     const help = { balanced: "Best mix of latency, RAM and flash among plans that fit.", fastest: "Lowest latency plan that fits.", "min-ram": "Smallest RAM (workspace + stack): leaves the most memory for your application.", "min-flash": "Smallest code + weights.", accuracy: "Most accurate size that fits, then balanced." };
     const g = () => { $("#goalhelp").textContent = help[st.goal]; };
     g();
@@ -448,6 +452,41 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
     };
     $("#back").onclick = () => { save(); st.step--; draw(); };
     $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length) return toast("Pick at least one size"); st.step++; draw(); };
+    $("#recbtn").onclick = async () => {
+      save();
+      if (!st.targets.length) return toast("Pick at least one board");
+      $("#recbtn").disabled = true;
+      try {
+        const job = await api("/api/recommend", { json: { template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, budgets: st.budgets, preprocess: st.prep } });
+        for (;;) {
+          const j = await api(`/api/jobs/${job.id}`);
+          const last = (j.logs || []).slice(-1)[0];
+          $("#recout").innerHTML = `<div class="callout info">Recommending (${esc(j.status)})${last ? ` · ${esc(last.line)}` : ""}</div>`;
+          if (j.status === "succeeded") { st.rec = j.result; break; }
+          if (j.status === "failed" || j.status === "cancelled") throw new Error(j.error || "recommendation failed");
+          await new Promise((res) => setTimeout(res, 2000));
+        }
+        if (st.rec.recommended) {
+          st.auto = st.rec.recommended.layers;
+          if (!st.sizes.includes("auto")) st.sizes.push("auto");
+          $("#autolbl").style.display = ""; $("#autolbl input").checked = true;
+        }
+        $("#recout").innerHTML = recTable(st.rec);
+      } catch (e) { if (!(e instanceof Stale)) $("#recout").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; }
+      finally { if ($("#recbtn")) { $("#recbtn").disabled = false; $("#recbtn").textContent = "Recommend again"; } }
+    };
+  }
+
+  function recTable(r) {
+    const arch = (layers) => layers.map((l) => l.op + (l.out ? l.out : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "")).join(" → ");
+    const rec = r.recommended;
+    return `${rec ? `<div class="callout ok"><b>Recommended: ${esc(rec.id)}</b> – ${esc(r.why)}. ${fmt(rec.params)} params, ${fmt(rec.macs)} MACs${rec.receptive_field ? `, receptive field ${fmt(rec.receptive_field)}` : ""}; worst board ${bytes(rec.ram)} RAM, ${bytes(rec.flash)} flash, ${fmt(rec.latency_ms, 3)} ms.<div class="mono small" style="margin-top:6px">${esc(arch(rec.layers))} → fc(head)</div></div>` : `<div class="callout warn">${esc(r.why)}</div>`}
+      <h3 style="margin-top:12px">Why</h3><ul class="small">${r.rules.reasons.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+      <p class="small muted">Made for goal <b>${esc(GOAL_LABEL[r.goal] || r.goal)}</b> on ${r.targets.map(esc).join(", ")}. If you change them, recommend again.</p>
+      <div class="tbl-wrap"><table class="t"><thead><tr><th></th><th>Candidate</th><th class="n">Params</th><th class="n">MACs</th><th class="n">Receptive field</th>${r.targets.map((t) => `<th class="n">${esc(t)} RAM</th><th class="n">flash</th><th class="n">latency</th>`).join("")}<th>Fits?</th></tr></thead><tbody>
+      ${r.candidates.map((c) => `<tr class="${c.recommended ? "rec" : c.fits ? "" : "nofit"}"><td>${c.recommended ? "★" : ""}</td><td><span class="mono small" title="${esc(arch(c.layers))}">${esc(c.id)}</span>${c.origin === "pool" ? ` <span class="badge">pool</span>` : ""}${c.over_cap ? ` <span class="badge b-warn">over cap</span>` : ""}</td><td class="n">${fmt(c.params)}</td><td class="n">${fmt(c.macs)}</td><td class="n">${c.receptive_field ? fmt(c.receptive_field) : "–"}</td>
+        ${r.targets.map((t) => { const b = (c.boards || {})[t]; return b ? `<td class="n">${bytes(b.ram)}</td><td class="n">${bytes(b.flash)}</td><td class="n">${fmt(b.latency_ms, 3)} ms</td>` : `<td colspan="3" class="muted">no plan</td>`; }).join("")}
+        <td>${c.fits ? `<span class="badge b-ok">fits</span>` : `<span class="badge b-bad" title="${esc(Object.values(c.boards || {}).flatMap((b) => (b && b.violations) || []).join("; "))}">no</span>`}</td></tr>`).join("")}</tbody></table></div>`;
   }
 
   function stepReview(b) {
@@ -464,7 +503,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
     $("#next").onclick = async () => {
       $("#next").disabled = true;
       try {
-        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
+        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, custom_variants: st.sizes.includes("auto") && st.auto ? { auto: st.auto } : {}, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
         location.hash = `#/job/${r.job.id}`;
       } catch (e) { toast(e.message); $("#next").disabled = false; }
     };
@@ -821,7 +860,7 @@ python agent/board_agent.py --server ${esc(location.origin)} \\
   --token $SAI_AGENT_TOKEN --boards boards.json</div></div></div>
     <div class="card" style="margin-top:16px"><h2>Nightly regression</h2>${reg.latest.length ? `<p class="small muted">Run ${esc(reg.runs[0].run_id)} · SAI ${esc(reg.runs[0].sai_version)} · ${ago(reg.runs[0].created)}</p>
       <div class="tbl-wrap"><table class="t"><thead><tr><th>Model type (tiny)</th><th>Board</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Plans that fit</th><th>Emulated HIL</th></tr></thead><tbody>
-      ${reg.latest.map((r) => `<tr><td>${esc(r.template)}</td><td>${esc(r.target)}</td><td class="n">${bytes(r.ram)}</td><td class="n">${bytes(r.flash)}</td><td class="n">${r.feasible}</td><td>${r.hil_match === null ? "–" : r.hil_match ? `<span class="badge b-ok">bit-exact</span>` : `<span class="badge b-bad">mismatch</span>`}</td></tr>`).join("")}</tbody></table></div>` : `<p class="small muted">No regression run yet. It checks every pool model type on every board against the current SAI release and alerts on RAM/flash growth, lost fits or HIL mismatches (also nightly in CI).</p>`}</div>
+      ${reg.latest.map((r) => `<tr><td>${esc(r.template)}</td><td>${esc(r.target)}</td><td class="n">${bytes(r.ram)}</td><td class="n">${bytes(r.flash)}</td><td class="n">${r.feasible}</td><td>${r.hil_match === null ? "–" : r.hil_match ? `<span class="badge b-ok">bit-exact</span>` : `<span class="badge b-bad">mismatch</span>`}</td></tr>`).join("")}</tbody></table></div>` : `<p class="small muted">No regression run yet. It checks every pool model type on every board against the current SAI release and alerts on RAM/flash growth, lost fits or HIL mismatches (also run by tools/full_check.sh).</p>`}</div>
     <div class="card" style="margin-top:16px"><h2>Recent runs</h2>${b.runs.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Run</th><th>Job</th><th>Board</th><th>Status</th><th class="n">Estimated</th><th class="n">Result</th><th>Outputs</th><th class="n">Stack</th><th>When</th></tr></thead><tbody>
       ${b.runs.map((x) => { const r = x.result || {}; return `<tr><td class="mono small">${esc(x.id)}</td><td><a href="#/job/${esc(x.job_id)}">${esc(x.job_id)}</a></td><td>${esc(x.board_id || "–")}</td><td>${statusBadge(x.status)}</td><td class="n">${ms(x.request.estimated_ms)}</td>
         <td class="n">${r.emulated ? `<span class="small muted">${fmt(r.cycles)} emu. cycles</span>` : r.simulated ? `${ms(r.latency_ms)} (sim)` : ms(r.latency_ms)}</td>
