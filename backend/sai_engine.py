@@ -86,12 +86,12 @@ def run(args: list[str], timeout: int = 300) -> dict:
         data = json.loads(proc.stdout) if proc.stdout.strip() else {}
     except json.JSONDecodeError:
         data = {}
-    if "error" in data:
+    if isinstance(data, dict) and "error" in data:
         err = data["error"]
         raise SaiFailure(f"{err.get('code')}: {err.get('reason')}", err)
-    if proc.returncode not in (0,) and not data:
+    if proc.returncode != 0 and (not data or args[0] in ("compile", "verify", "certify")):
         tail = (proc.stdout + proc.stderr).strip().splitlines()[-6:]
-        raise SaiFailure("sai " + args[0] + " failed: " + " | ".join(tail), {"exit": proc.returncode})
+        raise SaiFailure(f"sai {args[0]} exited {proc.returncode}: " + " | ".join(tail), {"exit": proc.returncode})
     return data
 
 
@@ -183,6 +183,9 @@ def certify_check(build: Path, model: Path) -> dict:
     out = run(["certify", str(model), "--check", str(build / "memory-certificate.json"),
                "--source", str(build / "model" / "sai_model.c")], timeout=300)
     checks = (out.get("check") or {}).get("checks", [])
+    failed = [c.get("check") for c in checks if not c.get("passed")]
+    if failed or not checks:
+        raise SaiFailure(f"sai certify --check: failed checks {failed or 'none reported'}", {"failed": failed})
     return {"passed": sum(1 for c in checks if c.get("passed")), "total": len(checks),
             "checks": [{"check": c.get("check"), "passed": c.get("passed")} for c in checks]}
 
@@ -200,7 +203,12 @@ def check_schema(kind: str, version: str | None):
 
 
 def verify(build: Path, model: Path) -> dict:
-    return run(["verify", str(build), "--model", str(model)], timeout=600)
+    """`sai verify`; raises SaiFailure unless every check passed."""
+    out = run(["verify", str(build), "--model", str(model)], timeout=600)
+    failed = [c.get("check") for c in out.get("checks", []) if not c.get("passed")]
+    if failed or not out.get("checks"):
+        raise SaiFailure(f"sai verify: failed checks {failed or 'none reported'}", {"failed": failed})
+    return out
 
 
 # ------------------------------------------------------------------------------------------------------------------

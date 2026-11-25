@@ -5,7 +5,8 @@ int main(void);
 void Reset_Handler(void);
 static void Default_Handler(void) { for (;;) {} }
 void SysTick_Handler(void) __attribute__((weak, alias("Default_Handler")));
-void HardFault_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void port_trap(void) __attribute__((weak));
+void HardFault_Handler(void) { if (port_trap) port_trap(); for (;;) {} }
 
 __attribute__((section(".vectors"), used)) static void (*const vectors[16])(void) = {
     (void (*)(void))_stack_top, Reset_Handler, Default_Handler, HardFault_Handler, Default_Handler, Default_Handler,

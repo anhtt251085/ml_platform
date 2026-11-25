@@ -156,6 +156,9 @@ def test_api_end_to_end_with_board_run():
         assert j["status"] == "succeeded", j["error"]
         res = j["result"]
         assert res["verify"]["passed"] == res["verify"]["total"]
+        from backend import config as _cfg
+        jd = _cfg.DATA_DIR / "jobs" / jid
+        assert (jd / "model.onnx").exists() and not list(jd.glob("model_*.onnx")) and not (jd / "exact").exists()
         assert res["selected"]["fits"]
         assert c.get(f"/api/jobs/{jid}/download/package.zip").status_code == 200
         run = c.post("/api/boards/runs", json={"job_id": jid}).json()

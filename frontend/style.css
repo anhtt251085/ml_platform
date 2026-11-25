@@ -163,3 +163,7 @@ svg text { fill: var(--muted); font-size: 11px; }
 body.signed-out .side { display: none; }
 body.signed-out .shell { grid-template-columns: 1fr; }
 [hidden] { display: none !important; }
+
+a:focus-visible, button:focus-visible, .tile:focus-visible, .drop:focus-visible, .chip:focus-visible, .tab:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}

@@ -9,7 +9,7 @@ x-common: &common
     SAI_PLATFORM_ADMIN_EMAIL: ${SAI_PLATFORM_ADMIN_EMAIL:-admin@sai.local}
     SAI_PLATFORM_ADMIN_PASSWORD: ${SAI_PLATFORM_ADMIN_PASSWORD:?set an admin password}
     SAI_PLATFORM_SIM_BOARDS: ${SAI_PLATFORM_SIM_BOARDS:-1}
-    SAI_PLATFORM_COOKIE_SECURE: ${SAI_PLATFORM_COOKIE_SECURE:-0}
+    SAI_PLATFORM_COOKIE_SECURE: ${SAI_PLATFORM_COOKIE_SECURE:-auto}    # Secure whenever served over HTTPS
   volumes:
     - platform-data:/data
   restart: unless-stopped
