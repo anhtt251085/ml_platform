@@ -1,0 +1,80 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (no SAI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - name: Run tests (SAI-dependent tests skip)
+        env:
+          SAI_BIN: /nonexistent/sai
+        run: |
+          export SAI_PLATFORM_DATA="$RUNNER_TEMP/saiplat"
+          python -m pytest -q tests -rs
+
+  full:
+    name: full (SAI + MCU toolchains, end to end)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Repository secret SAI_REPO_TOKEN: a fine-grained token with read access to anhtt251085/mcu_edge_ai.
+      HAS_SAI_TOKEN: ${{ secrets.SAI_REPO_TOKEN != '' }}
+    steps:
+      - name: SAI token missing
+        if: env.HAS_SAI_TOKEN != 'true'
+        run: echo "::notice::SAI_REPO_TOKEN is not set; skipping the full job (the unit job still ran)."
+      - uses: actions/checkout@v4
+        if: env.HAS_SAI_TOKEN == 'true'
+      - name: Check out the SAI compiler
+        if: env.HAS_SAI_TOKEN == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: anhtt251085/mcu_edge_ai
+          token: ${{ secrets.SAI_REPO_TOKEN }}
+          path: sai-src
+      - uses: actions/setup-python@v5
+        if: env.HAS_SAI_TOKEN == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install MCU toolchains
+        if: env.HAS_SAI_TOKEN == 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            gcc-riscv64-unknown-elf picolibc-riscv64-unknown-elf
+      - name: Install dependencies and SAI
+        if: env.HAS_SAI_TOKEN == 'true'
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install ./sai-src
+          sai version
+          sai targets
+      - name: Run all tests
+        if: env.HAS_SAI_TOKEN == 'true'
+        run: |
+          export SAI_MD6605_GCC="$PWD/toolchains/riscv-none-elf-gcc"
+          export SAI_PLATFORM_DATA="$RUNNER_TEMP/saiplat"
+          python -m pytest -q tests -rs

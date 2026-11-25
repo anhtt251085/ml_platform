@@ -1,5 +1,7 @@
 # SAI Platform (prototype v0.1)
 
+[![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
+
 A web platform on top of the SAI compiler. A customer picks a **model type** from the model pool, brings
 **data**, picks **boards and a goal**, and the platform does the rest:
 
@@ -25,7 +27,14 @@ pip install /path/to/a/copy/of/mcu_edge_ai      # the SAI compiler (`sai` CLI); 
 ./run.sh                                         # http://localhost:8000
 ```
 
-Tests: `SAI_PLATFORM_DATA=$(mktemp -d) pytest -q tests` (21 tests, about 25 s, the end-to-end one included).
+Tests: `SAI_PLATFORM_DATA=$(mktemp -d) pytest -q tests` (21 tests, about 25 s, the end-to-end one included;
+without the `sai` CLI the 3 compiler tests skip).
+
+CI (`.github/workflows/tests.yml`) runs on every push and pull request:
+* **unit**: no SAI, always runs.
+* **full**: installs SAI from `anhtt251085/mcu_edge_ai` plus the Arm and RISC-V toolchains and runs everything.
+  It needs a repository secret `SAI_REPO_TOKEN` (fine-grained token, read-only *Contents* on `mcu_edge_ai`);
+  without it the job skips with a notice.
 
 ## Layout
 
