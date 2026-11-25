@@ -13,7 +13,7 @@ RUN --mount=type=secret,id=extra_ca,required=false \
 
 RUN apt-get update -q && apt-get install -y -q --no-install-recommends \
         gcc libc6-dev git \
-        gcc-arm-none-eabi libnewlib-arm-none-eabi curl \
+        gcc-arm-none-eabi libnewlib-arm-none-eabi curl qemu-system-arm qemu-system-misc \
     && rm -rf /var/lib/apt/lists/*
 
 # MD6605: the xPack RISC-V toolchain SAI's MD6605 measurements use (pinned + checksum). Debian's
@@ -30,11 +30,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY --from=sai . /opt/sai-src
-RUN pip install --no-cache-dir /opt/sai-src && rm -rf /opt/sai-src && sai version
+# Bind-mounted for the install only: the SAI source never lands in an image layer.
+RUN --mount=type=bind,from=sai,target=/opt/sai-src,rw pip install --no-cache-dir /opt/sai-src && sai version
 
 COPY . .
-RUN useradd -m -u 1000 sai && mkdir -p /data && chown -R sai /data /app
+ARG SAI_PLATFORM_VERSION=dev
+ENV SAI_PLATFORM_VERSION=${SAI_PLATFORM_VERSION}
+RUN useradd -m -u 1000 sai && mkdir -p /data && chown -R sai /data     # /app stays root-owned (read-only code)
 USER sai
 
 ENV SAI_PLATFORM_DATA=/data \
@@ -42,4 +44,6 @@ ENV SAI_PLATFORM_DATA=/data \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"
-CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]
+# --proxy-headers: behind a TLS-terminating proxy the request scheme is https, so session cookies get Secure.
+# Set FORWARDED_ALLOW_IPS to the proxy's address (uvicorn trusts only 127.0.0.1 by default).
+CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

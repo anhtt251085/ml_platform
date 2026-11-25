@@ -156,6 +156,9 @@ def test_api_end_to_end_with_board_run():
         assert j["status"] == "succeeded", j["error"]
         res = j["result"]
         assert res["verify"]["passed"] == res["verify"]["total"]
+        from backend import config as _cfg
+        jd = _cfg.DATA_DIR / "jobs" / jid
+        assert (jd / "model.onnx").exists() and not list(jd.glob("model_*.onnx")) and not (jd / "exact").exists()
         assert res["selected"]["fits"]
         assert c.get(f"/api/jobs/{jid}/download/package.zip").status_code == 200
         run = c.post("/api/boards/runs", json={"job_id": jid}).json()
@@ -165,8 +168,8 @@ def test_api_end_to_end_with_board_run():
                 break
             time.sleep(1)
         assert rr["status"] == "succeeded" and rr["result"]["outputs_match"] is True
-        assert rr["result"]["simulated"] is True
-        # simulated runs never calibrate latency
+        assert rr["result"].get("simulated") or rr["result"].get("emulated")
+        # simulated and emulated runs never calibrate latency
         assert c.get("/api/boards").json()["calibration"] == {}
         # M1: provenance recorded and a rebuild is byte-identical
         prov = res["provenance"]
@@ -348,3 +351,106 @@ def test_kws_frontend_package_finetune_and_evaluation_marker():
         assert {"sai_package/frontend/sai_features.c", "sai_package/frontend/sai_frontend_config.h",
                 "sai_package/EVALUATION_ONLY.txt"} <= names
         assert b"SAI_PACKAGE_EVALUATION_ONLY" in z.read("sai_package/sai_app.h")
+
+
+# ---- M5: pool program -------------------------------------------------------------------------------------------
+@need_sai
+def test_pool_benchmark_leaderboard_and_permissions():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as c:
+        h = login(c)
+        ds = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 40}, headers=h).json()
+        r = c.post("/api/projects", headers=h, json={"name": "bench", "template_id": "gas-sense", "dataset_id": ds["id"],
+                                                     "sizes": ["tiny"], "epochs": 3, "targets": ["md6605"],
+                                                     "pool_benchmark": True}).json()
+        j = wait_job(c, r["job"]["id"], h)
+        assert j["status"] == "succeeded", j["error"]
+        lb = c.get("/api/pool/leaderboard", headers=h).json()
+        e = next(x for x in lb["gas-sense"] if x["job_id"] == j["id"])
+        assert e["synthetic"] is True and e["value"] is not None and e["ram"] and e["target"] == "md6605"
+        assert j["result"]["template"]["version"] is None or j["result"]["template"]["source"] == "builtin"
+        # customers cannot publish to the leaderboard
+        org = c.post("/api/admin/orgs", json={"name": "Initech", "tier": "standard"}, headers=h).json()
+        c.post("/api/admin/users", headers=h, json={"email": "m@initech.test", "name": "M", "role": "member",
+                                                     "password": "password-1", "org_id": org["id"]})
+        hm = login(c, "m@initech.test", "password-1")
+        dm = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 30}, headers=hm).json()
+        assert c.post("/api/projects", headers=hm, json={"name": "x", "template_id": "gas-sense", "dataset_id": dm["id"],
+                                                          "pool_benchmark": True}).status_code == 403
+
+
+# ---- M6: commercial ---------------------------------------------------------------------------------------------
+def _org_user(c, h, name, tier, email):
+    org = c.post("/api/admin/orgs", json={"name": name, "tier": tier}, headers=h).json()
+    r = c.post("/api/admin/users", headers=h, json={"email": email, "name": "U", "role": "org_admin",
+                                                     "password": "password-1", "org_id": org["id"]})
+    assert r.status_code == 200, r.text
+    return org, login(c, email, "password-1")
+
+
+def test_free_plan_limits_and_branding():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as c:
+        h = login(c)
+        org, hf = _org_user(c, h, "Hooli", "free", "a@hooli.test")
+        me = c.get("/api/me", headers=hf).json()
+        assert me["plan"]["tier"] == "free" and me["deployment"]["model"] == "none"
+        ds = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 30}, headers=hf).json()
+        body = {"name": "p", "template_id": "gas-sense", "dataset_id": ds["id"], "sizes": ["tiny"], "epochs": 1}
+        jobs = [c.post("/api/projects", headers=hf, json=body) for _ in range(4)]
+        assert [r.status_code for r in jobs] == [200, 200, 200, 402]          # 3 projects / month on Free
+        jid = jobs[0].json()["job"]["id"]
+        assert c.post("/api/boards/runs", headers=hf, json={"job_id": jid}).status_code == 402
+        for r in jobs[:3]:                                                     # do not leave work in the queue
+            c.post(f"/api/jobs/{r.json()['job']['id']}/cancel", headers=hf)
+        b = c.put("/api/org/brand", headers=hf, json={"product_name": "Hooli Edge", "accent": "#aa3300", "logo_text": "H"})
+        assert b.json() == {"product_name": "Hooli Edge", "accent": "#aa3300", "logo_text": "H"}
+        assert c.get("/api/me", headers=hf).json()["brand"]["product_name"] == "Hooli Edge"
+        assert "public_key_pem" in c.get("/api/signing/public-key").json()
+
+
+@need_sai
+def test_deployment_rights_signature_and_package_gate():
+    import zipfile
+    from fastapi.testclient import TestClient
+    from backend import commercial
+    from backend.app import app
+    with TestClient(app) as c:
+        h = login(c)
+        org, hs = _org_user(c, h, "Stark Motors", "standard", "a@stark.test")
+        rows = ["v_out,i_l,label,segment"] + [f"{12 + (i % 7) * 0.01},{2 + (s % 3)},{['normal', 'short', 'overload'][s % 3]},{s}"
+                                              for s in range(9) for i in range(300)]
+        up = c.post("/api/datasets/upload", headers=hs, data={"template_id": "dcdc-fault", "licence": "proprietary",
+                                                              "window": "64", "hop": "64"},
+                    files={"file": ("log.csv", "\n".join(rows).encode(), "text/csv")}).json()
+        body = {"name": "p", "template_id": "dcdc-fault", "dataset_id": up["id"], "sizes": ["tiny"], "epochs": 2,
+                "targets": ["cortex-m7"]}
+        j1 = wait_job(c, c.post("/api/projects", headers=hs, json=body).json()["job"]["id"], hs)
+        assert j1["status"] == "succeeded", j1["error"]
+        assert j1["result"]["deployable"] is False and "deployment rights" in j1["result"]["evaluation_reason"]
+        c.post(f"/api/admin/orgs/{org['id']}/deployment", headers=h, json={"model": "royalty", "units": 10000})
+        j2 = wait_job(c, c.post("/api/projects", headers=hs, json=body).json()["job"]["id"], hs)
+        assert j2["result"]["deployable"] is True
+        pkg = c.get(f"/api/jobs/{j2['id']}/download/package.zip", headers=hs)
+        assert pkg.status_code == 200
+        pem = c.get("/api/signing/public-key").json()["public_key_pem"]
+        ok = commercial.verify_package(pkg.content, pem)
+        assert ok["ok"] and ok["meta"]["deployable"] is True and ok["meta"]["org"] == org["id"]
+        names = zipfile.ZipFile(__import__("io").BytesIO(pkg.content)).namelist()
+        assert "sai_package/EVALUATION_ONLY.txt" not in names
+        # tampering is detected
+        import io
+        src = zipfile.ZipFile(io.BytesIO(pkg.content))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w") as z:
+            for n in src.namelist():
+                data = src.read(n)
+                z.writestr(n, data + b"//" if n.endswith("sai_app.h") else data)
+        bad = commercial.verify_package(out.getvalue(), pem)
+        assert not bad["ok"] and any("sai_app.h" in p for p in bad["problems"])
+        # Standard plan: emulated boards yes, physical boards no
+        from backend import boards
+        boards.register("lab-phys", [{"id": "PHYS-1", "target": "cortex-m7"}])
+        assert c.post("/api/boards/runs", headers=hs, json={"job_id": j2["id"], "board_id": "PHYS-1"}).status_code == 402

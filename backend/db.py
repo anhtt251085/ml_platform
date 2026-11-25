@@ -57,6 +57,24 @@ MIGRATIONS: list[str] = [
     ALTER TABLE hil_runs ADD COLUMN org_id TEXT;
     CREATE INDEX jobs_queue_i ON jobs(status, priority, created);
     """,
+    # 3: M3 - board-farm measurements of exact programs (plan digest), the platform's `measured` evidence
+    """
+    CREATE TABLE measurements (target TEXT, plan_digest TEXT, cycles INTEGER, stack_painted INTEGER, board TEXT,
+                               run_id TEXT, created REAL);
+    CREATE INDEX measurements_i ON measurements(target, plan_digest);
+    """,
+    # 4: M4 - board health, nightly regression results
+    """
+    ALTER TABLE boards ADD COLUMN fail_count INTEGER DEFAULT 0;
+    ALTER TABLE boards ADD COLUMN health TEXT;
+    CREATE TABLE regressions (run_id TEXT, template TEXT, size TEXT, target TEXT, ram INTEGER, flash INTEGER,
+                              cycles INTEGER, feasible INTEGER, hil_match INTEGER, sai_version TEXT, created REAL);
+    CREATE INDEX regressions_i ON regressions(template, size, target, created);
+    """,
+    # 5: review fixes - platform settings (queue pause shared by every worker process)
+    """
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+    """,
 ]
 
 
@@ -72,18 +90,47 @@ def conn():
             c.close()
 
 
+def _statements(sql: str) -> list[str]:
+    return [x.strip() for x in sql.split(";") if x.strip()]
+
+
 def init():
+    """Apply pending migrations under an exclusive lock, each migration and its version bump in one transaction
+    (SQLite DDL is transactional): concurrent starters (API + workers) wait, a crash leaves no half schema."""
+    with _lock:
+        c = sqlite3.connect(config.DB_PATH, timeout=60, isolation_level=None)
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("BEGIN EXCLUSIVE")
+            try:
+                c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER)")
+                r = c.execute("SELECT version FROM schema_version").fetchone()
+                have = r[0] if r else 0
+                if not r:
+                    c.execute("INSERT INTO schema_version VALUES (0)")
+                for v, sql in enumerate(MIGRATIONS, start=1):
+                    if v > have:
+                        for stmt in _statements(sql):
+                            c.execute(stmt)
+                        c.execute("UPDATE schema_version SET version=?", (v,))
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        finally:
+            c.close()
+
+
+def get_setting(key: str, default=None):
     with conn() as c:
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER)")
-        r = c.execute("SELECT version FROM schema_version").fetchone()
-        have = r[0] if r else 0
-        if not r:
-            c.execute("INSERT INTO schema_version VALUES (0)")
-        for v, sql in enumerate(MIGRATIONS, start=1):
-            if v > have:
-                c.executescript(sql)
-                c.execute("UPDATE schema_version SET version=?", (v,))
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return uj(r[0]) if r else default
+
+
+def set_setting(key: str, value):
+    with conn() as c:
+        c.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (key, j(value)))
 
 
 def version() -> int:

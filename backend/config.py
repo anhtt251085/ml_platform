@@ -15,7 +15,9 @@ SAI_BIN = os.environ.get("SAI_BIN") or shutil.which("sai") or "sai"
 SAI_MD6605_GCC = os.environ.get("SAI_MD6605_GCC", "")
 SAI_CORTEX_M7_GCC = os.environ.get("SAI_CORTEX_M7_GCC", "")
 HOST_CC = os.environ.get("CC", "gcc")
-MAX_UPLOAD_BYTES = int(os.environ.get("SAI_PLATFORM_MAX_UPLOAD", str(200 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.environ.get("SAI_PLATFORM_MAX_UPLOAD", str(2 * 1024 * 1024 * 1024)))
+# Uploads up to this size are parsed in the request (a few seconds); larger ones become an `ingest` job.
+INLINE_INGEST_BYTES = int(os.environ.get("SAI_PLATFORM_INLINE_INGEST", str(16 * 1024 * 1024)))
 
 # Deployment mode: "multi" = multi-tenant SaaS (SAI admins create customer orgs); "single" = one customer per
 # install (on-prem / customer VPC): one customer org, no org management.
@@ -30,8 +32,11 @@ WORKER_KINDS = [k for k in os.environ.get("SAI_PLATFORM_WORKER_KINDS", "").split
 SIM_BOARDS = os.environ.get("SAI_PLATFORM_SIM_BOARDS", "1") == "1"      # in-process simulated board agent
 AGENT_TOKEN = os.environ.get("SAI_PLATFORM_AGENT_TOKEN", "dev-agent-token")
 ALLOW_DEV_AGENT_TOKEN = os.environ.get("SAI_PLATFORM_ALLOW_DEV_AGENT_TOKEN", "0") == "1"
-COOKIE_SECURE = os.environ.get("SAI_PLATFORM_COOKIE_SECURE", "0") == "1"
+# auto (default): Secure cookie whenever the request came over HTTPS (behind a proxy: uvicorn --proxy-headers);
+# 1: always (HTTPS-only deployments); 0: never (not recommended).
+COOKIE_SECURE = os.environ.get("SAI_PLATFORM_COOKIE_SECURE", "auto").lower()
 BRAND_NAME = os.environ.get("SAI_PLATFORM_BRAND", "SAI Platform")         # white-label (M6)
+SIGNING_KEY = os.environ.get("SAI_PLATFORM_SIGNING_KEY", "")                # Ed25519 PEM; generated when unset
 
 
 def _git_sha() -> str:
