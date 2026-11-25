@@ -32,6 +32,8 @@ STAGES = {
     "rebuild": [("compile", "Recompile"), ("compare", "Compare with the original build")],
     "basetrain": [("data", "Prepare data"), ("train", "Train base weights"), ("save", "Store in the pool")],
     "ingest": [("ingest", "Parse and validate"), ("store", "Store dataset")],
+    "recommend": [("profile", "Profile the data"), ("generate", "Generate candidates"), ("cost", "SAI cost per board"),
+                  ("pick", "Recommend")],
     "regression": [("plans", "Pool x boards plan check"), ("hil", "Emulated HIL smoke"), ("compare", "Compare with last run")],
 }
 KINDS = tuple(STAGES)
@@ -253,7 +255,8 @@ def _run(jid: str, kind: str, params: dict):
         return
     try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
-         "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest}[kind](ctx, params)
+         "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest,
+         "recommend": run_recommend}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -327,8 +330,11 @@ def run_train(ctx: Ctx, p: dict):
     # 2 train ----------------------------------------------------------------------------------------------------
     ctx.stage("train")
     variants = []
+    custom = p.get("custom_variants") or {}
     for si, size in enumerate(sizes):
-        layers = tpl["variants"].get(size)
+        layers = custom.get(size) or tpl["variants"].get(size)
+        if size in custom:
+            ctx.log(f"size {size}: architecture from the recommender ({len(layers)} layers)")
         if not layers:
             continue
         try:
@@ -894,6 +900,31 @@ int sai_infer(const float *raw) {{
     {"return sai_app_argmax(output);" if pre["task"] == "classification" else "return 0; /* decode output[] with sai_app.h */"}
 }}
 """
+
+
+def run_recommend(ctx: Ctx, p: dict):
+    """Recommend an architecture for this dataset, boards and goal, costed exactly by SAI before any training."""
+    from . import recommend
+    tpl = get_template(p["template_id"])
+    task = tpl["task"]
+    X, y, labels, meta = data.load(p["dataset_id"])
+    pcfg = preprocess.normalize_cfg(p.get("preprocess"), meta, X.shape[1:], task)
+    X = preprocess.window_ops(X, pcfg)
+    rate = (tpl.get("input") or {}).get("sample_rate_hz")
+    if rate and pcfg.get("decimate", 1) > 1:
+        rate = rate / pcfg["decimate"]
+    n_out = len(labels) if task == "classification" else 1 if task == "regression" else int(np.prod(X.shape[1:]))
+    targets = [t for t in p.get("targets") or tpl.get("targets") or list(sai_engine.MCU_TARGETS) if t in sai_engine.MCU_TARGETS]
+    ctx.log(f"dataset {meta.get('name')}: {len(X)} windows, input {list(X.shape[1:])}; boards {', '.join(targets)}; "
+            f"goal {p.get('goal', 'balanced')}")
+    res = recommend.recommend(X, y, task, labels, tpl, n_out, p.get("goal", "balanced"), targets, p.get("budgets"),
+                              ctx.dir, sample_rate_hz=rate, n_train=int(round(len(X) * pcfg["split"]["train"])),
+                              max_candidates=int(p.get("max_candidates") or 8), calibration=boards_mod.calibration(),
+                              measurements=boards_mod.measurements(), log=ctx.log, cancelled=ctx.cancelled,
+                              stage=ctx.stage)
+    rec = res["recommended"]
+    ctx.log(f"recommended {rec['id']}: {res['why']}" if rec else res["why"])
+    ctx.result(_finite(res))
 
 
 def run_ingest(ctx: Ctx, p: dict):
