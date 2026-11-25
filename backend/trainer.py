@@ -15,26 +15,39 @@ torch.set_num_threads(2)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")    # GPU workers train on CUDA
 
 
-def split(y, task, seed=0, frac=(0.7, 0.15, 0.15), groups=None):
-    """Train/val/test indices. With recording groups, whole recordings go to one split (no window from a test
-    recording is ever seen in training), stratified by each recording's majority class; a class with fewer than
-    3 recordings falls back to a window-level split for that class (reported in `split_mode`)."""
+def split(y, task, seed=0, frac=(0.7, 0.15, 0.15), groups=None, mode="auto"):
+    """Train/val/test indices.
+
+    With recording groups (and mode "auto"), every recording goes to exactly one split, so no window of a test
+    recording is ever seen in training, even when a recording holds several classes. Recordings are stratified by
+    their majority class (regression: one stratum). A stratum with fewer than 3 recordings cannot be split by
+    recording; its windows are split at window level and `split_mode` reports "mixed".
+    """
     rng = np.random.default_rng(seed)
+    n = len(y)
     idx = {"train": [], "val": [], "test": []}
-    idx_mode = []
-    keys = [None] if task == "regression" else list(np.unique(y))
-    for k in keys:
-        members = np.arange(len(y)) if k is None else np.where(y == k)[0]
-        gs = None if groups is None else groups[members]
-        uniq = [] if gs is None else list(dict.fromkeys(gs.tolist()))
-        if gs is not None and len(uniq) >= 3 and len(uniq) < len(members):
-            order = rng.permutation(len(uniq))
-            sizes = {g: 0 for g in uniq}
-            for g in gs.tolist():
-                sizes[g] += 1
-            total, acc, parts = len(members), 0, {"train": [], "val": [], "test": []}
-            for i, oi in enumerate(order):
-                g = uniq[oi]
+    modes = []
+    use_groups = groups is not None and mode != "window" and len(set(np.asarray(groups).tolist())) < n
+    if use_groups:
+        groups = np.asarray(groups)
+        members: dict = {}
+        for i, g in enumerate(groups.tolist()):
+            members.setdefault(g, []).append(i)
+        strata: dict = {}
+        for g, ix in members.items():
+            key = None if task == "regression" else int(np.bincount(np.asarray(y[ix], dtype=int)).argmax())
+            strata.setdefault(key, []).append(g)
+        for key, glist in strata.items():
+            if len(glist) < 3:                         # too few recordings: window-level for this stratum
+                ix = rng.permutation([i for g in glist for i in members[g]])
+                a_, b_ = int(len(ix) * frac[0]), int(len(ix) * (frac[0] + frac[1]))
+                idx["train"] += list(ix[:a_]); idx["val"] += list(ix[a_:b_]); idx["test"] += list(ix[b_:])
+                modes.append("window")
+                continue
+            order = [glist[i] for i in rng.permutation(len(glist))]
+            total = sum(len(members[g]) for g in order)
+            acc, parts = 0, {"train": [], "val": [], "test": []}
+            for i, g in enumerate(order):
                 left = len(order) - i
                 if not parts["test"] and left == 1:
                     dest = "test"
@@ -43,28 +56,31 @@ def split(y, task, seed=0, frac=(0.7, 0.15, 0.15), groups=None):
                 else:
                     dest = "train" if acc < frac[0] * total else "val" if acc < (frac[0] + frac[1]) * total else "test"
                 parts[dest].append(g)
-                acc += sizes[g]
-            for dest, glist in parts.items():
-                gset = set(glist)
-                idx[dest] += [int(m) for m, g in zip(members, gs.tolist()) if g in gset]
-            idx_mode.append("recording")
-        else:
-            g = rng.permutation(members)
-            a, b = int(len(g) * frac[0]), int(len(g) * (frac[0] + frac[1]))
-            idx["train"] += list(g[:a]); idx["val"] += list(g[a:b]); idx["test"] += list(g[b:])
-            idx_mode.append("window")
+                acc += len(members[g])
+            for dest, gl in parts.items():
+                for g in gl:
+                    idx[dest] += members[g]
+            modes.append("recording")
+    else:
+        keys = [None] if task == "regression" else list(np.unique(y))
+        for k in keys:
+            ix = rng.permutation(np.arange(n) if k is None else np.where(y == k)[0])
+            a_, b_ = int(len(ix) * frac[0]), int(len(ix) * (frac[0] + frac[1]))
+            idx["train"] += list(ix[:a_]); idx["val"] += list(ix[a_:b_]); idx["test"] += list(ix[b_:])
+            modes.append("window")
     if task == "anomaly":                    # the autoencoder learns normal only; anomalies are for evaluation
         idx["train"] = [i for i in idx["train"] if y[i] == 0]
         idx["val"] = [i for i in idx["val"] if y[i] == 0]
-    out = {k: np.array(v, dtype=int) for k, v in idx.items()}
-    out["split_mode"] = "recording" if all(m == "recording" for m in idx_mode) else \
-        "mixed" if "recording" in idx_mode else "window"
+    out = {k: np.array(sorted(v), dtype=int) for k, v in idx.items()}
+    out["split_mode"] = "recording" if modes and all(m == "recording" for m in modes) else \
+        "mixed" if "recording" in modes else "window"
     return out
 
 
 def norm_stats(X):
     mean = X.mean(axis=(0, 2, 3), keepdims=True)
-    std = X.std(axis=(0, 2, 3), keepdims=True) + 1e-6
+    std = X.std(axis=(0, 2, 3), keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)          # a constant channel carries no information: do not blow it up
     return mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -75,7 +91,7 @@ def build_spec(layers, X, task, n_labels):
 
 
 def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500, log=lambda m: None, progress=lambda p: None,
-          cancelled=lambda: False, y_stats=None, net=None):
+          cancelled=lambda: False, y_stats=None, net=None, augment=None, class_weights=True):
     torch.manual_seed(0)
     net = (net if net is not None else archspec.SpecNet(spec)).to(DEVICE)
     n_train = len(idx["train"])
@@ -89,6 +105,8 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
     if task == "classification":
         counts = np.bincount(y[idx["train"]], minlength=spec["outputs"]).astype(np.float32)
         w = torch.tensor(np.where(counts > 0, counts.sum() / np.maximum(counts, 1) / len(counts), 0), dtype=torch.float32)
+        if not class_weights:
+            w = torch.ones_like(w)
         loss_fn = nn.CrossEntropyLoss(weight=w.to(DEVICE))
         yt = torch.from_numpy(y.astype(np.int64)).to(DEVICE)
     elif task == "regression":
@@ -108,8 +126,14 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
         for s in range(0, len(perm), batch):
             b = perm[s:s + batch]
             xb = Xt[b]
-            if task != "anomaly":            # light augmentation: gain jitter
-                xb = xb * (1 + 0.05 * torch.randn(len(b), 1, 1, 1, device=DEVICE))
+            if task != "anomaly":            # augmentation (training only): gain jitter, noise, time shift
+                aug = augment if augment is not None else {"gain": 0.05, "noise": 0.0, "shift": 0}
+                if aug.get("gain"):
+                    xb = xb * (1 + aug["gain"] * torch.randn(len(b), 1, 1, 1, device=DEVICE))
+                if aug.get("noise"):
+                    xb = xb + aug["noise"] * torch.randn_like(xb)
+                if aug.get("shift"):
+                    xb = torch.roll(xb, int(np.random.default_rng(ep * 100003 + s).integers(-aug["shift"], aug["shift"] + 1)), dims=3)
             opt.zero_grad()
             loss = loss_fn(net(xb), yt[b])
             loss.backward()
@@ -121,7 +145,7 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
         with torch.no_grad():
             vl = float(loss_fn(net(Xt[idx["val"]]), yt[idx["val"]]))
         if not math.isfinite(vl):
-            log(f"  diverged at epoch {ep + 1}; keeping the last good weights")
+            log(f"  diverged at epoch {ep + 1}" + ("; keeping the best weights so far" if best_state else ""))
             break
         history.append({"epoch": ep + 1, "train_loss": round(tot / max(len(perm), 1), 5), "val_loss": round(vl, 5)})
         progress((ep + 1) / epochs)
@@ -135,8 +159,10 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
                 log(f"  early stop at epoch {ep + 1}")
                 break
     net = net.cpu()
-    if best_state is not None:
-        net.load_state_dict(best_state)
+    if best_state is None:
+        raise ValueError("training produced no finite validation loss (check the data for extreme values, or use "
+                         "more data / a smaller learning rate)")
+    net.load_state_dict(best_state)
     net.eval()
     net.best_val = best
     return net, history
@@ -190,15 +216,17 @@ def metrics(task, y_true, out, labels, y_stats=None, x_flat=None, threshold=None
     flag = err > threshold
     tpr = float(flag[y_true == 1].mean()) if (y_true == 1).any() else None
     fpr = float(flag[y_true == 0].mean()) if (y_true == 0).any() else None
-    return {"auc": round(auc, 4), "threshold": round(float(threshold), 6),
+    auc = None if auc is None else round(auc, 4)
+    return {"auc": auc, "threshold": round(float(threshold), 6),
             "detection_rate": None if tpr is None else round(tpr, 4),
-            "false_alarm_rate": None if fpr is None else round(fpr, 4), "headline": "auc", "value": round(auc, 4)}
+            "false_alarm_rate": None if fpr is None else round(fpr, 4), "headline": "auc", "value": auc,
+            "note": None if auc is not None else "no anomalies in the test split: AUC undefined"}
 
 
 def _auc(score, y):
     pos, neg = score[y == 1], score[y == 0]
     if not len(pos) or not len(neg):
-        return float("nan")
+        return None
     order = np.argsort(np.concatenate([pos, neg]))
     ranks = np.empty(len(order)); ranks[order] = np.arange(1, len(order) + 1)
     return float((ranks[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))

@@ -20,6 +20,15 @@ uint32_t port_cycles(void) {
     return v;
 }
 
+void port_quiet(int on) { (void)on; }
+const char *port_config(void) { return "clock=emulated icache=0 dcache=0"; }
+
+void port_trap(void) {             /* any exception: say so instead of hanging until the runner's timeout */
+    const char *m = "DONE trap\n";
+    while (*m) port_putc(*m++);
+    port_exit(3);
+}
+
 void port_exit(int code) {
     TEST_DEV = code ? ((uint32_t)code << 16) | 0x3333u : 0x5555u;
     for (;;) {}

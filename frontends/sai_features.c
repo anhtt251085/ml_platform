@@ -3,6 +3,12 @@
 
 #include <math.h>
 
+/* No fused multiply-add: the FFT and filterbank must round like the training build (which uses -ffp-contract=off).
+   GCC ignores `#pragma STDC FP_CONTRACT`, so use its own pragma. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize("fp-contract=off")
+#endif
+
 #define SAI_PI 3.14159265358979323846f
 
 static int is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }

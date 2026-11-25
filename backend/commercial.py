@@ -34,8 +34,9 @@ DEPLOYMENT_MODELS = ("none", "royalty", "buyout")
 
 
 def _month_start() -> float:
+    import calendar
     t = time.gmtime()
-    return time.mktime((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+    return float(calendar.timegm((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, 0)))
 
 
 def plan_of(u: dict) -> dict:
@@ -129,10 +130,15 @@ def _key():
     d.mkdir(parents=True, exist_ok=True)
     path = Path(config.SIGNING_KEY) if config.SIGNING_KEY else d / "platform_ed25519.pem"
     if not path.exists():
-        k = Ed25519PrivateKey.generate()
-        path.write_bytes(k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                         serialization.NoEncryption()))
-        path.chmod(0o600)
+        import os
+        pem = Ed25519PrivateKey.generate().private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                         serialization.NoEncryption())
+        try:       # O_EXCL: two processes starting together keep one key; 0600 from the first byte
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(pem)
+        except FileExistsError:
+            time.sleep(0.2)                # the other process is writing it
     return serialization.load_pem_private_key(path.read_bytes(), password=None)
 
 
@@ -167,6 +173,11 @@ def verify_package(zip_bytes: bytes, public_pem: str) -> dict:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import serialization
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    allnames = [n for n in z.namelist() if not n.endswith("/")]
+    if len(allnames) != len(set(allnames)):
+        return {"ok": False, "problems": ["duplicate entry names (ambiguous archive)"], "meta": {}}
+    if any(not n.startswith("sai_package/") or ".." in n.split("/") for n in allnames):
+        return {"ok": False, "problems": ["entries outside sai_package/"], "meta": {}}
     sig = json.loads(z.read("sai_package/SIGNATURE.json"))
     pub = serialization.load_pem_public_key(public_pem.encode())
     problems = []
