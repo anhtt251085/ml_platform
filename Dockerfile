@@ -1,6 +1,7 @@
 # SAI Platform image: API + workers + MCU toolchains.
-#   docker build --build-context sai=/path/to/mcu_edge_ai -t sai-platform .
-# The SAI compiler is a separate build context, so its source never enters this repository.
+#   docker build -t sai-platform .
+# The image contains no SAI compiler code. At run time the SAI repository checkout is mounted read-only at
+# /opt/sai (SAI_REPO=/opt/sai, see docker-compose.yml) and bin/sai runs the compiler in place from there.
 # Behind a TLS-inspecting proxy (corporate networks, on-prem installs): add
 #   --secret id=extra_ca,src=/path/to/proxy-ca.crt --build-arg https_proxy=... --network host
 FROM python:3.12-slim-bookworm
@@ -29,9 +30,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
-
-# Bind-mounted for the install only: the SAI source never lands in an image layer.
-RUN --mount=type=bind,from=sai,target=/opt/sai-src,rw pip install --no-cache-dir /opt/sai-src && sai version
 
 COPY . .
 ARG SAI_PLATFORM_VERSION=dev

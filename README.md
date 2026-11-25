@@ -19,9 +19,11 @@ boards today) and calibrates latency from real measurements.
 
 ```bash
 export SAI_PLATFORM_ADMIN_PASSWORD='choose-a-strong-one'
-SAI_SRC=/path/to/mcu_edge_ai docker compose up -d --build        # http://localhost:8000
+SAI_REPO=/path/to/sai-compiler-checkout docker compose up -d --build     # http://localhost:8000
 ```
 
+* The image contains no SAI compiler code: the checkout is mounted read-only at run time and the compiler runs in
+  place from it (`bin/sai`).
 * `SAI_PLATFORM_MODE=multi` (default): multi-tenant SaaS. SAI admins create customer organisations and invite users
   (no public sign-up).
 * `SAI_PLATFORM_MODE=single SAI_PLATFORM_ORG_NAME="Acme"`: one customer per install (on-prem / customer VPC).
@@ -43,7 +45,8 @@ SAI_SRC=/path/to/mcu_edge_ai docker compose up -d --build        # http://localh
 ```bash
 python -m venv venv && . venv/bin/activate
 pip install -r requirements.txt
-pip install /path/to/a/copy/of/mcu_edge_ai      # the SAI compiler (`sai` CLI); install from a copy, not the checkout
+export SAI_REPO=/path/to/sai-compiler-checkout  # the SAI compiler runs in place from its own checkout (bin/sai);
+                                                 # nothing is installed or copied from it
 # optional MCU toolchains (exact flash + proven stack):
 #   Arm:   apt install gcc-arm-none-eabi libnewlib-arm-none-eabi
 #   RV32:  export SAI_MD6605_GCC=/opt/xpack/.../bin/riscv-none-elf-gcc   (xPack 13.2.0-2; the Ubuntu-picolibc
@@ -55,11 +58,14 @@ export SAI_PLATFORM_ADMIN_PASSWORD='dev-password-1'   # first start creates admi
 Tests: `SAI_PLATFORM_DATA=$(mktemp -d) pytest -q tests` (21 tests, about 25 s, the end-to-end one included;
 without the `sai` CLI the 3 compiler tests skip).
 
-CI (`.github/workflows/tests.yml`) runs on every push and pull request:
-* **unit**: no SAI, always runs.
-* **full**: installs SAI from `anhtt251085/mcu_edge_ai` plus the Arm and RISC-V toolchains and runs everything.
-  It needs a repository secret `SAI_REPO_TOKEN` (fine-grained token, read-only *Contents* on `mcu_edge_ai`);
-  without it the job skips with a notice.
+CI (`.github/workflows/tests.yml`, public) runs on every push and pull request and **never checks out, installs
+or downloads the SAI compiler**:
+* **unit**: Python tests; SAI-dependent tests skip.
+* **toolchains**: the same with the Arm and RISC-V toolchains and QEMU (firmware ports, C front ends).
+* **docker**: builds the image, checks it starts, and checks it contains no SAI code.
+
+The SAI-dependent tests and the pool x board regression run on a machine with the SAI checkout:
+`SAI_REPO=/path/to/sai-compiler-checkout tools/full_check.sh` (it also confirms the checkout was left untouched).
 
 ## Layout
 
@@ -137,7 +143,7 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * **Physical boards**: NUCLEO-H753ZI (PLL1 at 480 MHz on rev V / 400 MHz on rev Y, caches on, USART3 + DWT) and
   MD6605 EVB ports link in CI; the harness reports the clock it ran at and only reference-clock runs calibrate; lab agent drivers for pyOCD
   and J-Link, uhubctl power cycling, health reporting, quarantine after 3 failures.
-* **Nightly regression** of the whole pool on every board (`python -m backend.regression`, nightly workflow).
+* **Nightly regression** of the whole pool on every board (`python -m backend.regression`, or `tools/full_check.sh` on a machine with the SAI checkout).
 * Protocol and ports: `docs/BOARD_AGENT_PROTOCOL.md`.
 
 ## Compiler integration (M3)
@@ -150,7 +156,6 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
   that produces the same program shows that measurement instead of an estimate.
 * **SAI contract tests** (`tests/test_sai_contract.py`) pin the JSON fields and schema versions the platform reads;
   newer schemas surface as compatibility warnings on the Compiler & targets page.
-* `tools/sai_findings_repro.sh` reproduces the open SAI findings (issue #9) for upstream.
 
 ## Data & training (M2)
 

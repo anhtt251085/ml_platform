@@ -14,7 +14,7 @@ import pytest  # noqa: E402
 
 from backend import archspec, qexport, sai_engine  # noqa: E402
 
-pytestmark = pytest.mark.skipif(shutil.which(os.environ.get("SAI_BIN", "sai")) is None, reason="sai CLI not installed")
+pytestmark = pytest.mark.skipif(not sai_engine.available(), reason="no SAI compiler (set SAI_REPO)")
 
 
 @pytest.fixture(scope="module")

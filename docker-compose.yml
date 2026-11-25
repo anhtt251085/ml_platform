@@ -1,4 +1,5 @@
-# docker compose up -d   (set SAI_SRC to a checkout of mcu_edge_ai; default ../mcu_edge_ai)
+# docker compose up -d --build   (SAI_REPO = your SAI compiler checkout, default ../mcu_edge_ai; it is mounted
+# read-only and the compiler runs in place from it - nothing from it is copied into the image)
 # SaaS:     SAI_PLATFORM_MODE=multi  (default) - SAI admins create customer organisations
 # On-prem:  SAI_PLATFORM_MODE=single SAI_PLATFORM_ORG_NAME="Acme" - one customer per install
 x-common: &common
@@ -10,8 +11,10 @@ x-common: &common
     SAI_PLATFORM_ADMIN_PASSWORD: ${SAI_PLATFORM_ADMIN_PASSWORD:?set an admin password}
     SAI_PLATFORM_SIM_BOARDS: ${SAI_PLATFORM_SIM_BOARDS:-1}
     SAI_PLATFORM_COOKIE_SECURE: ${SAI_PLATFORM_COOKIE_SECURE:-auto}    # Secure whenever served over HTTPS
+    SAI_REPO: /opt/sai
   volumes:
     - platform-data:/data
+    - ${SAI_REPO:-../mcu_edge_ai}:/opt/sai:ro
   restart: unless-stopped
 
 services:
@@ -19,8 +22,6 @@ services:
     <<: *common
     build:
       context: .
-      additional_contexts:
-        sai: ${SAI_SRC:-../mcu_edge_ai}
     environment:
       <<: *env
       SAI_PLATFORM_INPROC_WORKERS: "0"          # jobs run in the worker service
