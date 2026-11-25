@@ -375,3 +375,79 @@ def test_pool_benchmark_leaderboard_and_permissions():
         dm = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 30}, headers=hm).json()
         assert c.post("/api/projects", headers=hm, json={"name": "x", "template_id": "gas-sense", "dataset_id": dm["id"],
                                                           "pool_benchmark": True}).status_code == 403
+
+
+# ---- M6: commercial ---------------------------------------------------------------------------------------------
+def _org_user(c, h, name, tier, email):
+    org = c.post("/api/admin/orgs", json={"name": name, "tier": tier}, headers=h).json()
+    r = c.post("/api/admin/users", headers=h, json={"email": email, "name": "U", "role": "org_admin",
+                                                     "password": "password-1", "org_id": org["id"]})
+    assert r.status_code == 200, r.text
+    return org, login(c, email, "password-1")
+
+
+def test_free_plan_limits_and_branding():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as c:
+        h = login(c)
+        org, hf = _org_user(c, h, "Hooli", "free", "a@hooli.test")
+        me = c.get("/api/me", headers=hf).json()
+        assert me["plan"]["tier"] == "free" and me["deployment"]["model"] == "none"
+        ds = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 30}, headers=hf).json()
+        body = {"name": "p", "template_id": "gas-sense", "dataset_id": ds["id"], "sizes": ["tiny"], "epochs": 1}
+        jobs = [c.post("/api/projects", headers=hf, json=body) for _ in range(4)]
+        assert [r.status_code for r in jobs] == [200, 200, 200, 402]          # 3 projects / month on Free
+        jid = jobs[0].json()["job"]["id"]
+        assert c.post("/api/boards/runs", headers=hf, json={"job_id": jid}).status_code == 402
+        for r in jobs[:3]:                                                     # do not leave work in the queue
+            c.post(f"/api/jobs/{r.json()['job']['id']}/cancel", headers=hf)
+        b = c.put("/api/org/brand", headers=hf, json={"product_name": "Hooli Edge", "accent": "#aa3300", "logo_text": "H"})
+        assert b.json() == {"product_name": "Hooli Edge", "accent": "#aa3300", "logo_text": "H"}
+        assert c.get("/api/me", headers=hf).json()["brand"]["product_name"] == "Hooli Edge"
+        assert "public_key_pem" in c.get("/api/signing/public-key").json()
+
+
+@need_sai
+def test_deployment_rights_signature_and_package_gate():
+    import zipfile
+    from fastapi.testclient import TestClient
+    from backend import commercial
+    from backend.app import app
+    with TestClient(app) as c:
+        h = login(c)
+        org, hs = _org_user(c, h, "Stark Motors", "standard", "a@stark.test")
+        rows = ["v_out,i_l,label,segment"] + [f"{12 + (i % 7) * 0.01},{2 + (s % 3)},{['normal', 'short', 'overload'][s % 3]},{s}"
+                                              for s in range(9) for i in range(300)]
+        up = c.post("/api/datasets/upload", headers=hs, data={"template_id": "dcdc-fault", "licence": "proprietary",
+                                                              "window": "64", "hop": "64"},
+                    files={"file": ("log.csv", "\n".join(rows).encode(), "text/csv")}).json()
+        body = {"name": "p", "template_id": "dcdc-fault", "dataset_id": up["id"], "sizes": ["tiny"], "epochs": 2,
+                "targets": ["cortex-m7"]}
+        j1 = wait_job(c, c.post("/api/projects", headers=hs, json=body).json()["job"]["id"], hs)
+        assert j1["status"] == "succeeded", j1["error"]
+        assert j1["result"]["deployable"] is False and "deployment rights" in j1["result"]["evaluation_reason"]
+        c.post(f"/api/admin/orgs/{org['id']}/deployment", headers=h, json={"model": "royalty", "units": 10000})
+        j2 = wait_job(c, c.post("/api/projects", headers=hs, json=body).json()["job"]["id"], hs)
+        assert j2["result"]["deployable"] is True
+        pkg = c.get(f"/api/jobs/{j2['id']}/download/package.zip", headers=hs)
+        assert pkg.status_code == 200
+        pem = c.get("/api/signing/public-key").json()["public_key_pem"]
+        ok = commercial.verify_package(pkg.content, pem)
+        assert ok["ok"] and ok["meta"]["deployable"] is True and ok["meta"]["org"] == org["id"]
+        names = zipfile.ZipFile(__import__("io").BytesIO(pkg.content)).namelist()
+        assert "sai_package/EVALUATION_ONLY.txt" not in names
+        # tampering is detected
+        import io
+        src = zipfile.ZipFile(io.BytesIO(pkg.content))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w") as z:
+            for n in src.namelist():
+                data = src.read(n)
+                z.writestr(n, data + b"//" if n.endswith("sai_app.h") else data)
+        bad = commercial.verify_package(out.getvalue(), pem)
+        assert not bad["ok"] and any("sai_app.h" in p for p in bad["problems"])
+        # Standard plan: emulated boards yes, physical boards no
+        from backend import boards
+        boards.register("lab-phys", [{"id": "PHYS-1", "target": "cortex-m7"}])
+        assert c.post("/api/boards/runs", headers=hs, json={"job_id": j2["id"], "board_id": "PHYS-1"}).status_code == 402

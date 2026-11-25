@@ -422,7 +422,8 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     const sel = r.selected, v = r.variants.find((x) => x.size === sel.size), task = r.template.task;
     const mt = (m) => task === "classification" ? pct(m.value) : fmt(m.value, 3);
     $("#res").innerHTML = `
-    ${r.deployable === false ? `<div class="callout bad" style="margin-top:16px"><b>Evaluation only.</b> The dataset licence (${esc(r.dataset.licence)}) does not allow commercial use; the package carries an EVALUATION_ONLY marker and a compile-time warning.</div>` : ""}
+    ${r.deployable === false ? `<div class="callout bad" style="margin-top:16px"><b>Evaluation only:</b> ${esc(r.evaluation_reason || "dataset licence")}. The package carries an EVALUATION_ONLY marker and a compile-time warning.</div>` : ""}
+    ${r.signature ? `<p class="small muted" style="margin-top:10px">Package signed (Ed25519, key <code>${esc(r.signature.key_id)}</code>); verify with <code>tools/verify_package.py</code> and <code>/api/signing/public-key</code>.</p>` : ""}
     ${r.split_mode ? `<p class="small muted" style="margin-top:10px">Test split: ${r.split_mode === "recording" ? "whole recordings held out (no leakage between windows of one recording)" : r.split_mode === "mixed" ? "recordings where available, windows elsewhere" : "random windows (no recording information in the data)"}.</p>` : ""}
     ${r.dataset.synthetic ? `<div class="callout" style="margin-top:16px">Trained on <b>synthetic demo data</b>. The pipeline, plans and resource numbers are real; the accuracy is not a field accuracy.</div>` : ""}
     <div class="hero" style="margin-top:16px">
@@ -724,6 +725,32 @@ route(/^\/system$/, async (el) => {
   <h3 style="margin-top:14px">Evidence labels</h3><div class="tbl-wrap"><table class="t"><tbody>${Object.entries(EVIDENCE).map(([k]) => `<tr><td>${ev(k)}</td><td class="small">${esc(EVIDENCE[k][2])}</td></tr>`).join("")}</tbody></table></div></div></div>`;
 });
 
+/* ------------------------------------------------------------------------------------------------ plan & usage */
+route(/^\/plan$/, async (el) => {
+  const d = await api("/api/plan");
+  const bar = (used, max) => max === null || max === undefined ? `<span class="small muted">${fmt(used)} used · unlimited</span>` : `<div class="row small"><div class="progress" style="flex:1;height:10px"><i style="width:${Math.min(100, used / Math.max(max, 1) * 100)}%"></i></div><span class="mono">${fmt(used)} / ${fmt(max)}</span></div>`;
+  const yes = (v) => v ? `<span class="badge b-ok">✓</span>` : `<span class="muted">—</span>`;
+  el.innerHTML = `<div class="page-h"><div><h1>Plan &amp; usage</h1><p class="muted">${esc(ME.org.name)} is on the <b>${esc(d.plan.label)}</b> plan.</p></div></div>
+  <div class="grid g2"><div class="card"><h2>This month</h2><div class="stack">
+      <div><div class="small muted">Projects</div>${bar(d.usage.projects, d.plan.projects_per_month)}</div>
+      <div><div class="small muted">Board-farm runs</div>${bar(d.usage.farm_runs, d.plan.farm_runs_per_month)}</div></div>
+      <h3 style="margin-top:14px">Metered (all time)</h3><p class="small">${Object.entries(d.metered).map(([k, v]) => `${esc(k)}: ${fmt(v.qty, 1)}`).join(" · ") || "–"}</p></div>
+    <div class="card"><h2>Deployment rights</h2>
+      ${d.deployment.model === "none" ? `<div class="callout">No deployment rights yet: packages are <b>evaluation only</b> (marker file, compile-time warning). Production deployment is licensed per unit (royalty) or as a buyout — contact your SAI representative.</div>` : `<div class="callout ok">Deployment licensed: <b>${esc(d.deployment.model)}</b>${d.deployment.units ? `, ${fmt(d.deployment.units)} units` : ""}. Packages trained on commercially licensed data are production packages.</div>`}
+      ${ME.perms.org_admin ? `<h3 style="margin-top:14px">Branding</h3><div class="grid g3"><label class="f">Product name<input id="bn" value="${esc((ME.brand || {}).product_name || "")}"></label><label class="f">Accent colour<input id="ba" type="color" value="${esc((ME.brand || {}).accent || "#2f5bea")}"></label><label class="f">Logo letters<input id="bl" maxlength="2" value="${esc((ME.brand || {}).logo_text || "")}"></label></div><div class="row" style="margin-top:8px"><button class="btn" id="bs">Save branding</button></div>` : ""}</div></div>
+  <div class="card" style="margin-top:16px"><h2>Plans</h2><div class="tbl-wrap"><table class="t"><thead><tr><th></th>${Object.values(d.plans).map((p) => `<th>${esc(p.label)}</th>`).join("")}</tr></thead><tbody>
+    <tr><td class="muted">For</td>${Object.values(d.plans).map((p) => `<td class="small">${esc(p.summary)}</td>`).join("")}</tr>
+    <tr><td class="muted">Projects / month</td>${Object.values(d.plans).map((p) => `<td>${p.projects_per_month === null ? "unlimited" : p.projects_per_month}</td>`).join("")}</tr>
+    <tr><td class="muted">Package downloads</td>${Object.values(d.plans).map((p) => `<td>${yes(p.packages)}</td>`).join("")}</tr>
+    <tr><td class="muted">Board farm</td>${Object.values(d.plans).map((p) => `<td>${p.farm === "none" ? "—" : p.farm === "emulated" ? "emulated boards" : "emulated + physical (measured)"}</td>`).join("")}</tr>
+    <tr><td class="muted">Farm runs / month</td>${Object.values(d.plans).map((p) => `<td>${p.farm_runs_per_month || "—"}</td>`).join("")}</tr>
+    <tr><td class="muted">Queue priority</td>${Object.values(d.plans).map((p) => `<td>${p.priority ? "priority" : "standard"}</td>`).join("")}</tr>
+    <tr><td class="muted">Support</td>${Object.values(d.plans).map((p) => `<td>${esc(p.support)}</td>`).join("")}</tr>
+  </tbody></table></div><p class="small muted" style="margin-top:8px">Prices and deployment royalties are quoted by SAI. Upgrades are applied by your SAI representative.</p></div>`;
+  const bs = $("#bs");
+  if (bs) bs.onclick = async () => { await api("/api/org/brand", { method: "PUT", json: { product_name: $("#bn").value, accent: $("#ba").value, logo_text: $("#bl").value } }); toast("Branding saved"); boot(); };
+});
+
 /* ------------------------------------------------------------------------------------------------ admin */
 route(/^\/admin$/, async (el) => {
   const m = ME;
@@ -737,11 +764,13 @@ route(/^\/admin$/, async (el) => {
     const box = $("#adm");
     if (tab === "orgs") {
       const orgs = await api("/api/admin/orgs");
-      box.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="t"><thead><tr><th>Organisation</th><th>Tier</th><th class="n">Users</th><th>Usage (all time)</th><th>Created</th></tr></thead><tbody>
+      box.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="t"><thead><tr><th>Organisation</th><th>Tier</th><th>Deployment rights</th><th class="n">Users</th><th>Usage (all time)</th><th>Created</th></tr></thead><tbody>
         ${orgs.map((o) => `<tr><td><b>${esc(o.name)}</b><div class="small muted mono">${esc(o.id)}</div></td><td>${m.perms.platform_admin ? `<select data-org="${esc(o.id)}">${["free", "standard", "professional"].map((t) => `<option ${t === o.tier ? "selected" : ""}>${t}</option>`).join("")}</select>` : esc(o.tier)}</td><td class="n">${o.users}</td>
+          <td>${m.perms.platform_admin ? `<select data-dep="${esc(o.id)}">${["none", "royalty", "buyout"].map((d) => `<option ${d === o.deployment.model ? "selected" : ""}>${d}</option>`).join("")}</select>` : esc(o.deployment.model)}</td><td class="n">${o.users}</td>
           <td class="small">${Object.entries(o.usage).map(([k, v]) => `${esc(k)}: ${fmt(v.qty, 1)}`).join(" · ") || "–"}</td><td class="muted">${ago(o.created)}</td></tr>`).join("")}</tbody></table></div>
         ${m.perms.platform_admin && m.mode !== "single" ? `<div class="row" style="margin-top:12px"><input id="on" placeholder="New customer organisation"><select id="ot"><option>free</option><option>standard</option><option selected>professional</option></select><button class="btn primary" id="oc">Create</button></div>` : ""}</div>`;
       $$("select[data-org]", box).forEach((x) => (x.onchange = async () => { await api(`/api/admin/orgs/${x.dataset.org}/tier`, { json: { tier: x.value } }); toast("Tier updated"); }));
+      $$("select[data-dep]", box).forEach((x) => (x.onchange = async () => { await api(`/api/admin/orgs/${x.dataset.dep}/deployment`, { json: { model: x.value } }); toast("Deployment rights updated"); }));
       if ($("#oc")) $("#oc").onclick = async () => { try { await api("/api/admin/orgs", { json: { name: $("#on").value, tier: $("#ot").value } }); toast("Organisation created"); draw(); } catch (e) { toast(e.message); } };
     }
     if (tab === "users") {
@@ -798,6 +827,10 @@ async function boot() {
   try { ME = await api("/api/me"); } catch { return; }
   document.body.classList.remove("signed-out");
   $$("[data-perm]").forEach((a) => (a.hidden = !a.dataset.perm.split("|").some((p) => ME.perms[p])));
+  const br = ME.brand || {};
+  if (br.accent) { document.documentElement.style.setProperty("--accent", br.accent); }
+  if (br.product_name) { document.title = br.product_name; const t = $(".brand span:last-child"); if (t) t.innerHTML = `<b>${esc(br.product_name)}</b><small>Edge AI for MCUs</small>`; }
+  if (br.logo_text) { const l = $(".brand .logo"); if (l) l.textContent = br.logo_text; }
   $("#sideFoot").innerHTML = `<div><b>${esc(ME.name)}</b></div><div>${esc(ME.org.name)} · <span class="badge b-acc">${esc(ME.org.tier)}</span></div><div>${esc(ME.role)}</div><a href="#" id="signout">Sign out</a><div id="sysline" style="margin-top:6px"></div>`;
   $("#signout").onclick = async (e) => { e.preventDefault(); await api("/api/auth/logout", { method: "POST" }); SYS = null; history.replaceState(null, "", "#/"); showLogin(); };
   try { const s = await system(); $("#sysline").textContent = `SAI ${s.sai.sai || "?"} · platform ${s.platform_version}`; } catch { /* shown per page */ }

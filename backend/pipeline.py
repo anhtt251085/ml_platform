@@ -438,9 +438,16 @@ def run_train(ctx: Ctx, p: dict):
            "output": v["q"]["output"], "task": task, "labels": labels, "y_stats": y_stats,
            "threshold": v["threshold"], "layout": "NCHW, 1-D signals as [1, C, 1, T]",
            "frontend": meta.get("frontend")}
-    deployable = bool(meta.get("commercial_use"))
+    from . import commercial
+    with db.conn() as c:
+        org_id = (c.execute("SELECT org_id FROM jobs WHERE id=?", (ctx.id,)).fetchone() or [None])[0]
+    rights = commercial.deployment_rights(org_id)
+    deployable = bool(meta.get("commercial_use")) and rights
+    eval_reason = None if deployable else (
+        f"dataset licence '{meta.get('licence')}' does not allow commercial use" if not meta.get("commercial_use")
+        else "the organisation has no SAI deployment rights yet (royalty or buyout)")
     if not deployable:
-        ctx.log(f"dataset licence '{meta.get('licence')}' does not allow commercial use: package is EVALUATION ONLY")
+        ctx.log(f"{eval_reason}: package is EVALUATION ONLY")
     (ctx.dir / "preprocessing.json").write_text(json.dumps(pre, indent=1))
     (ctx.dir / "sai_app.h").write_text(_app_header(pre, tpl, deployable))
     if meta.get("frontend"):
@@ -451,7 +458,7 @@ def run_train(ctx: Ctx, p: dict):
         "pool_benchmark": bool(p.get("pool_benchmark")),
         "dataset": {k: meta.get(k) for k in ("id", "name", "source", "n", "shape", "labels", "class_counts", "synthetic",
                                              "licence", "commercial_use", "recordings", "quality", "frontend")},
-        "deployable": deployable, "split_mode": idx["split_mode"],
+        "deployable": deployable, "evaluation_reason": eval_reason, "split_mode": idx["split_mode"],
         "goal": goal, "targets": targets, "budgets": p.get("budgets"), "metric_target": acc_target,
         "variants": [{"size": x["size"], "summary": {k: x["summary"][k] for k in ("macs", "params", "spatial_axes")},
                       "layers": x["summary"]["layers"], "spec": x["spec"], "float": x["float"], "int8": x["int8"],
@@ -476,11 +483,16 @@ def run_train(ctx: Ctx, p: dict):
             for f in ("sai_features.c", "sai_features.h"):
                 z.write(features.SRC / f, Path("sai_package") / "frontend" / f)
         if not deployable:
-            z.writestr("sai_package/EVALUATION_ONLY.txt", "Trained on data whose licence ("
-                       f"{meta.get('licence')}) does not allow commercial use. Not for deployment.\n")
+            z.writestr("sai_package/EVALUATION_ONLY.txt", f"Evaluation only: {eval_reason}. Not for deployment.\n")
+    sig = commercial.sign_package(ctx.dir / "package.zip", {
+        "job": ctx.id, "org": org_id, "deployable": deployable, "platform_version": config.PLATFORM_VERSION,
+        "sai_version": (man or {}).get("compiler_version"), "plan_digest": (man or {}).get("plan_digest"),
+        "target": chosen["target"]})
+    ctx.log(f"package signed (Ed25519, key {sig['key_id']})")
     ctx.log("package.zip ready")
     ctx.stage("package", "done")
     report["downloads"] = ["package.zip", "model.onnx", "report.json", "MODEL_CARD.md"]
+    report["signature"] = sig
     report["selected_model_path"] = str(v["onnx"])
     ctx.result(report)
 
@@ -856,8 +868,8 @@ def _model_card(r: dict, tpl: dict, meta: dict) -> str:
     sel = r["selected"]
     v = next(x for x in r["variants"] if x["size"] == sel["size"])
     synthetic = "**Trained on SYNTHETIC demo data - not valid for field use.**\n\n" if meta.get("synthetic") else ""
-    if not meta.get("commercial_use"):
-        synthetic += f"**EVALUATION ONLY: dataset licence `{meta.get('licence')}` does not allow commercial deployment.**\n\n"
+    if not r.get("deployable", True):
+        synthetic += f"**EVALUATION ONLY: {r.get('evaluation_reason')}.**\n\n"
     return f"""# Model card - {tpl['name']}
 
 {synthetic}| | |

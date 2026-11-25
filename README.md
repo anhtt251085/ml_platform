@@ -1,4 +1,4 @@
-# SAI Platform (v0.6: model pool program)
+# SAI Platform (v1.0: roadmap M1–M6)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -84,6 +84,18 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * Latency is a planning number until a real board measures the build. Simulated board runs are flagged and never
   enter calibration.
 * Synthetic demo data is labelled as synthetic in the dataset, the job page and the model card.
+
+## Commercial (M6)
+
+* **Plans**: Free (pool, fit check, estimates; 3 projects/month, no packages, no board farm), Standard (packages,
+  emulated board farm), Professional (physical boards with measured latency, priority queue). Quotas are enforced
+  (HTTP 402 with the reason); Plan & usage page per organisation. Prices are quoted by SAI, not in the software.
+* **Deployment rights** per organisation (none / royalty / buyout, set by SAI admins): without them — or with
+  data not licensed for commercial use — packages are evaluation-only.
+* **Signed packages**: every `package.zip` carries `SIGNATURE.json` (SHA-256 of every file + Ed25519 signature);
+  `tools/verify_package.py` + `/api/signing/public-key` detect any modification. Key: `SAI_PLATFORM_SIGNING_KEY`
+  (PEM) or generated on first start.
+* **White-label**: org admins set product name, accent colour and logo letters; installs set `SAI_PLATFORM_BRAND`.
 
 ## Model pool program (M5)
 
