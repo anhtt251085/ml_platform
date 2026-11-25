@@ -63,6 +63,14 @@ MIGRATIONS: list[str] = [
                                run_id TEXT, created REAL);
     CREATE INDEX measurements_i ON measurements(target, plan_digest);
     """,
+    # 4: M4 - board health, nightly regression results
+    """
+    ALTER TABLE boards ADD COLUMN fail_count INTEGER DEFAULT 0;
+    ALTER TABLE boards ADD COLUMN health TEXT;
+    CREATE TABLE regressions (run_id TEXT, template TEXT, size TEXT, target TEXT, ram INTEGER, flash INTEGER,
+                              cycles INTEGER, feasible INTEGER, hil_match INTEGER, sai_version TEXT, created REAL);
+    CREATE INDEX regressions_i ON regressions(template, size, target, created);
+    """,
 ]
 
 

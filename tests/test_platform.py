@@ -165,8 +165,8 @@ def test_api_end_to_end_with_board_run():
                 break
             time.sleep(1)
         assert rr["status"] == "succeeded" and rr["result"]["outputs_match"] is True
-        assert rr["result"]["simulated"] is True
-        # simulated runs never calibrate latency
+        assert rr["result"].get("simulated") or rr["result"].get("emulated")
+        # simulated and emulated runs never calibrate latency
         assert c.get("/api/boards").json()["calibration"] == {}
         # M1: provenance recorded and a rebuild is byte-identical
         prov = res["provenance"]

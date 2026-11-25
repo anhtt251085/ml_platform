@@ -17,6 +17,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import numpy as np
+
 from . import archspec, auth, boards, config, data, db, pipeline, sai_engine, store
 
 app = FastAPI(title=config.BRAND_NAME, version=config.PLATFORM_VERSION)
@@ -32,7 +34,8 @@ def _startup():
     if config.MODE == "single" and auth.org(SINGLE_ORG) is None:
         auth.create_org(config.SINGLE_ORG_NAME, "professional", SINGLE_ORG)
     if config.SIM_BOARDS and _started["sim"] is None:
-        _started["sim"] = boards.SimulatedAgent()
+        # emulated QEMU boards when the toolchains + QEMU exist (real firmware), else the simulated stand-in
+        _started["sim"] = boards.EmulatedAgent() if boards.EmulatedAgent.usable() else boards.SimulatedAgent()
         _started["sim"].start()
     if config.INPROC_WORKERS and not _started["workers"]:
         _started["workers"] = pipeline.start_inprocess_workers(config.INPROC_WORKERS)
@@ -571,7 +574,7 @@ def agent_register(body: dict, authorization: str | None = Header(None)):
 @app.post("/api/agent/poll")
 def agent_poll(body: dict, authorization: str | None = Header(None)):
     aid = auth.agent_from_token(authorization)
-    boards.heartbeat(aid)
+    boards.heartbeat(aid, body.get("health"))
     run = boards.claim(aid)
     if run:
         run["request"].pop("model_path", None)
@@ -595,7 +598,40 @@ def agent_package(rid: str, authorization: str | None = Header(None)):
     run = boards.get_run(rid)
     if not run or boards.board_agent(run["board_id"]) != aid:
         raise HTTPException(404, "unknown run")
+    bdir = Path(run["request"].get("build_dir") or "")
+    if bdir.is_dir() and config.DATA_DIR in bdir.resolve().parents:
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in sorted(bdir.rglob("*")):
+                if f.is_file():
+                    z.write(f, Path("sai_package") / f.relative_to(bdir))
+            z.writestr("sai_package/hil_vectors.json", json.dumps(
+                np.load(config.DATA_DIR / "jobs" / run["job_id"] / "hil_vectors.npz")["x"].tolist()))
+        return Response(buf.getvalue(), media_type="application/zip")
     return FileResponse(_file(run["job_id"], "package.zip"), media_type="application/zip")
+
+
+@app.post("/api/boards/{bid}/reset")
+def board_reset(bid: str, u: dict = Depends(auth.require("farm_admin"))):
+    boards.reset_board(bid)
+    auth.audit(u, "board_reset", bid)
+    return {"ok": True}
+
+
+@app.post("/api/admin/regression")
+def regression_start(body: dict, u: dict = Depends(auth.require("farm_admin"))):
+    j = pipeline.create("regression", {"templates": body.get("templates"), "hil": body.get("hil", True)},
+                        org_id=u["org_id"], user_id=u["id"], priority=-1)
+    auth.audit(u, "regression_requested", j["id"])
+    return j
+
+
+@app.get("/api/regressions")
+def regressions(u: dict = Depends(auth.current)):
+    from . import regression
+    return regression.summary()
 
 
 # ---- frontend ----------------------------------------------------------------------------------------------------

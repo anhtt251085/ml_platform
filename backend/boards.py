@@ -30,7 +30,8 @@ def register(agent_id: str, boards: list[dict], simulated: bool = False) -> list
             if b.get("target") not in sai_engine.TARGETS:
                 continue
             bid = b.get("id") or f"{agent_id}:{b.get('serial', uuid.uuid4().hex[:6])}"
-            c.execute("INSERT OR REPLACE INTO boards VALUES (?,?,?,?,?,?,?,?)",
+            c.execute("INSERT OR REPLACE INTO boards (id, name, target, agent_id, status, last_seen, simulated, info,"
+                      " fail_count, health) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
                       (bid, b.get("name", bid), b["target"], agent_id, "idle", db.now(), int(simulated),
                        db.j({k: v for k, v in b.items() if k not in ("id", "name", "target")})))
             out.append({"id": bid, "target": b["target"]})
@@ -43,9 +44,21 @@ def board_agent(board_id: str | None) -> str | None:
     return r[0] if r else None
 
 
-def heartbeat(agent_id: str):
+def heartbeat(agent_id: str, health: dict | None = None):
+    """health: {board_id: {"probe": "ok"|..., "temp_c": .., "note": ..}} reported by the agent each poll."""
     with db.conn() as c:
         c.execute("UPDATE boards SET last_seen=? WHERE agent_id=?", (db.now(), agent_id))
+        for bid, h in (health or {}).items():
+            c.execute("UPDATE boards SET health=? WHERE id=? AND agent_id=?", (db.j(h), bid, agent_id))
+
+
+def reset_board(board_id: str):
+    """Lab action after fixing a board: clear the failure count and put it back in service."""
+    with db.conn() as c:
+        c.execute("UPDATE boards SET status='idle', fail_count=0 WHERE id=?", (board_id,))
+
+
+QUARANTINE_AFTER = 3
 
 
 def list_boards() -> list[dict]:
@@ -54,8 +67,10 @@ def list_boards() -> list[dict]:
     t = db.now()
     for r in rows:
         r["info"] = db.uj(r["info"], {})
+        r["health"] = db.uj(r.get("health"), {})
         r["online"] = t - (r["last_seen"] or 0) < STALE_S
         r["simulated"] = bool(r["simulated"])
+        r["kind"] = "emulated" if r["info"].get("emulated") else "simulated" if r["simulated"] else "physical"
         if not r["online"]:
             r["status"] = "offline"
     return rows
@@ -119,11 +134,16 @@ def complete(rid: str, result: dict):
     status = "succeeded" if result.get("ok", True) and result.get("outputs_match", True) else "failed"
     with db.conn() as c:
         c.execute("UPDATE hil_runs SET status=?, result=?, updated=? WHERE id=?", (status, db.j(result), db.now(), rid))
-        c.execute("UPDATE boards SET status='idle' WHERE id=?", (run["board_id"],))
-        if status == "succeeded" and not result.get("simulated") and result.get("cycles") and req.get("macs"):
+        if status == "succeeded":
+            c.execute("UPDATE boards SET status='idle', fail_count=0 WHERE id=?", (run["board_id"],))
+        else:   # a board that fails QUARANTINE_AFTER runs in a row leaves service until the lab resets it
+            c.execute("UPDATE boards SET fail_count=COALESCE(fail_count,0)+1, status=CASE WHEN COALESCE(fail_count,0)+1>=?"
+                      " THEN 'quarantined' ELSE 'idle' END WHERE id=?", (QUARANTINE_AFTER, run["board_id"]))
+        real = not result.get("simulated") and not result.get("emulated")
+        if status == "succeeded" and real and result.get("cycles") and req.get("macs"):
             c.execute("INSERT INTO calibration VALUES (?,?,?,?,?,?)",
                       (run["target"], req.get("objective"), int(req["macs"]), int(result["cycles"]), rid, db.now()))
-        if status == "succeeded" and not result.get("simulated") and result.get("cycles") and req.get("plan_digest"):
+        if status == "succeeded" and real and result.get("cycles") and req.get("plan_digest"):
             c.execute("INSERT INTO measurements VALUES (?,?,?,?,?,?,?)",
                       (run["target"], req["plan_digest"], int(result["cycles"]), result.get("stack_painted"),
                        run["board_id"], rid, db.now()))
@@ -164,6 +184,57 @@ def calibration() -> dict:
 
 
 # ------------------------------------------------------------------------------------------------------------------
+class EmulatedAgent(threading.Thread):
+    """In-process lab of QEMU boards: the real HIL harness firmware, cross-compiled with SAI's target flags and
+    linked with the job's SAI build, runs on an emulated Cortex-M7 (MPS2-AN500) and RV32IMAFC (virt). Outputs are
+    checked bit-exactly server side; cycles are QEMU's instruction clock, flagged emulated (never calibration)."""
+
+    AGENT = "emu-lab-01"
+    BOARDS = [{"id": "QEMU-M7-01", "name": "QEMU MPS2-AN500 Cortex-M7 (emulated)", "target": "cortex-m7",
+               "port": "qemu-mps2-an500", "probe": "qemu", "emulated": True},
+              {"id": "QEMU-RV32-01", "name": "QEMU virt RV32IMAFC (emulated)", "target": "md6605",
+               "port": "qemu-virt-rv32", "probe": "qemu", "emulated": True}]
+
+    def __init__(self):
+        super().__init__(daemon=True, name="emu-agent")
+        self.stop = threading.Event()
+
+    @classmethod
+    def usable(cls) -> bool:
+        from . import hil
+        return all(hil.available(b["port"]) for b in cls.BOARDS)
+
+    def run(self):
+        register(self.AGENT, self.BOARDS, simulated=False)
+        while not self.stop.is_set():
+            heartbeat(self.AGENT, {b["id"]: {"probe": "ok", "kind": "qemu"} for b in self.BOARDS})
+            run = None
+            try:
+                run = claim(self.AGENT)
+                if run:
+                    self.execute(run)
+            except Exception as e:                        # keep the lab alive; the run is marked failed
+                if run:
+                    complete(run["id"], {"ok": False, "error": str(e)[-800:], "emulated": True})
+            self.stop.wait(1.0)
+
+    def execute(self, run):
+        from . import hil
+        req = run["request"]
+        port = next(b["port"] for b in self.BOARDS if b["id"] == run["board_id"])
+        jobdir = config.DATA_DIR / "jobs" / run["job_id"]
+        vec = np.load(jobdir / "hil_vectors.npz")
+        fw = hil.build(Path(req["build_dir"]), port, vec["x"], jobdir / "hil" / run["id"])
+        res = hil.run_emulated(fw["elf"], port)
+        complete(run["id"], {
+            "ok": True, "emulated": True, "outputs": res["outputs"], "cycles": res["cycles"],
+            "cycles_min": res.get("cycles_min"), "cycles_max": res.get("cycles_max"), "latency_ms": None,
+            "stack_painted": res["stack_painted"], "board": run["board_id"], "n_vectors": len(res["outputs"]),
+            "firmware": f"sai-hil-harness 1 ({port}, text {fw['text']} B, bss {fw['bss']} B)",
+            "log": [f"built {Path(fw['elf']).name}", f"qemu {port}: DONE {res['status']}",
+                    "cycles: QEMU -icount instruction clock (emulated, not latency evidence)"]})
+
+
 class SimulatedAgent(threading.Thread):
     """In-process stand-in for a lab agent until real boards are connected. It runs the build's bit-exact host
     library on the run's vectors (so output checking is real), and reports cycles from the planning model with
