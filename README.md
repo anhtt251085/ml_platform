@@ -1,4 +1,4 @@
-# SAI Platform (v0.5: board farm v1)
+# SAI Platform (v0.6: model pool program)
 
 [![tests](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml/badge.svg)](https://github.com/anhtt251085/ml_platform/actions/workflows/tests.yml)
 
@@ -84,6 +84,16 @@ CI (`.github/workflows/tests.yml`) runs on every push and pull request:
 * Latency is a planning number until a real board measures the build. Simulated board runs are flagged and never
   enter calibration.
 * Synthetic demo data is labelled as synthetic in the dataset, the job page and the model card.
+
+## Model pool program (M5)
+
+* **First real-data model**: activity recognition on UCI HAR (CC BY 4.0), split by subject — 95.4 % bit-exact on
+  held-out people with a 746-parameter model in 1.7 KB RAM / 5.4 KB flash on Cortex-M7
+  ([model card](docs/model_cards/har-imu_uci-har.md), importer `tools/import_uci_har.py`).
+* **Leaderboard** on the Model pool page: pool-benchmark projects (SAI research only) per model type, real data
+  ranked before synthetic, linked to full reports.
+* **Template versioning**: published versions, history, deprecation; every report records the template version.
+* Status of the six production model types and their data/licences: `docs/POOL_PROGRAM.md`.
 
 ## Board farm (M4)
 

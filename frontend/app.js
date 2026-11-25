@@ -186,7 +186,11 @@ route(/^\/pool$/, async (el) => {
   await system();
   const domains = ["All", ...new Set(cat.map((t) => t.domain))];
   let dom = "All", q = "";
+  const lb = await api("/api/pool/leaderboard");
   el.innerHTML = `<div class="page-h"><div><h1>Model pool</h1><p class="muted">Ready-to-train model types. Every architecture uses only SAI's operators, so it compiles for every supported MCU.</p></div><a class="btn" href="#/studio">Create a model type →</a></div>
+  ${Object.keys(lb).length ? `<div class="card" style="margin-bottom:16px"><h2>Leaderboard: real-data results of the pool program</h2><div class="tbl-wrap"><table class="t"><thead><tr><th>Model type</th><th>Data</th><th>Split</th><th>Size</th><th>Board</th><th class="n">Bit-exact</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Latency</th><th></th></tr></thead><tbody>
+    ${Object.entries(lb).map(([tid, rows]) => { const e = rows[0], t = cat.find((x) => x.id === tid) || { name: tid, icon: "" }; return `<tr><td>${esc(t.icon)} <b>${esc(t.name)}</b>${rows.length > 1 ? ` <span class="small muted">+${rows.length - 1} more</span>` : ""}</td><td class="small">${esc(e.dataset)}<br><span class="badge ${e.synthetic ? "b-warn" : "b-ok"}">${esc(e.licence)}</span> ${fmt(e.n)} windows</td><td class="small">${esc(e.split)}${e.recordings ? ` (${e.recordings} rec.)` : ""}</td><td>${esc(e.size)}</td><td>${esc(e.target)}</td><td class="n"><b>${e.metric === "accuracy" ? pct(e.value) : fmt(e.value, 3)}</b></td><td class="n">${bytes(e.ram)}</td><td class="n">${bytes(e.flash)}</td><td class="n">${ms(e.latency.ms)} ${ev(e.latency.evidence)}</td><td><a href="#/job/${e.job_id}">report</a></td></tr>`; }).join("")}
+  </tbody></table></div></div>` : ""}
   <div class="row" style="margin-bottom:14px"><div class="chips" id="doms"></div><div class="spacer"></div><input id="q" placeholder="Search…" style="width:220px"></div>
   <div class="grid gauto" id="grid"></div><div id="detail"></div>`;
   const draw = () => {
@@ -327,7 +331,8 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
         <label class="f">Training epochs<input id="ep" type="number" value="${st.epochs}" min="1" max="200"></label></div>
       <h3 style="margin-top:14px">Training</h3><div class="stack">
         <label class="check small"><input type="checkbox" id="ifp" ${st.initPool ? "checked" : ""} ${(SYS.pool_weights || {})[st.tpl.id] ? "" : "disabled"}>Fine-tune from the pool's base weights ${(SYS.pool_weights || {})[st.tpl.id] ? `<span class="badge b-ok">available</span>` : `<span class="muted">(none trained yet for this model type)</span>`}</label>
-        <label class="check small"><input type="checkbox" id="lrs" ${st.lrSearch ? "checked" : ""}>Learning-rate search (2 runs per size, keeps the best on validation)</label></div>
+        <label class="check small"><input type="checkbox" id="lrs" ${st.lrSearch ? "checked" : ""}>Learning-rate search (2 runs per size, keeps the best on validation)</label>
+        ${ME && ME.perms.publish ? `<label class="check small"><input type="checkbox" id="pbm" ${st.poolBench ? "checked" : ""}>Pool benchmark: publish the result on the pool leaderboard (SAI research)</label>` : ""}</div>
       <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label>`).join("")}</div>
       </div></div>${nav(true, true)}`;
     const help = { balanced: "Best mix of latency, RAM and flash among plans that fit.", fastest: "Lowest latency plan that fits.", "min-ram": "Smallest RAM (workspace + stack): leaves the most memory for your application.", "min-flash": "Smallest code + weights.", accuracy: "Most accurate size that fits, then balanced." };
@@ -337,7 +342,7 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
     const save = () => {
       st.targets = $$("input[name=tgt]:checked").map((x) => x.value); st.sizes = $$("input[name=sz]:checked").map((x) => x.value);
       st.budgets = { max_ram: +$("#mr").value || null, max_flash: +$("#mf").value || null, max_latency_ms: +$("#ml").value || null };
-      st.metric = $("#mt").value; st.epochs = +$("#ep").value || 30; st.initPool = $("#ifp").checked; st.lrSearch = $("#lrs").checked;
+      st.metric = $("#mt").value; st.epochs = +$("#ep").value || 30; st.initPool = $("#ifp").checked; st.lrSearch = $("#lrs").checked; st.poolBench = !!($("#pbm") && $("#pbm").checked);
     };
     $("#back").onclick = () => { save(); st.step--; draw(); };
     $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length) return toast("Pick at least one size"); st.step++; draw(); };
@@ -357,7 +362,7 @@ route(/^\/new(?:\?template=(.+))?$/, async (el, pre) => {
     $("#next").onclick = async () => {
       $("#next").disabled = true;
       try {
-        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch } });
+        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench } });
         location.hash = `#/job/${r.job.id}`;
       } catch (e) { toast(e.message); $("#next").disabled = false; }
     };
@@ -570,10 +575,12 @@ route(/^\/studio$/, async (el) => {
       <label class="f">Width / window<input id="i_w" type="number" value="${i.width}"></label>
       <label class="f">Demo data<select id="m_synth"><option value="">none</option>${[...new Set(builtins.map((t) => t.synth))].map((s) => `<option ${m.synth === s ? "selected" : ""}>${s}</option>`).join("")}</select></label></div>
       <label class="f">Data guidance for customers<textarea id="m_hint" rows="2">${esc(m.datasets_hint)}</textarea></label>
-      <div class="row"><button class="btn" id="save">Save draft</button><button class="btn primary" id="pub">Publish to pool</button>${m.id ? `<button class="btn ghost" id="del">Delete</button>` : ""}</div>
-      ${m.id ? `<div class="small muted">id <code>${esc(m.id)}</code> · ${esc(m.status || "draft")}</div>` : ""}</div>`;
+      <div class="row"><button class="btn" id="save">Save draft</button><button class="btn primary" id="pub">Publish to pool</button>${m.id && m.status === "published" ? `<button class="btn ghost" id="dep">Deprecate</button>` : ""}${m.id ? `<button class="btn ghost" id="del">Delete</button>` : ""}</div>
+      ${m.id ? `<div class="small muted">id <code>${esc(m.id)}</code> · ${esc(m.status || "draft")} · version ${esc(m.version || 1)}</div>
+        ${(m.history || []).length ? `<div class="small muted">History: ${m.history.slice(-5).map((h) => `v${h.version} ${esc(h.status)}`).join(" → ")}</div>` : ""}` : ""}</div>`;
     $$("#meta input, #meta select, #meta textarea").forEach((x) => (x.onchange = () => { readMeta(); if (x.id === "m_task") drawMeta(); validate(); }));
     $("#save").onclick = () => save("draft"); $("#pub").onclick = () => save("published");
+    if ($("#dep")) $("#dep").onclick = () => save("deprecated");
     if ($("#del")) $("#del").onclick = async () => { await api(`/api/catalog/${m.id}`, { method: "DELETE" }); toast("Deleted"); m = BLANK(); drawMeta(); drawArch(); };
   };
   const readMeta = () => {

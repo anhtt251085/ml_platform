@@ -348,3 +348,30 @@ def test_kws_frontend_package_finetune_and_evaluation_marker():
         assert {"sai_package/frontend/sai_features.c", "sai_package/frontend/sai_frontend_config.h",
                 "sai_package/EVALUATION_ONLY.txt"} <= names
         assert b"SAI_PACKAGE_EVALUATION_ONLY" in z.read("sai_package/sai_app.h")
+
+
+# ---- M5: pool program -------------------------------------------------------------------------------------------
+@need_sai
+def test_pool_benchmark_leaderboard_and_permissions():
+    from fastapi.testclient import TestClient
+    from backend.app import app
+    with TestClient(app) as c:
+        h = login(c)
+        ds = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 40}, headers=h).json()
+        r = c.post("/api/projects", headers=h, json={"name": "bench", "template_id": "gas-sense", "dataset_id": ds["id"],
+                                                     "sizes": ["tiny"], "epochs": 3, "targets": ["md6605"],
+                                                     "pool_benchmark": True}).json()
+        j = wait_job(c, r["job"]["id"], h)
+        assert j["status"] == "succeeded", j["error"]
+        lb = c.get("/api/pool/leaderboard", headers=h).json()
+        e = next(x for x in lb["gas-sense"] if x["job_id"] == j["id"])
+        assert e["synthetic"] is True and e["value"] is not None and e["ram"] and e["target"] == "md6605"
+        assert j["result"]["template"]["version"] is None or j["result"]["template"]["source"] == "builtin"
+        # customers cannot publish to the leaderboard
+        org = c.post("/api/admin/orgs", json={"name": "Initech", "tier": "standard"}, headers=h).json()
+        c.post("/api/admin/users", headers=h, json={"email": "m@initech.test", "name": "M", "role": "member",
+                                                     "password": "password-1", "org_id": org["id"]})
+        hm = login(c, "m@initech.test", "password-1")
+        dm = c.post("/api/datasets/demo", json={"template_id": "gas-sense", "per_class": 30}, headers=hm).json()
+        assert c.post("/api/projects", headers=hm, json={"name": "x", "template_id": "gas-sense", "dataset_id": dm["id"],
+                                                          "pool_benchmark": True}).status_code == 403

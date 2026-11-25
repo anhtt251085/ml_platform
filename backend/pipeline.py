@@ -447,7 +447,8 @@ def run_train(ctx: Ctx, p: dict):
         (ctx.dir / "sai_frontend_config.h").write_text(features.config_header(meta["frontend"]))
     (ctx.dir / "main_example.c").write_text(_example_main(pre, tpl))
     report = {
-        "template": {k: tpl.get(k) for k in ("id", "name", "domain", "task")},
+        "template": {k: tpl.get(k) for k in ("id", "name", "domain", "task", "version", "source")},
+        "pool_benchmark": bool(p.get("pool_benchmark")),
         "dataset": {k: meta.get(k) for k in ("id", "name", "source", "n", "shape", "labels", "class_counts", "synthetic",
                                              "licence", "commercial_use", "recordings", "quality", "frontend")},
         "deployable": deployable, "split_mode": idx["split_mode"],
@@ -768,6 +769,32 @@ int sai_infer(const float *raw) {{
 def _regression(ctx, p):
     from . import regression
     regression.run(ctx, p)
+
+
+def leaderboard() -> dict:
+    """Pool program leaderboard: per model type, every pool-benchmark project (real data, run by SAI research)
+    with its bit-exact accuracy and the resources of the selected plan; best first."""
+    with db.conn() as c:
+        rows = [db.row(r) for r in c.execute("SELECT id, params, result, updated FROM jobs WHERE kind='train' AND"
+                                             " status='succeeded' ORDER BY updated DESC LIMIT 500")]
+    out: dict[str, list] = {}
+    for r in rows:
+        params, res = db.uj(r["params"], {}), db.uj(r["result"], {})
+        if not params.get("pool_benchmark") or not res:
+            continue
+        sel, ds = res["selected"], res.get("dataset") or {}
+        v = next((x for x in res["variants"] if x["size"] == sel["size"]), {})
+        out.setdefault(res["template"]["id"], []).append({
+            "job_id": r["id"], "updated": r["updated"], "size": sel["size"], "target": sel["target"],
+            "metric": res["exact"]["headline"], "value": res["exact"]["value"], "float": v.get("float", {}).get("value"),
+            "ram": sel["ram"], "flash": sel["flash"], "latency": sel["latency"], "schedule": sel["schedule"],
+            "dataset": ds.get("name"), "licence": ds.get("licence"), "recordings": ds.get("recordings"),
+            "n": ds.get("n"), "split": res.get("split_mode"), "synthetic": bool(ds.get("synthetic")),
+            "template_version": res["template"].get("version"), "params": v.get("summary", {}).get("params"),
+            "macs": v.get("summary", {}).get("macs")})
+    for k in out:
+        out[k].sort(key=lambda e: (e["synthetic"], -(e["value"] or 0), e["ram"] or 1e12))
+    return out
 
 
 def pool_weights(tid: str, size: str) -> dict | None:

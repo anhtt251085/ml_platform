@@ -383,6 +383,7 @@ class ProjectIn(BaseModel):
     metric_target: float | None = None
     epochs: int = 30
     init_from_pool: bool = False      # fine-tune from the pool's base weights when the shapes match
+    pool_benchmark: bool = False      # SAI research only: publish the result on the pool leaderboard
     lr_search: bool = False           # try two learning rates per size, keep the better validation loss
 
 
@@ -394,6 +395,8 @@ def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
         raise HTTPException(400, f"goal must be one of {pipeline.GOALS}")
     cfg = body.model_dump()
     cfg["epochs"] = max(1, min(cfg["epochs"], 200))
+    if cfg.get("pool_benchmark") and u["role"] not in auth.PERMS["publish"]:
+        raise HTTPException(403, "only SAI research publishes pool benchmarks")
     job = pipeline.create("train", cfg, org_id=u["org_id"], user_id=u["id"])
     prj = store.create_project(body.name or "Untitled", body.template_id, body.dataset_id, cfg, job["id"], u["org_id"])
     with db.conn() as c:
@@ -508,6 +511,11 @@ def studio_basetrain(body: BaseTrainIn, u: dict = Depends(auth.require("publish"
     j = pipeline.create("basetrain", body.model_dump(), org_id=u["org_id"], user_id=u["id"])
     auth.audit(u, "basetrain_requested", body.template_id, {"job": j["id"]})
     return j
+
+
+@app.get("/api/pool/leaderboard")
+def pool_leaderboard(u: dict = Depends(auth.current)):
+    return pipeline.leaderboard()
 
 
 @app.get("/api/pool/weights")
