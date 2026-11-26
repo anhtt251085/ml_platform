@@ -181,6 +181,82 @@ function projectsTable(rows) {
     <td>${statusBadge(p.job_status, p.job_progress)}</td><td class="muted">${ago(p.created)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 const GATED = ["package.zip", "model.onnx", "report.json"];
+const LAYER_PARAMS = { conv: ["out", "k", "stride", "dilation", "relu"], dwconv: ["k", "stride", "dilation", "relu"], pwconv: ["out", "relu"], maxpool: ["k"], avgpool: ["k"], gap: [], fc: ["out", "relu"], residual: ["k"], dropout: ["p"] };
+const LAYER_DEF = { conv: { out: 16, k: 3, stride: 1, relu: true }, dwconv: { k: 3, stride: 1, relu: true }, pwconv: { out: 16, relu: true }, maxpool: { k: 2 }, avgpool: { k: 2 }, gap: {}, fc: { out: 16, relu: true }, residual: { k: 3 }, dropout: { p: 0.1 } };
+const PARAM_RANGE = { out: [1, 1024, 1, "output channels / units"], k: [1, 31, 1, "kernel / pool size"], stride: [1, 8, 1, "stride"], dilation: [1, 32, 1, "dilation"], p: [0, 0.9, 0.05, "dropout rate (training only)"] };
+// Model editor: start from a baseline, add / remove / reorder layers and change their parameters; every change is
+// checked on the user's data (shapes, MACs, parameters, receptive field) and can be compiled with SAI.
+function modelEditor(box, o) {
+  let layers = JSON.parse(JSON.stringify(o.layers)), vt = null, valid = false, ft = null;
+  const ops = Object.keys(o.ops);
+  onLeave(() => { clearTimeout(vt); clearTimeout(ft); });
+  const draw = () => {
+    box.innerHTML = `<div class="card" style="margin-top:16px;border-color:var(--accent)"><div class="row"><h2 style="margin:0">Customize · ${esc(o.baseName)}</h2><span class="spacer"></span><label class="f" style="min-width:260px">Name<input id="ed_name" value="${esc(o.label)}"></label></div>
+      <p class="small muted" style="margin-top:6px">Your baseline is <b>${esc(o.baseName)}</b>. Add, remove or reorder layers and change their parameters; every change is checked on your data. Only SAI operators are offered, and the output head is added for you.</p>
+      <div class="tbl-wrap"><table class="t layers"><thead><tr><th>#</th><th>Layer</th><th>Parameters</th><th>Output</th><th class="n">MACs</th><th class="n">Params</th><th></th></tr></thead><tbody id="ed_rows">
+      ${layers.map((l, i) => `<tr data-i="${i}"><td class="muted">${i + 1}</td><td><select data-f="op">${ops.map((x) => `<option ${x === l.op ? "selected" : ""}>${x}</option>`).join("")}</select><div class="small muted">${esc(o.ops[l.op] || "")}</div></td>
+        <td><div class="row" style="gap:6px;flex-wrap:wrap">${LAYER_PARAMS[l.op].map((p) => p === "relu" ? `<label class="check small"><input type="checkbox" data-f="relu" ${l.relu !== false ? "checked" : ""}>ReLU</label>` : `<label class="f" title="${PARAM_RANGE[p][3]}" style="width:78px">${p}<input data-f="${p}" type="number" min="${PARAM_RANGE[p][0]}" max="${PARAM_RANGE[p][1]}" step="${PARAM_RANGE[p][2]}" value="${l[p] ?? (p === "stride" || p === "dilation" ? 1 : "")}"></label>`).join("") || `<span class="small muted">no parameters</span>`}</div></td>
+        <td class="mono small" data-shape="${i}"></td><td class="n mono small" data-macs="${i}"></td><td class="n mono small" data-par="${i}"></td>
+        <td style="white-space:nowrap"><button class="btn ghost sm" data-a="up" title="move up">↑</button><button class="btn ghost sm" data-a="dn" title="move down">↓</button><button class="btn ghost sm" data-a="dup" title="duplicate">⧉</button><button class="btn ghost sm" data-a="rm" title="remove">✕</button></td></tr>`).join("")}
+      <tr class="muted"><td></td><td>head</td><td class="small">output layer, automatic</td><td class="mono small" data-shape="head"></td><td class="n mono small" data-macs="head"></td><td class="n mono small" data-par="head"></td><td></td></tr></tbody></table></div>
+      <div class="row" style="margin-top:10px;gap:8px"><select id="ed_op">${ops.map((x) => `<option>${x}</option>`).join("")}</select><select id="ed_pos"><option value="end">at the end</option>${layers.map((l, i) => `<option value="${i}">after layer ${i + 1} (${esc(l.op)})</option>`).join("")}</select><button class="btn sm" id="ed_add">+ Add layer</button><span class="spacer"></span><button class="btn sm ghost" id="ed_reset">Reset to baseline</button></div>
+      <div id="ed_sum" style="margin-top:12px"></div>
+      <div class="row" style="margin-top:12px;gap:8px"><button class="btn" id="ed_fit">Check with SAI</button>${o.canSaveToLibrary ? `<button class="btn ghost" id="ed_lib">Save to library</button>` : ""}<span class="spacer"></span><button class="btn ghost" id="ed_cancel">Cancel</button><button class="btn primary" id="ed_ok">${o.okText || "Use this model"}</button></div>
+      <div id="ed_fitres"></div></div>`;
+    $("#ed_rows").onchange = (e) => {
+      const tr = e.target.closest("tr[data-i]"); if (!tr) return; const i = +tr.dataset.i, f = e.target.dataset.f;
+      if (f === "op") { layers[i] = { op: e.target.value, ...LAYER_DEF[e.target.value] }; return draw(); }
+      layers[i][f] = f === "relu" ? e.target.checked : e.target.value === "" ? undefined : +e.target.value; check();
+    };
+    $("#ed_rows").onclick = (e) => {
+      const a = e.target.dataset.a; if (!a) return; const i = +e.target.closest("tr").dataset.i;
+      if (a === "rm") layers.splice(i, 1);
+      if (a === "dup") layers.splice(i + 1, 0, JSON.parse(JSON.stringify(layers[i])));
+      if (a === "up" && i > 0) [layers[i - 1], layers[i]] = [layers[i], layers[i - 1]];
+      if (a === "dn" && i < layers.length - 1) [layers[i + 1], layers[i]] = [layers[i], layers[i + 1]];
+      draw();
+    };
+    $("#ed_add").onclick = () => { const op = $("#ed_op").value, pos = $("#ed_pos").value; const l = { op, ...LAYER_DEF[op] }; if (pos === "end") layers.push(l); else layers.splice(+pos + 1, 0, l); draw(); };
+    $("#ed_reset").onclick = () => { layers = JSON.parse(JSON.stringify(o.baseline)); draw(); };
+    $("#ed_cancel").onclick = () => { box.innerHTML = ""; o.onCancel && o.onCancel(); };
+    $("#ed_ok").onclick = () => { if (!valid) return toast("Fix the model first: see the message under the table"); o.onSave(JSON.parse(JSON.stringify(layers)), $("#ed_name").value.trim() || o.label); box.innerHTML = ""; };
+    if ($("#ed_lib")) $("#ed_lib").onclick = async () => {
+      if (!valid) return toast("Fix the model first");
+      try { const a = await api("/api/architectures", { json: { name: $("#ed_name").value.trim() || o.label, family: "Custom", inputs: [o.inputKind], tasks: [o.task], layers, summary: `Customized from ${o.baseName}` } }); toast(`Saved to your library as ${a.name}`); } catch (e) { toast(e.message); }
+    };
+    $("#ed_fit").onclick = async () => {
+      if (!valid) return toast("Fix the model first");
+      $("#ed_fitres").innerHTML = `<div class="callout info" style="margin-top:10px">Compiling with SAI on ${o.targets().map(esc).join(", ")}…</div>`;
+      try {
+        const job = await api("/api/models/fitcheck", { json: { dataset_id: o.datasetId, layers, preprocess: o.prep(), targets: o.targets(), goal: o.goal() } });
+        const wait = async () => {
+          let j; try { j = await api(`/api/jobs/${job.id}`); } catch (e) { if (!(e instanceof Stale)) $("#ed_fitres").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; return; }
+          if (!$("#ed_fitres")) return;
+          if (j.status === "succeeded") { const p = j.result.plans; $("#ed_fitres").innerHTML = `<div style="margin-top:12px">${p.recommended ? `<div class="callout ok">Fits: best plan ${esc(p.recommended.target)} · ${bytes(p.recommended.ram)} RAM · ${bytes(p.recommended.flash)} flash · ${ms(p.recommended.latency.ms)}</div>` : `<div class="callout bad">${esc(p.advice || "no plan fits")}</div>`}${planTable(p.candidates)}</div>`; return; }
+          if (j.status === "failed" || j.status === "cancelled") { $("#ed_fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(j.error || j.status)}</div>`; return; }
+          ft = setTimeout(wait, 1000);
+        };
+        wait();
+      } catch (e) { $("#ed_fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(e.message)}</div>`; }
+    };
+    check();
+  };
+  const check = () => {
+    clearTimeout(vt);
+    vt = setTimeout(async () => {
+      let r; try { r = await api("/api/models/preview", { json: { dataset_id: o.datasetId, layers, preprocess: o.prep() } }); } catch (e) { if (!(e instanceof Stale)) toast(e.message); return; }
+      if (!$("#ed_sum")) return;
+      valid = r.ok;
+      $("#ed_ok").disabled = !r.ok;
+      if (!r.ok) { $$("[data-shape],[data-macs],[data-par]", box).forEach((x) => (x.textContent = "")); $("#ed_sum").innerHTML = `<div class="callout bad">${esc(r.error)}</div>`; return; }
+      r.summary.layers.forEach((row, i) => { const k = row.head ? "head" : i; const set = (a, v) => { const x = $(`[data-${a}="${k}"]`, box); if (x) x.textContent = v; }; set("shape", row.shape.join("×")); set("macs", fmt(row.macs)); set("par", row.params ? fmt(row.params) : ""); });
+      const s = r.summary;
+      $("#ed_sum").innerHTML = `<div class="kpis"><div class="kpi"><div class="l">Parameters</div><div class="v">${fmt(s.params)}</div></div><div class="kpi"><div class="l">MACs</div><div class="v">${fmt(s.macs)}</div></div><div class="kpi"><div class="l">Receptive field</div><div class="v">${r.receptive_field ? fmt(r.receptive_field) : "–"}</div></div><div class="kpi"><div class="l">Largest activation</div><div class="v">${bytes(s.peak_activation_bytes)}</div></div></div>
+        <p class="small muted" style="margin-top:6px">Input ${s.layers.length ? "" : ""}${esc(r.spec.input.channels + "×" + r.spec.input.height + "×" + r.spec.input.width)} after your preprocessing · ${r.spec.outputs} output(s) · weights ≈ ${bytes(s.weight_bytes_int8)} INT8. RAM and flash come from SAI: use “Check with SAI”.</p>`;
+    }, 250);
+  };
+  draw();
+}
 const archChain = (layers) => layers.map((l) => l.op + (l.out ? l.out : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "") + (l.dilation > 1 ? "d" + l.dilation : "")).join(" → ") + " → fc(head)";
 function archChecks(a, targets) {
   const ts = targets || Object.keys(a.checks || {});
@@ -266,7 +342,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
   const pre = qp.get("template");
   const [cat, sys] = await Promise.all([api("/api/catalog"), system()]);
   const st = { step: pre ? 1 : 0, tpl: pre ? cat.find((t) => t.id === pre) : null, ds: null, prep: {},
-    targets: [], goal: "balanced", budgets: {}, metric: "", sizes: ["tiny", "small", "base"], epochs: 30, name: "", training: {}, archs: [] };
+    targets: [], goal: "balanced", budgets: {}, metric: "", sizes: ["tiny", "small", "base"], epochs: 30, name: "", training: {}, archs: [], customs: [] };
   if (st.tpl) st.targets = [...st.tpl.targets];
   if (qp.get("dataset")) { try { st.ds = await api(`/api/datasets/${encodeURIComponent(qp.get("dataset"))}`); st.step = 2; } catch { /* stays on Data */ } }
   const STEPS = ["Model type", "Data", "Preprocess", "Board & goal", "Review"];
@@ -454,9 +530,12 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         ${ME && ME.perms.publish ? `<label class="check small"><input type="checkbox" id="pbm" ${st.poolBench ? "checked" : ""}>Pool benchmark: publish the result on the pool leaderboard (SAI research)</label>` : ""}</div>
       <details id="tadv" style="margin-top:10px" ${Object.keys(st.training).length ? "open" : ""}><summary class="small"><b>Advanced training settings</b> <span class="muted">(leave blank for automatic)</span></summary>
         ${trainingForm(st.training, st.tpl.task)}</details>
-      <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label>`).join("")}
-        <label class="check" id="autolbl" style="${st.auto ? "" : "display:none"}"><input type="checkbox" name="sz" value="auto" ${st.sizes.includes("auto") ? "checked" : ""}>auto <span class="badge b-ok">recommended</span></label></div>
+      <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].filter((s) => (st.tpl.variants || {})[s]).map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label><button class="btn ghost sm" data-cust="size:${s}" title="Use ${s} as a baseline and edit it">✎</button>`).join("")}
+        <label class="check" id="autolbl" style="${st.auto ? "" : "display:none"}"><input type="checkbox" name="sz" value="auto" ${st.sizes.includes("auto") ? "checked" : ""}>auto <span class="badge b-ok">recommended</span></label><button class="btn ghost sm" data-cust="auto" id="autocust" style="${st.auto ? "" : "display:none"}" title="Use the recommended model as a baseline and edit it">✎</button></div>
+        <p class="small muted" style="margin-top:4px">✎ customizes a size as your own baseline: add layers, change channels, kernels, strides…</p>
       </div></div>
+      <div id="custed"></div>
+      <div class="card" style="margin-top:16px" id="custcard"></div>
       <div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Architectures from the library</h2><span class="spacer"></span><a class="small" href="#/architectures">Browse the library</a></div>
         <p class="small muted" style="margin-top:6px">Architectures that suit this data (parameters, MACs and receptive field are for your input). ✓ = SAI compiled it and it fits that board at the library's reference input; the project then costs it exactly on your data. Each one you tick is trained next to the sizes above and competes for the best plan.</p><div id="libpick"><span class="small muted">Loading…</span></div></div>
       <div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Recommended architecture</h2><span class="spacer"></span><button class="btn sm" id="recbtn">${st.rec ? "Recommend again" : "Recommend an architecture"}</button></div>
@@ -473,7 +552,43 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
       st.training = readTrainingForm();
     };
     $("#back").onclick = () => { save(); st.step--; draw(); };
-    $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length && !st.archs.length) return toast("Pick at least one size or architecture"); st.step++; draw(); };
+    $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length && !st.archs.length && !st.customs.some((m) => m.include)) return toast("Pick at least one size, architecture or customized model"); st.step++; draw(); };
+    let libById = {};
+    const kindOf = () => st.ds.height > 1 ? "2d" : st.ds.width >= 8 ? "timeseries" : "features";
+    const drawCustoms = () => {
+      const c = $("#custcard"); if (!c) return;
+      c.style.display = st.customs.length ? "" : "none";
+      c.innerHTML = `<h2 style="margin:0 0 6px">Your customized models</h2><p class="small muted">Trained next to the sizes and library architectures you ticked; each competes for the best plan.</p>
+        <div class="tbl-wrap"><table class="t"><thead><tr><th></th><th>Name</th><th>Baseline</th><th>Layers</th><th></th></tr></thead><tbody>${st.customs.map((m, i) => `<tr><td><input type="checkbox" data-inc="${i}" ${m.include ? "checked" : ""}></td><td><b>${esc(m.label)}</b><div class="mono small muted">${esc(m.key)}</div></td><td class="small">${esc(m.base)}</td><td class="arch-chain" style="margin:0">${esc(archChain(m.layers))}</td><td style="white-space:nowrap"><button class="btn sm" data-edit="${i}">Edit</button> <button class="btn ghost sm" data-rmc="${i}">Remove</button></td></tr>`).join("")}</tbody></table></div>`;
+      c.onclick = (e) => {
+        const t = e.target;
+        if (t.dataset.inc !== undefined) { st.customs[+t.dataset.inc].include = t.checked; return; }
+        if (t.dataset.rmc !== undefined) { st.customs.splice(+t.dataset.rmc, 1); return drawCustoms(); }
+        if (t.dataset.edit !== undefined) { const m = st.customs[+t.dataset.edit]; openEditor(m.base, m.baseline, m.layers, m.label, m); }
+      };
+    };
+    const openEditor = (baseName, baseline, layers, label, existing) => {
+      save();
+      modelEditor($("#custed"), { baseName, baseline, layers, label, ops: SYS.ops, datasetId: st.ds.id, prep: () => st.prep, targets: () => st.targets.length ? st.targets : ["md6605", "cortex-m7"], goal: () => st.goal,
+        canSaveToLibrary: !!ME.perms.research, inputKind: kindOf(), task: st.tpl.task,
+        onSave: (ls, name) => {
+          if (existing) { existing.layers = ls; existing.label = name; }
+          else { const slug = baseName.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 14) || "model"; let n = 1; while (st.customs.some((m) => m.key === `c_${slug}_${n}`)) n++; st.customs.push({ key: `c_${slug}_${n}`, label: name, base: baseName, baseline, layers: ls, include: true }); }
+          drawCustoms(); toast(`“${name}” will be trained`); $("#custcard").scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } });
+      $("#custed").scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    if (b._custH) b.removeEventListener("click", b._custH, true);     // one handler per draw of this step
+    b._custH = (e) => {
+      const t = e.target.closest("[data-cust]"); if (!t) return;
+      e.preventDefault(); e.stopPropagation();
+      const v = t.dataset.cust;
+      if (v === "auto") return openEditor("Recommended (auto)", st.auto, st.auto, "Recommended, customized");
+      if (v.startsWith("size:")) { const s = v.slice(5); return openEditor(`${st.tpl.name} · ${s}`, st.tpl.variants[s], st.tpl.variants[s], `My ${s}`); }
+      if (v.startsWith("lib:")) { const a = libById[v.slice(4)]; return openEditor(a.name, a.layers, a.layers, `My ${a.name}`); }
+    };
+    b.addEventListener("click", b._custH, true);
+    drawCustoms();
     (async () => {
       try {
         const lib = (await api(`/api/architectures?dataset_id=${encodeURIComponent(st.ds.id)}`)).architectures;
@@ -482,9 +597,10 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         box.innerHTML = (ok.length ? `<div class="archpick">${ok.map((a) => `<label class="${st.archs.includes(a.id) ? "on" : ""}"><input type="checkbox" name="arch" value="${esc(a.id)}" ${st.archs.includes(a.id) ? "checked" : ""}>
           <div><b>${esc(a.name)}</b> <span class="muted small">${esc(a.family)}</span>${a.source === "custom" ? ` <span class="badge">${a.org_id ? "your organisation" : "SAI"}</span>` : ""}
           <div class="small muted">${fmt(a.fit.params)} params · ${fmt(a.fit.macs / 1000, 1)}k MACs${a.fit.receptive_field ? ` · RF ${a.fit.receptive_field}` : ""}</div>
-          <div class="small" style="margin-top:4px">${archChecks(a, st.targets.length ? st.targets : null)}</div></div></label>`).join("")}</div>` : `<p class="small muted">No library architecture suits this data shape.</p>`)
+          <div class="small" style="margin-top:4px">${archChecks(a, st.targets.length ? st.targets : null)} <button class="btn ghost sm" data-cust="lib:${esc(a.id)}" title="Use as a baseline and edit it">✎ Customize</button></div></div></label>`).join("")}</div>` : `<p class="small muted">No library architecture suits this data shape.</p>`)
           + (no.length ? `<details style="margin-top:8px"><summary class="small muted">${no.length} not suitable for this data</summary><ul class="small muted">${no.map((a) => `<li>${esc(a.name)}: ${esc(a.fit.reason)}</li>`).join("")}</ul></details>` : "");
         $$("input[name=arch]").forEach((x) => { x.onchange = () => { x.closest("label").classList.toggle("on", x.checked); st.archs = $$("input[name=arch]:checked").map((y) => y.value); }; });
+        libById = Object.fromEntries(lib.map((a) => [a.id, a]));
       } catch (e) { if (!(e instanceof Stale)) $("#libpick").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; }
     })();
     $("#recbtn").onclick = async () => {
@@ -504,7 +620,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         if (st.rec.recommended) {
           st.auto = st.rec.recommended.layers;
           if (!st.sizes.includes("auto")) st.sizes.push("auto");
-          $("#autolbl").style.display = ""; $("#autolbl input").checked = true;
+          $("#autolbl").style.display = ""; $("#autolbl input").checked = true; $("#autocust").style.display = "";
         }
         $("#recout").innerHTML = recTable(st.rec);
       } catch (e) { if (!(e instanceof Stale)) $("#recout").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; }
@@ -562,13 +678,13 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         <div class="kpi"><div class="l">Boards</div><div class="v" style="font-size:15px">${st.targets.join(", ")}</div></div>
         <div class="kpi"><div class="l">Goal</div><div class="v" style="font-size:15px">${GOAL_LABEL[st.goal]}</div></div></div>
       ${Object.keys(st.training).length ? `<p class="small" style="margin-top:14px">Training settings: ${Object.entries(st.training).map(([k, v]) => `<code>${esc(k)}=${esc(String(v))}</code>`).join(" ")} (the rest automatic)</p>` : ""}
-      <p class="small muted" style="margin-top:14px">The pipeline trains ${st.sizes.length} size(s)${st.archs.length ? ` and ${st.archs.length} library architecture(s) (${st.archs.map(esc).join(", ")})` : ""}, quantizes each to INT8 (with quantization-aware fine-tuning when INT8 loses more than 1%), asks SAI for every plan on every board, picks the best that fits, then compiles, verifies and measures the deployed program's accuracy bit-exactly.</p>
+      <p class="small muted" style="margin-top:14px">The pipeline trains ${st.sizes.length} size(s)${st.archs.length ? `, ${st.archs.length} library architecture(s) (${st.archs.map(esc).join(", ")})` : ""}${st.customs.some((m) => m.include) ? ` and ${st.customs.filter((m) => m.include).length} customized model(s) (${st.customs.filter((m) => m.include).map((m) => esc(m.label)).join(", ")})` : ""}, quantizes each to INT8 (with quantization-aware fine-tuning when INT8 loses more than 1%), asks SAI for every plan on every board, picks the best that fits, then compiles, verifies and measures the deployed program's accuracy bit-exactly.</p>
       ${nav(true, true, true, "Build my model →")}</div>`;
     $("#back").onclick = () => { st.name = $("#nm").value; st.step--; draw(); };
     $("#next").onclick = async () => {
       $("#next").disabled = true;
       try {
-        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, architectures: st.archs, training: st.training, custom_variants: st.sizes.includes("auto") && st.auto ? { auto: st.auto } : {}, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
+        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, architectures: st.archs, training: st.training, custom_variants: { ...(st.sizes.includes("auto") && st.auto ? { auto: st.auto } : {}), ...Object.fromEntries(st.customs.filter((m) => m.include).map((m) => [m.key, m.layers])) }, custom_labels: Object.fromEntries(st.customs.filter((m) => m.include).map((m) => [m.key, `${m.label} (from ${m.base})`])), budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
         location.hash = `#/job/${r.job.id}`;
       } catch (e) { toast(e.message); $("#next").disabled = false; }
     };

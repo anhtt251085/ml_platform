@@ -559,7 +559,8 @@ class ProjectIn(BaseModel):
     pool_benchmark: bool = False      # SAI research only: publish the result on the pool leaderboard
     lr_search: bool = False           # try two learning rates per size, keep the better validation loss
     preprocess: dict = {}             # preprocessing stage settings (backend/preprocess.py)
-    custom_variants: dict[str, list[dict]] = {}   # e.g. {"auto": layers} from the architecture recommender
+    custom_variants: dict[str, list[dict]] = {}   # e.g. {"auto": layers} from the recommender, or edited baselines
+    custom_labels: dict[str, str] = {}             # display name and origin of each custom variant
     architectures: list[str] = []     # architecture library ids to train next to the sizes
     training: dict = {}               # training settings (backend/trainer.py TRAIN_DEFAULTS); empty = automatic
 
@@ -612,22 +613,20 @@ def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
         trainer.normalize_training(cfg["training"], cfg["epochs"])
     except trainer.TrainCfgError as e:
         _bad(e)
-    c_in, h_in, w_in = (int(v) for v in d["shape"])
-    if pcfg["window_ops"]:                                   # the model sees the window after the C steps
-        c_in, w_in = len(pcfg["channels"] or range(c_in)), w_in // pcfg["decimate"]
+    (c_in, h_in, w_in), task, n_out = _model_io(d, pcfg)
+    labels_in = cfg.pop("custom_labels") or {}
     for name, layers in (cfg.get("custom_variants") or {}).items():
-        if not isinstance(name, str) or not name.isidentifier() or len(name) > 16 or len(layers) > 64:
-            raise HTTPException(400, "custom_variants: short names and at most 64 layers")
+        if not isinstance(name, str) or not name.isidentifier() or len(name) > 24 or len(layers) > 64:
+            raise HTTPException(400, "custom_variants: names of letters, digits and _ (max 24) and at most 64 layers")
         try:
             archspec.normalize({"input": {"channels": c_in, "height": h_in, "width": w_in}, "layers": layers,
-                                "outputs": 2})
+                                "outputs": n_out})
         except (archspec.SpecError, AttributeError, TypeError) as e:
-            _bad(e)
+            raise HTTPException(400, f"model {labels_in.get(name) or name}: {e}") from None
         if name not in cfg["sizes"]:
             cfg["sizes"].append(name)
-    task = d.get("task", "classification")
-    labels = d.get("labels") or []
-    n_out = len(labels) if task == "classification" else 1 if task == "regression" else c_in * h_in * w_in
+        if labels_in.get(name):
+            cfg.setdefault("architecture_names", {})[name] = str(labels_in[name])[:80]
     for aid in cfg.pop("architectures") or []:
         a = archlib.get(aid, u["org_id"], auth.has(u, "platform_admin"))
         if not a:
@@ -729,6 +728,71 @@ def _file(jid: str, name: str) -> Path:
     if not p.exists():
         raise HTTPException(404, "not built yet")
     return p
+
+
+# ---- model editor: preview and SAI fit check of an edited baseline, for every user --------------------------------
+def _model_io(d: dict, pcfg: dict):
+    """(input shape the model sees after the preprocessing window steps, task, number of outputs) of a dataset."""
+    c, h, w = (int(v) for v in d["shape"])
+    if pcfg["window_ops"]:
+        c, w = len(pcfg["channels"] or range(c)), w // pcfg["decimate"]
+    task = d.get("task", "classification")
+    labels = d.get("labels") or []
+    n_out = len(labels) if task == "classification" else 1 if task == "regression" else c * h * w
+    return (c, h, w), task, n_out
+
+
+class ModelIn(BaseModel):
+    dataset_id: str
+    layers: list[dict]
+    preprocess: dict = {}
+    targets: list[str] = []
+    goal: str = "balanced"
+
+
+def _model_spec(body: ModelIn, u: dict) -> tuple[dict, str]:
+    d = _ds(body.dataset_id, u)
+    from . import preprocess
+    try:
+        pcfg = preprocess.normalize_cfg(body.preprocess, d, d["shape"], d.get("task", "classification"))
+    except preprocess.PrepError as e:
+        _bad(e)
+    (c, h, w), task, n_out = _model_io(d, pcfg)
+    if len(body.layers) > 64:
+        _bad("at most 64 layers")
+    return archspec.normalize({"input": {"channels": c, "height": h, "width": w}, "layers": body.layers,
+                               "outputs": n_out}), task
+
+
+@app.post("/api/models/preview")
+def model_preview(body: ModelIn, u: dict = Depends(auth.current)):
+    """Live check of an edited model on the user's data: per-layer output shapes, MACs, parameters, receptive
+    field, peak activation; or the reason it cannot be built."""
+    try:
+        spec, task = _model_spec(body, u)
+    except archspec.SpecError as e:
+        return {"ok": False, "error": str(e)}
+    from .recommend import receptive_field
+    s = archspec.summary(spec)
+    conv = any(layer["op"] in ("conv", "dwconv", "pwconv", "residual") for layer in spec["layers"])
+    return {"ok": True, "spec": spec, "summary": s, "task": task,
+            "receptive_field": receptive_field(spec["layers"]) if conv else None}
+
+
+@app.post("/api/models/fitcheck")
+def model_fitcheck(body: ModelIn, u: dict = Depends(auth.current)):
+    """SAI fit check of an edited model on the user's data (random weights; RAM, flash and plan do not depend on
+    them). A background job; the result has the plans per board."""
+    try:
+        spec, _ = _model_spec(body, u)
+    except archspec.SpecError as e:
+        _bad(e)
+    if body.goal not in pipeline.GOALS:
+        raise HTTPException(400, f"goal must be one of {pipeline.GOALS}")
+    targets = [t for t in body.targets if t in sai_engine.MCU_TARGETS] or list(sai_engine.MCU_TARGETS)
+    return pipeline.create("fitcheck", {"spec": spec, "targets": targets,
+                                        "goal": body.goal if body.goal != "accuracy" else "balanced"},
+                           org_id=u["org_id"], user_id=u["id"], priority=2)
 
 
 # ---- architecture library -----------------------------------------------------------------------------------------
