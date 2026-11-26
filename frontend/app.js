@@ -180,7 +180,13 @@ function projectsTable(rows) {
   ${rows.map((p) => `<tr><td><a href="#/job/${esc(p.job_id)}">${esc(p.name)}</a></td><td>${esc(p.template_id)}</td><td>${esc(GOAL_LABEL[p.config.goal] || p.config.goal)}</td>
     <td>${statusBadge(p.job_status, p.job_progress)}</td><td class="muted">${ago(p.created)}</td></tr>`).join("")}</tbody></table></div>`;
 }
-const GATED = ["package.zip", "model.onnx", "report.json"];   // downloads that need a manager's approval
+const GATED = ["package.zip", "model.onnx", "report.json"];
+const archChain = (layers) => layers.map((l) => l.op + (l.out ? l.out : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "") + (l.dilation > 1 ? "d" + l.dilation : "")).join(" → ") + " → fc(head)";
+function archChecks(a, targets) {
+  const ts = targets || Object.keys(a.checks || {});
+  if (!ts.length || !Object.keys(a.checks || {}).length) return `<span class="badge">not SAI-checked yet</span>`;
+  return ts.map((t) => { const c = (a.checks || {})[t]; return !c ? `<span class="badge">${esc(t)}: not checked</span>` : c.fits ? `<span class="badge b-ok" title="SAI ${esc(c.sai_version)} · ${bytes(c.ram)} RAM · ${bytes(c.flash)} flash · ${fmt(c.latency_ms, 3)} ms at the reference input">✓ ${esc(t)}</span>` : `<span class="badge b-bad" title="${esc(((c.detail || {}).violations || []).join("; ") || (c.detail || {}).error || "")}">✗ ${esc(t)}</span>`; }).join(" ");
+}   // downloads that need a manager's approval
 function dur(sec) {
   if (sec === null || sec === undefined || !isFinite(sec)) return "–";
   sec = Math.max(0, Math.round(sec));
@@ -189,7 +195,7 @@ function dur(sec) {
 function jobTitle(job) {
   const p = job.params || {};
   return { train: p.name || "Project", fitcheck: "Studio fit check", rebuild: "Reproducibility rebuild", regression: "Pool regression",
-    basetrain: "Pool base weights", recommend: "Architecture recommendation", ingest: `Import ${p.filename || "dataset"}` }[job.kind] || `Analyze ${p.filename || "model"}`;
+    basetrain: "Pool base weights", recommend: "Architecture recommendation", archverify: "Architecture library SAI check", ingest: `Import ${p.filename || "dataset"}` }[job.kind] || `Analyze ${p.filename || "model"}`;
 }
 function statusBadge(s, p) {
   const c = { succeeded: "b-ok", failed: "b-bad", running: "b-acc", queued: "", cancelled: "b-warn" }[s] || "";
@@ -260,7 +266,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
   const pre = qp.get("template");
   const [cat, sys] = await Promise.all([api("/api/catalog"), system()]);
   const st = { step: pre ? 1 : 0, tpl: pre ? cat.find((t) => t.id === pre) : null, ds: null, prep: {},
-    targets: [], goal: "balanced", budgets: {}, metric: "", sizes: ["tiny", "small", "base"], epochs: 30, name: "", training: {} };
+    targets: [], goal: "balanced", budgets: {}, metric: "", sizes: ["tiny", "small", "base"], epochs: 30, name: "", training: {}, archs: [] };
   if (st.tpl) st.targets = [...st.tpl.targets];
   if (qp.get("dataset")) { try { st.ds = await api(`/api/datasets/${encodeURIComponent(qp.get("dataset"))}`); st.step = 2; } catch { /* stays on Data */ } }
   const STEPS = ["Model type", "Data", "Preprocess", "Board & goal", "Review"];
@@ -451,6 +457,8 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
       <h3 style="margin-top:14px">Model sizes to try</h3><div class="row">${["tiny", "small", "base"].map((s) => `<label class="check"><input type="checkbox" name="sz" value="${s}" ${st.sizes.includes(s) ? "checked" : ""}>${s} <span class="muted small">${fmt(st.tpl.sizes[s]?.macs / 1000)}k MACs</span></label>`).join("")}
         <label class="check" id="autolbl" style="${st.auto ? "" : "display:none"}"><input type="checkbox" name="sz" value="auto" ${st.sizes.includes("auto") ? "checked" : ""}>auto <span class="badge b-ok">recommended</span></label></div>
       </div></div>
+      <div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Architectures from the library</h2><span class="spacer"></span><a class="small" href="#/architectures">Browse the library</a></div>
+        <p class="small muted" style="margin-top:6px">Architectures that suit this data (parameters, MACs and receptive field are for your input). ✓ = SAI compiled it and it fits that board at the library's reference input; the project then costs it exactly on your data. Each one you tick is trained next to the sizes above and competes for the best plan.</p><div id="libpick"><span class="small muted">Loading…</span></div></div>
       <div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Recommended architecture</h2><span class="spacer"></span><button class="btn sm" id="recbtn">${st.rec ? "Recommend again" : "Recommend an architecture"}</button></div>
         <p class="small muted" style="margin-top:6px">Profiles your data, generates candidate architectures for it, and has SAI cost every candidate exactly on the selected boards before any training: RAM, flash and plan depend on the architecture, not on the weights. Takes a few minutes; the result is added as size <b>auto</b>.</p>
         <div id="recout">${st.rec ? recTable(st.rec) : ""}</div></div>${nav(true, true)}`;
@@ -465,7 +473,20 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
       st.training = readTrainingForm();
     };
     $("#back").onclick = () => { save(); st.step--; draw(); };
-    $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length) return toast("Pick at least one size"); st.step++; draw(); };
+    $("#next").onclick = () => { save(); if (!st.targets.length) return toast("Pick at least one board"); if (!st.sizes.length && !st.archs.length) return toast("Pick at least one size or architecture"); st.step++; draw(); };
+    (async () => {
+      try {
+        const lib = (await api(`/api/architectures?dataset_id=${encodeURIComponent(st.ds.id)}`)).architectures;
+        const ok = lib.filter((a) => a.fit && a.fit.ok), no = lib.filter((a) => a.fit && !a.fit.ok);
+        const box = $("#libpick"); if (!box) return;
+        box.innerHTML = (ok.length ? `<div class="archpick">${ok.map((a) => `<label class="${st.archs.includes(a.id) ? "on" : ""}"><input type="checkbox" name="arch" value="${esc(a.id)}" ${st.archs.includes(a.id) ? "checked" : ""}>
+          <div><b>${esc(a.name)}</b> <span class="muted small">${esc(a.family)}</span>${a.source === "custom" ? ` <span class="badge">${a.org_id ? "your organisation" : "SAI"}</span>` : ""}
+          <div class="small muted">${fmt(a.fit.params)} params · ${fmt(a.fit.macs / 1000, 1)}k MACs${a.fit.receptive_field ? ` · RF ${a.fit.receptive_field}` : ""}</div>
+          <div class="small" style="margin-top:4px">${archChecks(a, st.targets.length ? st.targets : null)}</div></div></label>`).join("")}</div>` : `<p class="small muted">No library architecture suits this data shape.</p>`)
+          + (no.length ? `<details style="margin-top:8px"><summary class="small muted">${no.length} not suitable for this data</summary><ul class="small muted">${no.map((a) => `<li>${esc(a.name)}: ${esc(a.fit.reason)}</li>`).join("")}</ul></details>` : "");
+        $$("input[name=arch]").forEach((x) => { x.onchange = () => { x.closest("label").classList.toggle("on", x.checked); st.archs = $$("input[name=arch]:checked").map((y) => y.value); }; });
+      } catch (e) { if (!(e instanceof Stale)) $("#libpick").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; }
+    })();
     $("#recbtn").onclick = async () => {
       save();
       if (!st.targets.length) return toast("Pick at least one board");
@@ -527,7 +548,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
       <h3 style="margin-top:12px">Why</h3><ul class="small">${r.rules.reasons.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
       <p class="small muted">Made for goal <b>${esc(GOAL_LABEL[r.goal] || r.goal)}</b> on ${r.targets.map(esc).join(", ")}. If you change them, recommend again.</p>
       <div class="tbl-wrap"><table class="t"><thead><tr><th></th><th>Candidate</th><th class="n">Params</th><th class="n">MACs</th><th class="n">Receptive field</th>${r.targets.map((t) => `<th class="n">${esc(t)} RAM</th><th class="n">flash</th><th class="n">latency</th>`).join("")}<th>Fits?</th></tr></thead><tbody>
-      ${r.candidates.map((c) => `<tr class="${c.recommended ? "rec" : c.fits ? "" : "nofit"}"><td>${c.recommended ? "★" : ""}</td><td><span class="mono small" title="${esc(arch(c.layers))}">${esc(c.id)}</span>${c.origin === "pool" ? ` <span class="badge">pool</span>` : ""}${c.over_cap ? ` <span class="badge b-warn">over cap</span>` : ""}</td><td class="n">${fmt(c.params)}</td><td class="n">${fmt(c.macs)}</td><td class="n">${c.receptive_field ? fmt(c.receptive_field) : "–"}</td>
+      ${r.candidates.map((c) => `<tr class="${c.recommended ? "rec" : c.fits ? "" : "nofit"}"><td>${c.recommended ? "★" : ""}</td><td><span class="mono small" title="${esc(arch(c.layers))}">${esc(c.id)}</span>${c.origin === "pool" ? ` <span class="badge">pool</span>` : c.origin === "library" ? ` <span class="badge b-info">library</span>` : ""}${c.over_cap ? ` <span class="badge b-warn">over cap</span>` : ""}</td><td class="n">${fmt(c.params)}</td><td class="n">${fmt(c.macs)}</td><td class="n">${c.receptive_field ? fmt(c.receptive_field) : "–"}</td>
         ${r.targets.map((t) => { const b = (c.boards || {})[t]; return b ? `<td class="n">${bytes(b.ram)}</td><td class="n">${bytes(b.flash)}</td><td class="n">${fmt(b.latency_ms, 3)} ms</td>` : `<td colspan="3" class="muted">no plan</td>`; }).join("")}
         <td>${c.fits ? `<span class="badge b-ok">fits</span>` : `<span class="badge b-bad" title="${esc(Object.values(c.boards || {}).flatMap((b) => (b && b.violations) || []).join("; "))}">no</span>`}</td></tr>`).join("")}</tbody></table></div>`;
   }
@@ -541,13 +562,13 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
         <div class="kpi"><div class="l">Boards</div><div class="v" style="font-size:15px">${st.targets.join(", ")}</div></div>
         <div class="kpi"><div class="l">Goal</div><div class="v" style="font-size:15px">${GOAL_LABEL[st.goal]}</div></div></div>
       ${Object.keys(st.training).length ? `<p class="small" style="margin-top:14px">Training settings: ${Object.entries(st.training).map(([k, v]) => `<code>${esc(k)}=${esc(String(v))}</code>`).join(" ")} (the rest automatic)</p>` : ""}
-      <p class="small muted" style="margin-top:14px">The pipeline trains ${st.sizes.length} size(s), quantizes each to INT8 (with quantization-aware fine-tuning when INT8 loses more than 1%), asks SAI for every plan on every board, picks the best that fits, then compiles, verifies and measures the deployed program's accuracy bit-exactly.</p>
+      <p class="small muted" style="margin-top:14px">The pipeline trains ${st.sizes.length} size(s)${st.archs.length ? ` and ${st.archs.length} library architecture(s) (${st.archs.map(esc).join(", ")})` : ""}, quantizes each to INT8 (with quantization-aware fine-tuning when INT8 loses more than 1%), asks SAI for every plan on every board, picks the best that fits, then compiles, verifies and measures the deployed program's accuracy bit-exactly.</p>
       ${nav(true, true, true, "Build my model →")}</div>`;
     $("#back").onclick = () => { st.name = $("#nm").value; st.step--; draw(); };
     $("#next").onclick = async () => {
       $("#next").disabled = true;
       try {
-        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, training: st.training, custom_variants: st.sizes.includes("auto") && st.auto ? { auto: st.auto } : {}, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
+        const r = await api("/api/projects", { json: { name: $("#nm").value, template_id: st.tpl.id, dataset_id: st.ds.id, targets: st.targets, goal: st.goal, sizes: st.sizes, architectures: st.archs, training: st.training, custom_variants: st.sizes.includes("auto") && st.auto ? { auto: st.auto } : {}, budgets: st.budgets, metric_target: st.metric === "" ? null : +st.metric, epochs: st.epochs, init_from_pool: !!st.initPool, lr_search: !!st.lrSearch, pool_benchmark: !!st.poolBench, preprocess: st.prep } });
         location.hash = `#/job/${r.job.id}`;
       } catch (e) { toast(e.message); $("#next").disabled = false; }
     };
@@ -571,6 +592,55 @@ function datasetSummary(d) {
 }
 
 /* ------------------------------------------------------------------------------------------------ job page */
+route(/^\/architectures$/, async (el) => {
+  let kind = "", editing = null;
+  async function load() {
+    const r = await api("/api/architectures");
+    const list = r.architectures.filter((a) => !kind || a.inputs.includes(kind));
+    const fams = [...new Set(list.map((a) => a.family))];
+    el.innerHTML = `<div class="page-h"><div><h1>Architecture library</h1><p class="muted">Model architectures built only from operators SAI compiles, checked with SAI on every board at a reference input. Pick them in a new project (Board &amp; goal step); the recommender costs them too.</p></div>
+      <div class="row">${r.can_publish ? `<button class="btn" id="verall">Verify all with SAI</button>` : ""}${r.can_add ? `<button class="btn primary" id="addarch">+ Add architecture</button>` : ""}</div></div>
+      <div class="chips" id="kf" style="margin-bottom:14px">${[["", "All inputs"], ["timeseries", "Time series"], ["2d", "Spectrogram / image"], ["features", "Feature vector"]].map(([k, v]) => `<button class="chip ${k === kind ? "on" : ""}" data-k="${k}">${v}</button>`).join("")}</div>
+      <div id="archform"></div>
+      ${fams.map((f) => `<h2 style="margin:18px 0 10px">${esc(f)}</h2><div class="arch-grid">${list.filter((a) => a.family === f).map((a) => { const ref = r.reference[a.inputs[0]];
+        return `<div class="card"><div class="row"><b>${esc(a.name)}</b><span class="spacer"></span>${a.source === "custom" ? `<span class="badge">${a.org_id ? "your organisation" : "SAI"}</span>` : `<span class="badge b-acc">built-in</span>`}</div>
+          <div class="small" style="margin-top:4px">${a.inputs.map((x) => `<span class="badge">${esc(x)}</span>`).join(" ")} ${a.tasks.map((x) => `<span class="badge b-info">${esc(x)}</span>`).join(" ")}</div>
+          <p class="small" style="margin:8px 0 0">${esc(a.summary)}</p>${a.notes ? `<p class="small muted" style="margin:4px 0 0">${esc(a.notes)}</p>` : ""}
+          <div class="arch-chain">${esc(archChain(a.layers))}</div>
+          ${Object.keys(a.checks).length ? `<table class="t small"><thead><tr><th>Board</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Latency</th><th></th></tr></thead><tbody>${Object.entries(a.checks).map(([t, c]) => `<tr><td>${esc(t)}</td><td class="n">${bytes(c.ram)}</td><td class="n">${bytes(c.flash)}</td><td class="n">${c.latency_ms === null ? "–" : fmt(c.latency_ms, 3) + " ms"}</td><td>${c.fits ? `<span class="badge b-ok">fits</span>` : `<span class="badge b-bad" title="${esc(((c.detail || {}).violations || []).join("; ") || (c.detail || {}).error || "")}">${c.ok ? "no fit" : "no plan"}</span>`}</td></tr>`).join("")}</tbody></table>
+            <div class="small muted">SAI ${esc(Object.values(a.checks)[0].sai_version)} · input ${ref.channels}×${ref.height}×${ref.width} · ${ago(Object.values(a.checks)[0].checked)}</div>` : `<p class="small muted">Not checked with SAI yet.</p>`}
+          <div class="row" style="margin-top:10px;gap:6px">${r.can_add ? `<button class="btn sm" data-ver="${esc(a.id)}">Verify with SAI</button>` : ""}${a.editable ? `<button class="btn sm ghost" data-edit="${esc(a.id)}">Edit</button><button class="btn sm ghost" data-del="${esc(a.id)}">Delete</button>` : ""}</div></div>`; }).join("")}</div>`).join("") || `<div class="empty small">No architectures for this input.</div>`}`;
+    const form = (a) => {
+      const v = a || { name: "", family: "Custom", size: "", inputs: ["timeseries"], tasks: ["classification"], layers: [{ op: "conv", out: 8, k: 5, stride: 2 }, { op: "dwconv", k: 3 }, { op: "pwconv", out: 16 }, { op: "gap" }], summary: "", notes: "" };
+      $("#archform").innerHTML = `<div class="card" style="margin-bottom:16px"><h2>${a ? "Edit" : "Add"} architecture</h2><div class="grid g3">
+        <label class="f">Name<input id="an" value="${esc(v.name)}"></label><label class="f">Family<input id="af" value="${esc(v.family)}"></label><label class="f">Size label<input id="as" value="${esc(v.size)}" placeholder="s, m, l"></label></div>
+        <div class="row" style="margin-top:8px">${r.input_kinds.map((k) => `<label class="check small"><input type="checkbox" name="ain" value="${k}" ${v.inputs.includes(k) ? "checked" : ""}>${k}</label>`).join("")}<span class="spacer"></span>${r.tasks.map((k) => `<label class="check small"><input type="checkbox" name="atk" value="${k}" ${v.tasks.includes(k) ? "checked" : ""}>${k}</label>`).join("")}</div>
+        <label class="f" style="margin-top:8px">Layers (JSON; SAI operators: conv, dwconv, pwconv, maxpool, avgpool, gap, fc, residual, dropout; the output head is added for you)<textarea id="al" rows="6" class="mono">${esc(JSON.stringify(v.layers, null, 0))}</textarea></label>
+        <label class="f">Summary<input id="asu" value="${esc(v.summary)}"></label>
+        ${!a && r.can_publish ? `<label class="check small" style="margin-top:8px"><input type="checkbox" id="aglob">Global (every customer sees it)</label>` : ""}
+        <div class="row" style="margin-top:10px"><button class="btn primary" id="asave">Save</button><button class="btn ghost" id="acancel">Cancel</button><span class="small muted" id="amsg"></span></div></div>`;
+      $("#acancel").onclick = () => { $("#archform").innerHTML = ""; };
+      $("#asave").onclick = async () => {
+        let layers; try { layers = JSON.parse($("#al").value); } catch { return toast("Layers are not valid JSON"); }
+        const body = { name: $("#an").value, family: $("#af").value, size: $("#as").value, inputs: $$("input[name=ain]:checked").map((x) => x.value), tasks: $$("input[name=atk]:checked").map((x) => x.value), layers, summary: $("#asu").value, scope: $("#aglob") && $("#aglob").checked ? "global" : "org" };
+        try { const x = await api(a ? `/api/architectures/${a.id}` : "/api/architectures", { method: a ? "PUT" : "POST", json: body }); toast(`Saved ${x.name}`); $("#archform").innerHTML = ""; load(); } catch (e) { $("#amsg").textContent = e.message; }
+      };
+    };
+    if ($("#addarch")) $("#addarch").onclick = () => form(null);
+    if ($("#verall")) $("#verall").onclick = async () => { const j = await api("/api/architectures/verify", { json: {} }); toast("Verifying every architecture with SAI…"); location.hash = `#/job/${j.id}`; };
+    el.onclick = async (e) => {
+      const t = e.target;
+      if (t.dataset.k !== undefined && t.classList.contains("chip")) { kind = t.dataset.k; return load(); }
+      if (t.dataset.ver) { t.disabled = true; t.textContent = "Checking with SAI…"; const j = await api("/api/architectures/verify", { json: { ids: [t.dataset.ver] } });
+        for (;;) { const s = await api(`/api/jobs/${j.id}`); if (["succeeded", "failed", "cancelled"].includes(s.status)) { if (s.status !== "succeeded") toast(s.error || s.status); break; } await new Promise((res) => setTimeout(res, 1500)); }
+        return load(); }
+      if (t.dataset.edit) return form(r.architectures.find((a) => a.id === t.dataset.edit));
+      if (t.dataset.del && confirm("Delete this architecture from the library?")) { await api(`/api/architectures/${t.dataset.del}`, { method: "DELETE" }); toast("Deleted"); load(); }
+    };
+  }
+  load();
+});
+
 async function refreshPending() {
   const el = $("#pendingCount"); if (!el || !ME) return;
   try {
@@ -630,7 +700,7 @@ route(/^\/packages$/, async (el) => {
 route(/^\/jobs$/, async (el) => {
   let timer = null, kind = "", status = "";
   el.innerHTML = `<div class="page-h"><div><h1>Jobs &amp; logs</h1><p class="muted">Every training run, recommendation, import, rebuild and regression, live. Open a job for its training monitor and full log.</p></div></div>
-    <div class="row" style="margin-bottom:12px"><select id="jk"><option value="">All kinds</option>${["train", "recommend", "ingest", "fitcheck", "analyze", "rebuild", "basetrain", "regression"].map((k) => `<option>${k}</option>`).join("")}</select>
+    <div class="row" style="margin-bottom:12px"><select id="jk"><option value="">All kinds</option>${["train", "recommend", "archverify", "ingest", "fitcheck", "analyze", "rebuild", "basetrain", "regression"].map((k) => `<option>${k}</option>`).join("")}</select>
     <select id="js"><option value="">Any status</option>${["running", "queued", "succeeded", "failed", "cancelled"].map((k) => `<option>${k}</option>`).join("")}</select><span class="spacer"></span><span class="small muted" id="jupd"></span></div>
     <div class="card"><div class="tbl-wrap" id="jt"></div></div>`;
   async function load() {
@@ -663,6 +733,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
       drawHead(); drawLive(); drawLog();
       if (["succeeded", "failed", "cancelled"].includes(job.status)) {
         if (job.kind === "recommend" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawRecommend(job.result); }
+        if (job.kind === "archverify" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; const r = job.result; $("#res").innerHTML = `<div class="card" style="margin-top:16px"><h2>SAI check</h2><p class="small">${r.checked} architecture(s) checked on ${r.targets.map(esc).join(", ")}${r.failed.length ? `; <b>${r.failed.length} failed</b>: ${r.failed.map((f) => esc(f.id + ": " + f.error)).join("; ")}` : ""}.</p><table class="t small"><tbody>${Object.entries(r.fits).map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td>${r.targets.map((t) => v.includes(t) ? `<span class="badge b-ok">✓ ${esc(t)}</span>` : `<span class="badge b-bad">✗ ${esc(t)}</span>`).join(" ")}</td></tr>`).join("")}</tbody></table><p class="small"><a href="#/architectures">Open the architecture library</a></p></div>`; return; }
         if (job.kind === "ingest" && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; $("#res").innerHTML = `<div class="callout ok" style="margin-top:16px">Dataset imported: <a href="#/data/${esc(job.result.dataset_id)}">open it</a>.</div>`; return; }
         if (["rebuild", "regression", "basetrain"].includes(job.kind) && job.status === "succeeded" && rendered !== job.status) { rendered = job.status; return drawPlansOnly(job.result); }
         if (rendered !== job.status) { rendered = job.status; drawResult(); if (job.kind === "train" && job.status === "succeeded") drawPackageButton().catch(() => {}); }

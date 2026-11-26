@@ -163,7 +163,8 @@ def _fc_family(prof: dict, task: str) -> list[tuple[str, list[dict]]]:
     return out
 
 
-def candidates(prof: dict, rl: dict, template: dict, n_outputs: int, max_candidates: int = 8) -> list[dict]:
+def candidates(prof: dict, rl: dict, template: dict, n_outputs: int, max_candidates: int = 8,
+               library: list | None = None) -> list[dict]:
     conv = any(layer["op"] in ("conv", "dwconv", "pwconv") for v in template["variants"].values() for layer in v)
     gen = _conv_family(prof, rl.get("max_stride", 4)) if conv else _fc_family(prof, template["task"])
     inp = {"channels": prof["channels"], "height": prof["height"], "width": prof["width"]}
@@ -187,6 +188,13 @@ def candidates(prof: dict, rl: dict, template: dict, n_outputs: int, max_candida
         add(f"pool:{size}", layers, "pool")
         if len(rows) > before:
             pool.append(rows.pop())
+    for aid, layers in library or []:         # architecture library entries that build on this input
+        before = len(rows)
+        add(f"lib:{aid}", layers, "library")
+        if len(rows) > before:
+            r = rows.pop()
+            if r["params"] <= rl["param_cap"] * 2:
+                pool.append(r)
     ok = [r for r in rows if r["params"] <= rl["param_cap"] and r["params"] >= rl["param_floor"] * 0.5]
     if conv and rl["rf_target"]:
         reach = [r for r in ok if r["receptive_field"] >= rl["rf_target"]]
@@ -283,7 +291,7 @@ def pick(cands: list[dict], rl: dict, goal: str) -> tuple[dict | None, str]:
 
 def recommend(X, y, task, labels, template, n_outputs, goal, targets, budgets, workdir, sample_rate_hz=None,
               n_train=None, max_candidates=8, calibration=None, measurements=None, log=lambda m: None,
-              cancelled=lambda: False, stage=lambda name, status="running": None) -> dict:
+              cancelled=lambda: False, stage=lambda name, status="running": None, library=None) -> dict:
     stage("profile")
     prof = profile(X, y, task, labels, sample_rate_hz, n_train)
     conv = any(layer["op"] in ("conv", "dwconv", "pwconv") for v in template["variants"].values() for layer in v)
@@ -292,9 +300,10 @@ def recommend(X, y, task, labels, template, n_outputs, goal, targets, budgets, w
         log("rule: " + r)
     stage("profile", "done")
     stage("generate")
-    cands = candidates(prof, rl, template, n_outputs, max_candidates)
+    cands = candidates(prof, rl, template, n_outputs, max_candidates, library)
     log(f"{len(cands)} candidates to cost with SAI ({sum(c['origin'] == 'generated' for c in cands)} generated, "
-        f"{sum(c['origin'] == 'pool' for c in cands)} from the pool)")
+        f"{sum(c['origin'] == 'pool' for c in cands)} from the pool, "
+        f"{sum(c['origin'] == 'library' for c in cands)} from the architecture library)")
     stage("generate", "done")
     stage("cost")
     cost(cands, prof, n_outputs, targets, goal, budgets, workdir, calibration, measurements, log, cancelled)

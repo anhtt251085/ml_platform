@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 import numpy as np
 
-from . import approvals, archspec, auth, boards, commercial, config, data, db, pipeline, sai_engine, store
+from . import approvals, archlib, archspec, auth, boards, commercial, config, data, db, pipeline, sai_engine, store
 
 app = FastAPI(title=config.BRAND_NAME, version=config.PLATFORM_VERSION)
 FRONT = config.ROOT / "frontend"
@@ -560,6 +560,7 @@ class ProjectIn(BaseModel):
     lr_search: bool = False           # try two learning rates per size, keep the better validation loss
     preprocess: dict = {}             # preprocessing stage settings (backend/preprocess.py)
     custom_variants: dict[str, list[dict]] = {}   # e.g. {"auto": layers} from the architecture recommender
+    architectures: list[str] = []     # architecture library ids to train next to the sizes
     training: dict = {}               # training settings (backend/trainer.py TRAIN_DEFAULTS); empty = automatic
 
 
@@ -587,6 +588,7 @@ def recommend_start(body: RecommendIn, u: dict = Depends(auth.current)):
         raise HTTPException(400, f"goal must be one of {pipeline.GOALS}")
     cfg = body.model_dump()
     cfg["max_candidates"] = max(2, min(cfg["max_candidates"], 16))
+    cfg["_org_id"] = u["org_id"]
     job = pipeline.create("recommend", cfg, org_id=u["org_id"], user_id=u["id"], priority=1)
     auth.audit(u, "recommend_started", job["id"], {"template": body.template_id, "dataset": body.dataset_id})
     return job
@@ -623,6 +625,20 @@ def project_create(body: ProjectIn, u: dict = Depends(auth.current)):
             _bad(e)
         if name not in cfg["sizes"]:
             cfg["sizes"].append(name)
+    task = d.get("task", "classification")
+    labels = d.get("labels") or []
+    n_out = len(labels) if task == "classification" else 1 if task == "regression" else c_in * h_in * w_in
+    for aid in cfg.pop("architectures") or []:
+        a = archlib.get(aid, u["org_id"], auth.has(u, "platform_admin"))
+        if not a:
+            raise HTTPException(400, f"unknown architecture {aid}")
+        fit = archlib.compatible(a, (c_in, h_in, w_in), task, n_out)
+        if not fit["ok"]:
+            raise HTTPException(400, f"architecture {a['name']} does not suit this data: {fit['reason']}")
+        cfg["custom_variants"][aid] = a["layers"]
+        cfg.setdefault("architecture_names", {})[aid] = a["name"]
+        if aid not in cfg["sizes"]:
+            cfg["sizes"].append(aid)
     if cfg.get("pool_benchmark") and not auth.has(u, "publish"):
         raise HTTPException(403, "only SAI research publishes pool benchmarks")
     plan = commercial.check_project(u)
@@ -713,6 +729,103 @@ def _file(jid: str, name: str) -> Path:
     if not p.exists():
         raise HTTPException(404, "not built yet")
     return p
+
+
+# ---- architecture library -----------------------------------------------------------------------------------------
+@app.get("/api/architectures")
+def arch_list(dataset_id: str | None = None, template_id: str | None = None, u: dict = Depends(auth.current)):
+    """The library; with a dataset, each entry says whether it suits that data (shape after preprocessing defaults)
+    with its parameters, MACs and receptive field. Latest SAI check per board is attached."""
+    plat = auth.has(u, "platform_admin")
+    archs = archlib.all_visible(u["org_id"], plat)
+    chk = archlib.checks()
+    ctx = None
+    if dataset_id:
+        d = _ds(dataset_id, u)
+        task = d.get("task", "classification")
+        labels = d.get("labels") or []
+        shape = d["shape"]
+        n_out = len(labels) if task == "classification" else 1 if task == "regression" else int(np.prod(shape))
+        ctx = (shape, task, n_out)
+    out = []
+    for a in archs:
+        row = {**a, "checks": chk.get(a["id"], {}),
+               "editable": a["source"] == "custom" and (plat or (a["org_id"] == u["org_id"] and auth.has(u, "research"))
+                                                        or (a["org_id"] is None and auth.has(u, "studio")))}
+        if ctx:
+            row["fit"] = archlib.compatible(a, *ctx)
+        out.append(row)
+    return {"architectures": out, "input_kinds": archlib.INPUT_KINDS, "tasks": archlib.TASKS,
+            "reference": archlib.REFERENCE, "can_add": auth.has(u, "research"), "can_publish": auth.has(u, "studio")}
+
+
+class ArchIn(BaseModel):
+    name: str
+    family: str = "Custom"
+    size: str = ""
+    inputs: list[str]
+    tasks: list[str]
+    layers: list[dict]
+    summary: str = ""
+    notes: str = ""
+    scope: str = "org"                # org (private to the organisation) | global (SAI researchers and admins)
+
+
+@app.post("/api/architectures")
+def arch_create(body: ArchIn, u: dict = Depends(auth.require("research"))):
+    if body.scope == "global" and not auth.has(u, "studio"):
+        raise HTTPException(403, "only SAI researchers and admins add global architectures")
+    try:
+        a = archlib.save(body.model_dump(), u, global_=body.scope == "global")
+    except archlib.LibError as e:
+        _bad(e)
+    auth.audit(u, "architecture_created", a["id"], {"name": a["name"], "global": a["org_id"] is None})
+    return a
+
+
+def _own_arch(aid: str, u: dict) -> dict:
+    a = archlib.get(aid, u["org_id"], auth.has(u, "platform_admin"))
+    if not a:
+        raise HTTPException(404, "unknown architecture")
+    if a["source"] == "builtin":
+        raise HTTPException(403, "built-in architectures cannot be changed")
+    if not (auth.has(u, "platform_admin") or (a["org_id"] == u["org_id"] and auth.has(u, "research"))
+            or (a["org_id"] is None and auth.has(u, "studio"))):
+        raise HTTPException(403, "you cannot change this architecture")
+    return a
+
+
+@app.put("/api/architectures/{aid}")
+def arch_update(aid: str, body: ArchIn, u: dict = Depends(auth.require("research"))):
+    _own_arch(aid, u)
+    try:
+        a = archlib.save(body.model_dump(), u, aid=aid)
+    except archlib.LibError as e:
+        _bad(e)
+    auth.audit(u, "architecture_updated", aid)
+    return a
+
+
+@app.delete("/api/architectures/{aid}")
+def arch_delete(aid: str, u: dict = Depends(auth.require("research"))):
+    _own_arch(aid, u)
+    archlib.delete(aid)
+    auth.audit(u, "architecture_deleted", aid)
+    return {"ok": True}
+
+
+@app.post("/api/architectures/verify")
+def arch_verify(body: dict, u: dict = Depends(auth.require("research"))):
+    """SAI check of library architectures (all, or `ids`) on every board: a background job."""
+    ids = body.get("ids") or []
+    if ids:
+        for aid in ids:
+            if not archlib.get(aid, u["org_id"], auth.has(u, "platform_admin")):
+                raise HTTPException(404, f"unknown architecture {aid}")
+    elif not auth.has(u, "studio"):
+        raise HTTPException(403, "verifying the whole library is for SAI researchers and admins")
+    return pipeline.create("archverify", {"ids": ids, "targets": body.get("targets")}, org_id=u["org_id"],
+                           user_id=u["id"], priority=1)
 
 
 # ---- compiled packages & approvals ---------------------------------------------------------------------------------

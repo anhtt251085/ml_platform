@@ -123,6 +123,11 @@ table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
 .progress > i { display: block; height: 100%; background: var(--accent); transition: width .3s; }
 
 .log { background: #0f1216; color: #cdd3dc; font: 12px/1.5 var(--mono); border-radius: 8px; padding: 10px 12px; max-height: 280px; overflow: auto; white-space: pre-wrap; }
+.arch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+.arch-chain { font: 11.5px/1.5 var(--mono); color: var(--muted); word-break: break-word; margin: 8px 0; }
+.archpick { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 8px; margin-top: 8px; }
+.archpick label { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; display: flex; gap: 8px; align-items: flex-start; }
+.archpick label.on { border-color: var(--accent); background: var(--accent-soft); }
 .nav-count { background: var(--warn); color: #fff; border-radius: 9px; font-size: 11px; padding: 0 6px; margin-left: 4px; }
 .b-pend { background: var(--warn-soft); color: var(--warn); }
 .log .lw { color: #f5c26b; }

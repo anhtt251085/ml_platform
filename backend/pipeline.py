@@ -32,6 +32,7 @@ STAGES = {
     "rebuild": [("compile", "Recompile"), ("compare", "Compare with the original build")],
     "basetrain": [("data", "Prepare data"), ("train", "Train base weights"), ("save", "Store in the pool")],
     "ingest": [("ingest", "Parse and validate"), ("store", "Store dataset")],
+    "archverify": [("verify", "SAI check per architecture and board")],
     "recommend": [("profile", "Profile the data"), ("generate", "Generate candidates"), ("cost", "SAI cost per board"),
                   ("pick", "Recommend")],
     "regression": [("plans", "Pool x boards plan check"), ("hil", "Emulated HIL smoke"), ("compare", "Compare with last run")],
@@ -277,7 +278,7 @@ def _run(jid: str, kind: str, params: dict):
     try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
          "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest,
-         "recommend": run_recommend}[kind](ctx, params)
+         "recommend": run_recommend, "archverify": run_archverify}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -931,6 +932,28 @@ int sai_infer(const float *raw) {{
 """
 
 
+def run_archverify(ctx: Ctx, p: dict):
+    """Check library architectures with SAI at their reference input on every board (see backend/archlib.py)."""
+    from . import archlib
+    ctx.stage("verify")
+    archs = [a for a in archlib.all_visible(None, platform=True) if not p.get("ids") or a["id"] in p["ids"]]
+    targets = [t for t in p.get("targets") or sai_engine.MCU_TARGETS if t in sai_engine.MCU_TARGETS]
+    ctx.log(f"{len(archs)} architecture(s) x {len(targets)} board(s), SAI {sai_engine.version().get('sai')}")
+    res, failed = {}, []
+    for i, a in enumerate(archs):
+        if ctx.cancelled():
+            raise InterruptedError("cancelled")
+        try:
+            res[a["id"]] = archlib.verify(a, targets, ctx.dir, log=ctx.log)
+        except Exception as e:            # one bad entry must not stop the others; it is reported
+            failed.append({"id": a["id"], "error": str(e)})
+            ctx.log(f"warning: {a['id']}: {e}")
+        ctx.progress_within("verify", (i + 1) / len(archs))
+    ctx.stage("verify", "done")
+    ctx.result({"checked": len(res), "failed": failed, "targets": targets,
+                "fits": {aid: [t for t, r in v.items() if r["fits"]] for aid, v in res.items()}})
+
+
 def run_recommend(ctx: Ctx, p: dict):
     """Recommend an architecture for this dataset, boards and goal, costed exactly by SAI before any training."""
     from . import recommend
@@ -946,8 +969,11 @@ def run_recommend(ctx: Ctx, p: dict):
     targets = [t for t in p.get("targets") or tpl.get("targets") or list(sai_engine.MCU_TARGETS) if t in sai_engine.MCU_TARGETS]
     ctx.log(f"dataset {meta.get('name')}: {len(X)} windows, input {list(X.shape[1:])}; boards {', '.join(targets)}; "
             f"goal {p.get('goal', 'balanced')}")
+    from . import archlib
+    lib = [(a["id"], a["layers"]) for a in archlib.all_visible(p.get("_org_id"), platform=False)
+           if archlib.compatible(a, X.shape[1:], task, n_out)["ok"]]
     res = recommend.recommend(X, y, task, labels, tpl, n_out, p.get("goal", "balanced"), targets, p.get("budgets"),
-                              ctx.dir, sample_rate_hz=rate, n_train=int(round(len(X) * pcfg["split"]["train"])),
+                              ctx.dir, library=lib, sample_rate_hz=rate, n_train=int(round(len(X) * pcfg["split"]["train"])),
                               max_candidates=int(p.get("max_candidates") or 8), calibration=boards_mod.calibration(),
                               measurements=boards_mod.measurements(), log=ctx.log, cancelled=ctx.cancelled,
                               stage=ctx.stage)

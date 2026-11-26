@@ -90,6 +90,15 @@ MIGRATIONS: list[str] = [
                                     decision_note TEXT, downloads INTEGER DEFAULT 0, last_download REAL);
     CREATE INDEX package_approvals_i ON package_approvals(org_id, status);
     """,
+    # 8: architecture library (custom entries; built-ins live in backend/archlib.py) and SAI verification results
+    """
+    CREATE TABLE architectures (id TEXT PRIMARY KEY, org_id TEXT, status TEXT, data TEXT, created_by TEXT,
+                                created REAL, updated REAL);
+    CREATE TABLE architecture_checks (arch_id TEXT, target TEXT, sai_version TEXT, ok INTEGER, fits INTEGER,
+                                      ram INTEGER, flash INTEGER, latency_ms REAL, plan TEXT, detail TEXT,
+                                      checked REAL);
+    CREATE INDEX architecture_checks_i ON architecture_checks(arch_id, target, checked);
+    """,
 ]
 
 
