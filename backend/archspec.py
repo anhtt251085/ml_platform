@@ -38,7 +38,37 @@ OPS = {
     "fc": {"params": {"out": int, "relu": bool}, "sai": "Fully Connected"},
     "residual": {"params": {"k": int}, "sai": "Conv + Conv + Add"},
     "dropout": {"params": {"p": float}, "sai": "(training only)"},
+    # sequence layers: compiled by SAI's front end through the XModels backend (SAI_REPO on product/sai-unified)
+    "lstm": {"params": {"units": int, "bidirectional": bool, "sequences": bool}, "sai": "LSTM (XModels)"},
+    "gru": {"params": {"units": int, "bidirectional": bool, "sequences": bool}, "sai": "GRU (XModels)"},
+    "rnn": {"params": {"units": int, "bidirectional": bool, "sequences": bool}, "sai": "SimpleRNN (XModels)"},
+    "attention": {"params": {"heads": int}, "sai": "Self-attention + LayerNorm (XModels)"},
+    "layernorm": {"params": {}, "sai": "LayerNorm (XModels)"},
 }
+RECURRENT = {"lstm": 4, "gru": 3, "rnn": 1}            # op -> gates
+SEQ_OPS = set(RECURRENT) | {"attention", "layernorm"}
+# operators a sequence model may use: in it, `conv` is a 1-D convolution over time with valid padding, `fc` before
+# the time reduction is applied to every time step, `gap` averages over time
+SEQ_ALLOWED = SEQ_OPS | {"conv", "fc", "gap", "dropout"}
+
+
+def is_sequence(spec: dict) -> bool:
+    return any(layer["op"] in SEQ_OPS for layer in spec.get("layers") or [])
+
+
+def seq_dims(inp: dict) -> tuple[int, int]:
+    """(time steps, features per step) a sequence model sees: 1-D [C, 1, T] -> T steps of C; 2-D [C, H, W] -> H
+    steps of C*W (rows of a spectrogram or image)."""
+    c, h, w = inp["channels"], inp["height"], inp["width"]
+    return (w, c) if h == 1 else (h, c * w)
+
+
+def to_sequence(X):
+    """Data [N, C, H, W] -> [N, T, F] in the layout of seq_dims (what sequence models are trained and fed with)."""
+    n, c, h, w = X.shape
+    if h == 1:
+        return X[:, :, 0, :].transpose(0, 2, 1).copy()
+    return X.transpose(0, 2, 1, 3).reshape(n, h, c * w).copy()
 
 
 class SpecError(ValueError):
@@ -107,14 +137,84 @@ def normalize(spec: dict) -> dict:
                 raise SpecError(f"layer {i} ({op}): out must be 1..1024")
         if op == "dropout":
             layer.setdefault("p", 0.1)
+        if op in RECURRENT:
+            layer.setdefault("units", 32)
+            layer.setdefault("bidirectional", False)
+            layer.setdefault("sequences", False)
+            if not 1 <= layer["units"] <= 512:
+                raise SpecError(f"layer {i} ({op}): units must be 1..512")
+        if op == "attention":
+            layer.setdefault("heads", 2)
+            if not 1 <= layer["heads"] <= 16:
+                raise SpecError(f"layer {i} (attention): heads must be 1..16")
         layers.append(layer)
     norm = {"input": {"channels": c, "height": h, "width": w}, "layers": layers, "outputs": outputs}
+    if any(layer["op"] in SEQ_OPS for layer in layers):
+        bad = sorted({layer["op"] for layer in layers if layer["op"] not in SEQ_ALLOWED})
+        if bad:
+            raise SpecError(f"a sequence model (LSTM, GRU, RNN, attention, LayerNorm) can also use conv, fc, gap and "
+                            f"dropout, not {', '.join(bad)}")
+        norm["layout"] = "sequence"
     shapes(norm)    # raises on an impossible graph
     return norm
 
 
+def _seq_shapes(spec: dict) -> list[dict]:
+    """Shapes of a sequence model: [T, F] while it is a sequence, [F] after the time reduction."""
+    t, f = seq_dims(spec["input"])
+    seq, prev = True, None
+    rows = []
+    for i, layer in enumerate(spec["layers"] + [{"op": "fc", "out": spec["outputs"], "relu": False, "head": True}]):
+        op = layer["op"]
+        macs = params = 0
+        if op in ("conv", "lstm", "gru", "rnn", "attention", "layernorm", "gap") and not seq:
+            raise SpecError(f"layer {i} ({op}): needs the sequence, but the time axis was already reduced (by a "
+                            "recurrent layer with sequences off, or by gap)")
+        if op == "conv":
+            k, st, d = layer["k"], layer["stride"], layer["dilation"]
+            nt = (t - (k - 1) * d - 1) // st + 1
+            if nt < 1:
+                raise SpecError(f"layer {i} (conv): {t} time steps are shorter than the kernel (valid padding)")
+            macs, params = nt * layer["out"] * f * k, layer["out"] * f * k + layer["out"]
+            t, f = nt, layer["out"]
+        elif op in RECURRENT:
+            g, u, dirs = RECURRENT[op], layer["units"], 2 if layer["bidirectional"] else 1
+            params = dirs * g * (f * u + u * u + 2 * u)
+            macs = dirs * g * t * (f * u + u * u)
+            f = dirs * u
+            seq = layer["sequences"]
+        elif op == "attention":
+            if f % layer["heads"]:
+                raise SpecError(f"layer {i} (attention): {f} features do not split into {layer['heads']} heads")
+            params = 4 * f * f + 4 * f + 2 * f
+            macs = 4 * t * f * f + 2 * t * t * f
+        elif op == "layernorm":
+            params, macs = 2 * f, 2 * t * f
+        elif op == "gap":
+            if prev in RECURRENT:
+                raise SpecError(f"layer {i} (gap): averaging over time right after a recurrent layer is not "
+                                "supported; put a fc or layernorm layer in between, or turn off 'sequences' to use "
+                                "the last state")
+            macs, seq = t * f, False
+        elif op == "fc":
+            if layer.get("head") and seq:
+                raise SpecError("end the sequence part before the output: a recurrent layer with sequences off "
+                                "(last state) or gap (average over time)")
+            n = t if seq else 1
+            macs, params = n * f * layer["out"], f * layer["out"] + layer["out"]
+            f = layer["out"]
+        if op != "dropout":
+            prev = op
+        shape = [t, f] if seq else [f]
+        rows.append({"index": i, "op": op, "head": bool(layer.get("head")), "shape": shape, "macs": int(macs),
+                     "params": int(params), "activation_bytes": int(t * f if seq else f)})
+    return rows
+
+
 def shapes(spec: dict) -> list[dict]:
     """Per-layer output shapes, MACs and parameters (head included). Raises SpecError."""
+    if spec.get("layout") == "sequence" or is_sequence(spec):
+        return _seq_shapes(spec)
     inp = spec["input"]
     s = Shape(inp["channels"], inp["height"], inp["width"])
     one_d = s.h == 1
@@ -175,7 +275,8 @@ def summary(spec: dict) -> dict:
             "weight_bytes_int8": sum(r["params"] for r in rows),   # ~1 B per weight, biases are int32 (small)
             "input_bytes": inp["channels"] * inp["height"] * inp["width"],
             "peak_activation_bytes": max([r["activation_bytes"] for r in rows] + [inp["channels"] * inp["height"] * inp["width"]]),
-            "spatial_axes": 1 if inp["height"] == 1 else 2}
+            "spatial_axes": 1 if inp["height"] == 1 or spec.get("layout") == "sequence" else 2,
+            "backend": "xmodels" if spec.get("layout") == "sequence" else "core"}
 
 
 def fake_quant(x, scale, zp):
@@ -240,6 +341,18 @@ class _Linear(nn.Linear):
         return F.linear(x, fake_quant_weight(self.weight) if self.qat else self.weight, self.bias)
 
 
+class _SelfAttention(nn.Module):
+    """Self-attention block: LayerNorm(x + MultiHeadAttention(x, x, x)), the pattern SAI's front end rebuilds."""
+
+    def __init__(self, d, heads):
+        super().__init__()
+        self.att = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.norm = nn.LayerNorm(d)
+
+    def forward(self, x):
+        return self.norm(x + self.att(x, x, x, need_weights=False)[0])
+
+
 class SpecNet(nn.Module):
     """A torch module built from a normalized spec. forward(x, record) fills `record[name] = tensor` for every
     tensor the exporter quantizes (names: "x", "L{i}", "L{i}_a" for the residual's inner tensor)."""
@@ -254,6 +367,10 @@ class SpecNet(nn.Module):
         self.mods = nn.ModuleList()
         self.layers = spec["layers"] + [{"op": "fc", "out": spec["outputs"], "relu": False, "head": True}]
         rows = shapes(spec)
+        self.sequence = spec.get("layout") == "sequence"
+        if self.sequence:
+            self._build_sequence(rows)
+            return
         prev_shape = [inp["channels"], inp["height"], inp["width"]]
         for layer, row in zip(self.layers, rows):
             op = layer["op"]
@@ -277,6 +394,49 @@ class SpecNet(nn.Module):
                 self.mods.append(nn.Identity())
             prev_shape = row["shape"]
 
+    def _build_sequence(self, rows):
+        t, f = seq_dims(self.spec["input"])
+        seq = True
+        for layer, row in zip(self.layers, rows):
+            op = layer["op"]
+            if op == "conv":
+                self.mods.append(nn.Conv1d(f, layer["out"], layer["k"], layer["stride"], 0, layer["dilation"]))
+            elif op in RECURRENT:
+                cls = {"lstm": nn.LSTM, "gru": nn.GRU, "rnn": nn.RNN}[op]
+                self.mods.append(cls(f, layer["units"], batch_first=True, bidirectional=layer["bidirectional"]))
+            elif op == "attention":
+                self.mods.append(_SelfAttention(f, layer["heads"]))
+            elif op == "layernorm":
+                self.mods.append(nn.LayerNorm(f))
+            elif op == "fc":
+                self.mods.append(_Linear(f, layer["out"]))
+            elif op == "dropout":
+                self.mods.append(nn.Dropout(layer["p"]))
+            else:
+                self.mods.append(nn.Identity())
+            f = row["shape"][-1]
+
+    def _forward_sequence(self, x):
+        """x: [N, T, F] (archspec.to_sequence)."""
+        for layer, mod in zip(self.layers, self.mods):
+            op = layer["op"]
+            if op == "conv":
+                x = mod(x.transpose(1, 2)).transpose(1, 2)
+                if layer.get("relu"):
+                    x = F.relu(x)
+            elif op in RECURRENT:
+                y = mod(x)[0]
+                x = y if layer["sequences"] else y[:, -1, :]
+            elif op in ("attention", "layernorm", "dropout"):
+                x = mod(x)
+            elif op == "gap":
+                x = x.mean(1)
+            elif op == "fc":
+                x = mod(x)
+                if layer.get("relu"):
+                    x = F.relu(x)
+        return x
+
     # ---- quantization support -------------------------------------------------------------------------------
     act_q: dict | None = None            # name -> (scale, zero_point); set for quantization-aware fine-tuning
 
@@ -299,6 +459,8 @@ class SpecNet(nn.Module):
         return x
 
     def forward(self, x, record: dict | None = None):
+        if self.sequence:
+            return self._forward_sequence(x)
         x = self._t("x", x, record)
         for i, (layer, mod) in enumerate(zip(self.layers, self.mods)):
             op = layer["op"]

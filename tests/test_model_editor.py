@@ -65,7 +65,7 @@ def test_preview_checks_an_edited_model_on_the_users_data():
                                                             "preprocess": {"decimate": 2}}).json()
         assert r2["ok"] and r2["spec"]["input"]["width"] == 16
         # impossible edits come back as a message, not an error page
-        bad = c.post("/api/models/preview", headers=h, json={"dataset_id": ds["id"], "layers": [{"op": "lstm"}]}).json()
+        bad = c.post("/api/models/preview", headers=h, json={"dataset_id": ds["id"], "layers": [{"op": "conv3d"}]}).json()
         assert not bad["ok"] and "unknown op" in bad["error"]
         bad = c.post("/api/models/preview", headers=h, json={"dataset_id": ds["id"],
                                                              "layers": [{"op": "fc", "out": 8}, {"op": "conv", "out": 4}]}).json()
@@ -105,7 +105,7 @@ def test_fitcheck_is_open_to_engineers():
     with _client() as c:
         h, _ = _engineer(c)
         ds = c.post("/api/datasets/demo", headers=h, json={"template_id": "gas-sense", "per_class": 20}).json()
-        assert c.post("/api/models/fitcheck", headers=h, json={"dataset_id": ds["id"], "layers": [{"op": "lstm"}]}).status_code == 400
+        assert c.post("/api/models/fitcheck", headers=h, json={"dataset_id": ds["id"], "layers": [{"op": "conv3d"}]}).status_code == 400
         j = c.post("/api/models/fitcheck", headers=h, json={"dataset_id": ds["id"], "layers": BASE, "targets": ["md6605"]})
         assert j.status_code == 200 and j.json()["kind"] == "fitcheck"
         if not sai_engine.available():

@@ -41,6 +41,12 @@ RES = lambda k=3: {"op": "residual", "k": k}  # noqa: E731
 DROP = {"op": "dropout", "p": 0.1}
 
 TS, D2, FV = ["timeseries"], ["2d"], ["features"]
+LSTM = lambda u, bi=False, seq=False: {"op": "lstm", "units": u, "bidirectional": bi, "sequences": seq}  # noqa: E731
+GRU = lambda u, bi=False, seq=False: {"op": "gru", "units": u, "bidirectional": bi, "sequences": seq}  # noqa: E731
+RNN = lambda u: {"op": "rnn", "units": u, "bidirectional": False, "sequences": False}  # noqa: E731
+ATT = lambda h=2: {"op": "attention", "heads": h}  # noqa: E731
+LN = {"op": "layernorm"}
+CV = lambda out, k=5, stride=2: {"op": "conv", "out": out, "k": k, "stride": stride}  # noqa: E731
 CR = ["classification", "regression"]
 
 
@@ -180,6 +186,36 @@ BUILTIN = [
        "must beat.", "Use it to check that a deeper model earns its RAM and flash."),
     _a("mlp-l", "MLP L", "Dense network", "l", FV, CR, [FC(128), DROP, FC(64), FC(32)],
        "Three wider dense layers for rich feature vectors (spectral statistics, many sensors)."),
+    # ---- sequence models: SAI front end, XModels backend (evaluation only until the front end is qualified) ----
+    _a("lstm-s", "LSTM S", "Recurrent (XModels)", "s", TS + D2, CRA, [LSTM(16)],
+       "One 16-unit LSTM over the window, classifying from its last state.",
+       "Sequence model: compiled by SAI's front end (XModels); packages are evaluation-only for now.",
+       "Classic LSTM classifier (Hochreiter & Schmidhuber, 1997) at MCU scale."),
+    _a("gru-s", "GRU S", "Recurrent (XModels)", "s", TS + D2, CRA, [GRU(24)],
+       "One 24-unit GRU: fewer gates than an LSTM, often as accurate on sensor data.",
+       "Sequence model (XModels); evaluation-only packages.", "GRU (Cho et al., 2014)."),
+    _a("rnn-s", "SimpleRNN S", "Recurrent (XModels)", "xs", TS + D2, CRA, [RNN(16)],
+       "The smallest recurrent model: a 16-unit tanh RNN.", "Sequence model (XModels); evaluation-only packages."),
+    _a("bilstm-s", "BiLSTM S", "Recurrent (XModels)", "s", TS + D2, CRA, [LSTM(12, bi=True)],
+       "Reads the window forwards and backwards (12 units each).",
+       "More RAM than one direction; Cortex-M7 class parts. Sequence model (XModels); evaluation-only packages.",
+       "Bidirectional RNN (Schuster & Paliwal, 1997)."),
+    _a("lstm-stack", "Stacked LSTM M", "Recurrent (XModels)", "m", TS + D2, CRA,
+       [LSTM(24, seq=True), LSTM(24)], "Two stacked LSTMs (24 units): the first passes its full sequence on.",
+       "Sequence model (XModels); evaluation-only packages."),
+    _a("crnn-s", "CRNN S", "Convolutional-recurrent (XModels)", "s", TS, CRA, [CV(16, 5, 2), GRU(16)],
+       "A strided convolution shortens and enriches the sequence, then a GRU reads it.",
+       "Long windows (the convolution halves the steps). Sequence model (XModels); evaluation-only packages.",
+       "CRNN (e.g. DeepConvLSTM-style conv + recurrent layers) with valid padding."),
+    _a("tiny-transformer", "Tiny transformer encoder", "Attention (XModels)", "s", TS + D2, CRA,
+       [{"op": "fc", "out": 16, "relu": True}, ATT(2), {"op": "fc", "out": 16, "relu": True}, {"op": "gap"}],
+       "Per-step projection to 16 features, one 2-head self-attention block with LayerNorm, average over time.",
+       "Cortex-M7 class parts (attention RAM grows with the square of the steps; a 256-step window needs ~20 KB). "
+       "Sequence model (XModels); evaluation-only packages.",
+       "Transformer encoder (Vaswani et al., 2017) at KWT-style MCU scale (Berg et al., 2021)."),
+    _a("lstm-ln", "LSTM + LayerNorm", "Recurrent (XModels)", "s", TS + D2, CRA, [LSTM(16, seq=True), LN, {"op": "gap"}],
+       "LSTM over the whole window, LayerNorm, then the average over time (uses every step, not just the last).",
+       "Keeps every step: Cortex-M7 class parts for long windows. Sequence model (XModels); evaluation-only packages."),
     _a("ae-l", "Autoencoder L (MLPerf-style)", "Dense autoencoder", "l", FV, FA,
        [FC(128), FC(128), FC(8), FC(128), FC(128)],
        "Two 128-unit layers on each side of an 8-value bottleneck.", "Trained on normal data only.",
@@ -309,30 +345,56 @@ def checks(aid: str | None = None) -> dict:
     return out
 
 
-def verify(arch: dict, targets, workdir: Path, log=lambda m: None) -> dict:
-    """Export at the reference input with random weights and run SAI's plan search per board; store the result."""
+def random_plans(spec: dict, targets, workdir: Path, goal: str = "balanced", budgets: dict | None = None,
+                 log=lambda m: None, name: str = "model") -> dict:
+    """Plans per board for an untrained architecture (random weights; RAM, flash and plan do not depend on them):
+    SAI Core's plan search for CNNs, SAI's front end (XModels) for sequence models."""
     import torch
 
-    from . import qexport, sai_engine
+    from . import qexport, sai_engine, seqfront
+    inp = spec["input"]
+    torch.manual_seed(0)
+    net = archspec.SpecNet(spec)
+    net.eval()
+    rng = np.random.default_rng(0)
+    summ = archspec.summary(spec)
+    if spec.get("layout") == "sequence":
+        if not seqfront.available():
+            raise RuntimeError(seqfront.why_unavailable())
+        t, f = archspec.seq_dims(inp)
+        path = workdir / f"{name}_float.onnx"
+        seqfront.export_float(net, spec, path)
+        data = workdir / f"{name}_calib.npz"
+        seqfront.write_data(data, rng.normal(0, 1, (32, t, f)).astype(np.float32), None, "regression")
+        try:
+            return seqfront.plans(path, list(targets), goal, budgets, workdir / f"{name}_xm", data, None, log=log)
+        finally:
+            path.unlink(missing_ok=True)
+            data.unlink(missing_ok=True)
+    net.fold_bn()
+    calib = rng.normal(0, 1, (32, inp["channels"], inp["height"], inp["width"])).astype(np.float32)
+    path = workdir / f"{name}.onnx"
+    qexport.export_qdq(net, calib, path)
+    try:
+        return sai_engine.plan_search(path, summ["macs"], summ["spatial_axes"], list(targets), goal, budgets,
+                                      explore_seconds=3, explore_builds=0, log=log)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def verify(arch: dict, targets, workdir: Path, log=lambda m: None) -> dict:
+    """Export at the reference input with random weights and run SAI's plan search per board; store the result."""
+    from . import sai_engine
     kind = arch["inputs"][0]
     inp = REFERENCE[kind]
     n_out = int(np.prod([inp["channels"], inp["height"], inp["width"]])) if arch["tasks"] == ["anomaly"] else 4
     spec = archspec.normalize({"input": inp, "layers": arch["layers"], "outputs": n_out})
-    torch.manual_seed(0)
-    net = archspec.SpecNet(spec)
-    net.eval()
-    net.fold_bn()
-    calib = np.random.default_rng(0).normal(0, 1, (32, inp["channels"], inp["height"], inp["width"])).astype(np.float32)
-    path = workdir / f"arch_{arch['id']}.onnx"
-    qexport.export_qdq(net, calib, path)
     summ = archspec.summary(spec)
     sai_v = (sai_engine.version() or {}).get("sai", "unknown")
+    if spec.get("layout") == "sequence":
+        sai_v = f"{sai_v} + sai_front (XModels)"
     out = {}
-    try:
-        plans = sai_engine.plan_search(path, summ["macs"], summ["spatial_axes"], list(targets), "balanced",
-                                       explore_seconds=3, explore_builds=0)
-    finally:
-        path.unlink(missing_ok=True)
+    plans = random_plans(spec, targets, workdir, name=f"arch_{arch['id']}")
     for t in targets:
         rows = [r for r in plans["candidates"] if r["target"] == t]
         fit = [r for r in rows if r["fits"]]

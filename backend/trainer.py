@@ -216,11 +216,12 @@ def train(spec, Xn, y, idx, task, epochs=30, lr=5e-3, batch=None, min_steps=1500
             if task != "anomaly":            # augmentation (training only): gain jitter, noise, time shift
                 aug = augment if augment is not None else {"gain": 0.05, "noise": 0.0, "shift": 0}
                 if aug.get("gain"):
-                    xb = xb * (1 + aug["gain"] * torch.randn(len(b), 1, 1, 1, device=DEVICE))
+                    xb = xb * (1 + aug["gain"] * torch.randn(len(b), *([1] * (xb.dim() - 1)), device=DEVICE))
                 if aug.get("noise"):
                     xb = xb + aug["noise"] * torch.randn_like(xb)
                 if aug.get("shift"):
-                    xb = torch.roll(xb, int(np.random.default_rng(ep * 100003 + s).integers(-aug["shift"], aug["shift"] + 1)), dims=3)
+                    xb = torch.roll(xb, int(np.random.default_rng(ep * 100003 + s).integers(-aug["shift"], aug["shift"] + 1)),
+                                    dims=1 if xb.dim() == 3 else 3)      # time axis: [N, T, F] or [N, C, H, T]
             opt.zero_grad()
             loss = loss_fn(net(xb), yt[b])
             loss.backward()

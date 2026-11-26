@@ -33,6 +33,7 @@ STAGES = {
     "basetrain": [("data", "Prepare data"), ("train", "Train base weights"), ("save", "Store in the pool")],
     "ingest": [("ingest", "Parse and validate"), ("store", "Store dataset")],
     "archverify": [("verify", "SAI check per architecture and board")],
+    "multimodel": [("collect", "Collect models"), ("compile", "SAI multi-model build"), ("package", "Package")],
     "recommend": [("profile", "Profile the data"), ("generate", "Generate candidates"), ("cost", "SAI cost per board"),
                   ("pick", "Recommend")],
     "regression": [("plans", "Pool x boards plan check"), ("hil", "Emulated HIL smoke"), ("compare", "Compare with last run")],
@@ -278,7 +279,7 @@ def _run(jid: str, kind: str, params: dict):
     try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
          "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest,
-         "recommend": run_recommend, "archverify": run_archverify}[kind](ctx, params)
+         "recommend": run_recommend, "archverify": run_archverify, "multimodel": run_multimodel}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -354,6 +355,8 @@ def run_train(ctx: Ctx, p: dict):
     ctx.stage("train")
     variants = []
     custom = p.get("custom_variants") or {}
+    from . import seqfront
+    Xseq = None                         # [N, T, F] for sequence models (LSTM / GRU / attention), made on first use
     for si, size in enumerate(sizes):
         layers = custom.get(size) or tpl["variants"].get(size)
         if size in custom:
@@ -366,7 +369,15 @@ def run_train(ctx: Ctx, p: dict):
             ctx.log(f"size {size}: skipped ({e})")
             continue
         summ = archspec.summary(spec)
-        ctx.log(f"size {size}: {summ['params']:,} params, {summ['macs']:,} MACs")
+        seq = spec.get("layout") == "sequence"
+        if seq and not seqfront.available():
+            ctx.log(f"warning: size {size}: skipped, {seqfront.why_unavailable()}")
+            continue
+        if seq and Xseq is None:
+            Xseq = archspec.to_sequence(Xn)
+        Xin = Xseq if seq else Xn
+        ctx.log(f"size {size}: {summ['params']:,} params, {summ['macs']:,} MACs"
+                + (" (sequence model: SAI front end, XModels backend)" if seq else ""))
         base = pool_weights(tpl["id"], size) if p.get("init_from_pool") else None
         lrs = [3e-3, 1e-2] if p.get("lr_search") and not tcfg["lr"] else [None]
         best_net = None
@@ -379,7 +390,7 @@ def run_train(ctx: Ctx, p: dict):
             kw = {"lr": lr if lr else (2e-3 if base is not None else 5e-3)}
             run_cfg = {**tcfg, "lr": lr or tcfg["lr"]}
             series = f"train:{size}" + (f"@lr{kw['lr']:g}" if len(lrs) > 1 else "")
-            net, hist = trainer.train(spec, Xn, y, idx, task, epochs=epochs, log=ctx.log, cancelled=ctx.cancelled,
+            net, hist = trainer.train(spec, Xin, y, idx, task, epochs=epochs, log=ctx.log, cancelled=ctx.cancelled,
                                       cfg=run_cfg, metric=lambda d, s=series: ctx.metric(s, d),
                                       augment=pcfg["augment"], class_weights=pcfg["class_weights"],
                                       progress=lambda f, si=si: ctx.progress_within("train", (si + f) / len(sizes)),
@@ -390,16 +401,16 @@ def run_train(ctx: Ctx, p: dict):
                 best_net = (net, hist)
         net, hist = best_net
         with torch.no_grad():
-            out = net(torch.from_numpy(Xn[idx["test"]])).numpy().reshape(len(idx["test"]), -1)
+            out = net(torch.from_numpy(Xin[idx["test"]])).numpy().reshape(len(idx["test"]), -1)
         thr = None
         if task == "anomaly":
             with torch.no_grad():
-                vo = net(torch.from_numpy(Xn[idx["val"]])).numpy().reshape(len(idx["val"]), -1)
+                vo = net(torch.from_numpy(Xin[idx["val"]])).numpy().reshape(len(idx["val"]), -1)
             thr = float(np.percentile(((vo - Xn[idx["val"]].reshape(len(idx["val"]), -1)) ** 2).mean(1), 99))
         fm = trainer.metrics(task, y[idx["test"]], out, labels, y_stats, Xn[idx["test"]].reshape(len(idx["test"]), -1), thr)
         ctx.log(f"size {size}: float {fm['headline']} = {fm['value']}")
         variants.append({"size": size, "spec": spec, "summary": summ, "net": net, "history": hist,
-                         "float": fm, "threshold": thr})
+                         "float": fm, "threshold": thr, "seq": seq, "backend": "xmodels" if seq else "core"})
     if not variants:
         raise ValueError("no model size fits this input; check the window length")
     ctx.stage("train", "done")
@@ -427,6 +438,12 @@ def run_train(ctx: Ctx, p: dict):
         return _m(out, xs, ys, v)
 
     for v in variants:
+        if v["seq"]:                       # the SAI front end quantizes sequence models itself (sai-int/1)
+            path = ctx.dir / f"model_{v['size']}.onnx"
+            seqfront.export_float(v["net"], v["spec"], path)
+            v["onnx"], v["quant_method"], v["int8"] = path, "SAI front end", dict(v["float"])
+            ctx.log(f"size {v['size']}: float ONNX exported for the SAI front end (it quantizes with its own contract)")
+            continue
         v["net"].fold_bn()
         path = ctx.dir / f"model_{v['size']}.onnx"
         v["q"] = qexport.export_qdq(v["net"], calib, path)
@@ -470,7 +487,23 @@ def run_train(ctx: Ctx, p: dict):
     # 4 plan -----------------------------------------------------------------------------------------------------
     ctx.stage("plan")
     cal = boards_mod.calibration()
+    seq_data = None
     for i, v in enumerate(variants):
+        if v["seq"]:
+            if seq_data is None:
+                cal_i = np.random.default_rng(0).choice(idx["train"], size=min(512, len(idx["train"])), replace=False)
+                seq_data = (ctx.dir / "seq_calib.npz", ctx.dir / "seq_test.npz")
+                seqfront.write_data(seq_data[0], Xseq[cal_i], y[cal_i], task)
+                seqfront.write_data(seq_data[1], Xseq[idx["test"]], y[idx["test"]], task)
+            v["plans"] = seqfront.plans(v["onnx"], targets, goal, p.get("budgets"), ctx.dir / f"seq_{v['size']}",
+                                        seq_data[0], seq_data[1], log=ctx.log)
+            acc = next((c["accuracy"] for c in v["plans"]["candidates"] if c.get("accuracy")), None) or {}
+            if task == "classification" and acc.get("integer_top1") is not None:
+                v["int8"] = {**v["float"], "headline": "accuracy", "value": round(float(acc["integer_top1"]), 4),
+                             "basis": "SAI front end integer oracle"}
+            ctx.progress_within("plan", (i + 1) / len(variants))
+            ctx.log(f"size {v['size']}: {v['plans']['feasible']} of {len(v['plans']['candidates'])} boards fit")
+            continue
         v["plans"] = sai_engine.plan_search(v["onnx"], v["summary"]["macs"], v["summary"]["spatial_axes"], targets,
                                             goal if goal != "accuracy" else "balanced", p.get("budgets"), cal,
                                             log=ctx.log, measurements=boards_mod.measurements(),
@@ -512,6 +545,10 @@ def run_train(ctx: Ctx, p: dict):
             f"RAM {chosen['ram']} B, flash {chosen['flash']} B, ~{chosen['latency']['ms']} ms, "
             f"INT8 {v['int8']['headline']} {v['int8']['value']}" + (f" - {note}" if note else ""))
     ctx.stage("select", "done", note)
+
+    if v["seq"]:
+        return _finish_sequence(ctx, p, tpl, meta, v, variants, chosen, note, goal, targets, acc_target, tcfg, idx, y,
+                                labels, task, y_stats, pcfg, off, sc, mean, std, raw_shape, X, Xseq, xt)
 
     # 6 compile --------------------------------------------------------------------------------------------------
     ctx.stage("compile")
@@ -621,11 +658,123 @@ def run_train(ctx: Ctx, p: dict):
     ctx.result(report)
 
 
+def _finish_sequence(ctx, p, tpl, meta, v, variants, chosen, note, goal, targets, acc_target, tcfg, idx, y, labels,
+                     task, y_stats, pcfg, off, sc, mean, std, raw_shape, X, Xseq, xt):
+    """Compile, bit-exact evaluation and package for a sequence model built by SAI's front end (XModels)."""
+    from . import commercial, seqfront
+    ctx.stage("compile")
+    build = ctx.dir / "build"
+    if build.exists():
+        shutil.rmtree(build)
+    shutil.copytree(chosen["build_dir"], build)
+    final = ctx.dir / "model.onnx"
+    shutil.copy(v["onnx"], final)
+    ver = chosen.get("verification") or {}
+    checks = [{"name": "integer oracle vs generated C (host)", "passed": ver.get("mismatches") == 0,
+               "detail": f"{ver.get('vectors')} vectors, {ver.get('mismatches')} mismatches"},
+              {"name": "sanitizers (ASan / UBSan)", "passed": "clean" in str(ver.get("sanitized", "")),
+               "detail": ver.get("sanitized")}]
+    q7 = ver.get("cortex_m7_qemu") or {}
+    if q7:
+        checks.append({"name": "Cortex-M7 build on QEMU", "passed": "exact" in str(q7.get("result", "")),
+                       "detail": q7.get("result")})
+    passed = sum(1 for c in checks if c["passed"])
+    ctx.log(f"SAI front end build for {chosen['target']}: plan {chosen['schedule']}, {passed}/{len(checks)} checks "
+            "passed (output EVALUATION_ONLY: the front end is not qualified yet)")
+    ctx.stage("compile", "done")
+
+    ctx.stage("exact")
+    outs, q = seqfront.run_exact(build / "library", Xseq[idx["test"]], ctx.dir / "exact")
+    exact = trainer.metrics(task, y[idx["test"]], outs, labels, y_stats, xt.reshape(len(xt), -1), v["threshold"])
+    exact["basis"] = "generated C run on the host (sai_xm_invoke), every test window"
+    ctx.log(f"bit-exact generated C: {exact['headline']} = {exact['value']} on {len(xt)} test windows")
+    ctx.stage("exact", "done")
+
+    ctx.stage("package")
+    seq_width = 1 if X.shape[2] == 1 else int(X.shape[3])
+    pre = {"mean": mean.reshape(-1).tolist(), "std": std.reshape(-1).tolist(), "input": q["input"],
+           "preprocess": pcfg, "raw_shape": raw_shape, "model_input_shape": list(Xseq.shape[1:]),
+           "output": q["output"], "task": task, "labels": labels, "y_stats": y_stats, "threshold": v["threshold"],
+           "layout": "[time, features] (sequence model)", "frontend": meta.get("frontend")}
+    with db.conn() as c:
+        org_id = (c.execute("SELECT org_id FROM jobs WHERE id=?", (ctx.id,)).fetchone() or [None])[0]
+    reasons = ["SAI's front end and XModels backend are not qualified yet (their own status: EVALUATION_ONLY)"]
+    if not meta.get("commercial_use"):
+        reasons.append(f"dataset licence '{meta.get('licence')}' does not allow commercial use")
+    if not commercial.deployment_rights(org_id):
+        reasons.append("the organisation has no SAI deployment rights yet (royalty or buyout)")
+    eval_reason = "; ".join(reasons)
+    ctx.log(f"package is EVALUATION ONLY: {eval_reason}")
+    (ctx.dir / "preprocessing.json").write_text(json.dumps(pre, indent=1))
+    (ctx.dir / "sai_app.h").write_text(_app_header(pre, tpl, False))
+    (ctx.dir / "sai_app_prepare.h").write_text(preprocess.c_prepare(
+        pcfg, off, sc, q["input"], raw_shape if pcfg["window_ops"] else list(X.shape[1:]), seq_width=seq_width))
+    (ctx.dir / "main_example.c").write_text(seqfront.EXAMPLE_MAIN)
+    front = chosen.get("accuracy") or {}
+    report = {
+        "template": {k: tpl.get(k) for k in ("id", "name", "domain", "task", "version", "source")},
+        "pool_benchmark": bool(p.get("pool_benchmark")),
+        "dataset": {k: meta.get(k) for k in ("id", "name", "source", "n", "shape", "labels", "class_counts", "synthetic",
+                                             "licence", "commercial_use", "recordings", "quality", "frontend")},
+        "deployable": False, "evaluation_reason": eval_reason, "split_mode": idx["split_mode"], "backend": "xmodels",
+        "goal": goal, "targets": targets, "budgets": p.get("budgets"), "metric_target": acc_target, "training": tcfg,
+        "variants": [{"size": x["size"], "summary": {k: x["summary"][k] for k in ("macs", "params", "spatial_axes")},
+                      "layers": x["summary"]["layers"], "spec": x["spec"], "float": x["float"], "int8": x["int8"],
+                      "quant_method": x.get("quant_method"), "backend": x["backend"],
+                      "history": x["history"], "plans": x["plans"]} for x in variants],
+        "selected": {**chosen, "note": note},
+        "exact": exact, "verify": {"passed": passed, "total": len(checks), "checks": checks},
+        "front_end": {"accuracy": front, "route": "xmodels", "techniques": None},
+        "memory_certificate": None, "certificate_check": None, "preprocessing": pre, "sai": sai_engine.version(),
+        "provenance": {"platform_version": config.PLATFORM_VERSION, "torch": torch.__version__,
+                       "seeds": {"split": 0, "torch": int(tcfg.get("seed", 0)), "calibration": 0},
+                       "compiler": "SAI front end (sai_front) + XModels", "target": chosen["target"],
+                       "objective": chosen["objective"], "schedule": chosen["schedule"]},
+        "tier_compare": None,
+    }
+    (ctx.dir / "report.json").write_text(json.dumps(report, indent=1, default=str))
+    (ctx.dir / "MODEL_CARD.md").write_text(_model_card(report, tpl, meta))
+    with zipfile.ZipFile(ctx.dir / "package.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(build.rglob("*")):
+            if f.is_file():
+                z.write(f, Path("sai_package") / f.relative_to(build))
+        for name in ("model.onnx", "preprocessing.json", "sai_app.h", "sai_app_prepare.h", "main_example.c",
+                     "report.json", "MODEL_CARD.md"):
+            z.write(ctx.dir / name, Path("sai_package") / name)
+        for f in ("sai_prep.c", "sai_prep.h"):
+            z.write(preprocess.SRC / f, Path("sai_package") / f)
+        z.writestr("sai_package/EVALUATION_ONLY.txt", f"Evaluation only: {eval_reason}. Not for deployment.\n")
+    sig = commercial.sign_package(ctx.dir / "package.zip", {
+        "job": ctx.id, "org": org_id, "deployable": False, "platform_version": config.PLATFORM_VERSION,
+        "sai_version": "sai_front", "plan_digest": None, "target": chosen["target"]})
+    ctx.log(f"package signed (Ed25519, key {sig['key_id']}); package.zip ready")
+    ctx.stage("package", "done")
+    report["downloads"] = ["package.zip", "model.onnx", "report.json", "MODEL_CARD.md"]
+    report["signature"] = sig
+    report["selected_model_path"] = str(final)
+    from . import retention
+    retention.job_intermediates(ctx.dir)
+    ctx.result(report)
+
+
 def run_fitcheck(ctx: Ctx, p: dict):
     ctx.stage("build")
     spec = archspec.normalize(p["spec"])
     summ = archspec.summary(spec)
     ctx.log(f"{len(spec['layers'])} layers + head, {summ['params']:,} params, {summ['macs']:,} MACs")
+    if spec.get("layout") == "sequence":          # SAI's front end (XModels) builds sequence models
+        from . import archlib
+        ctx.stage("build", "done")
+        ctx.stage("quantize")
+        ctx.log("sequence model: float graph with random weights; SAI's front end quantizes it and plans every board")
+        ctx.stage("quantize", "done")
+        ctx.stage("plan")
+        targets = [t for t in (p.get("targets") or sai_engine.MCU_TARGETS) if t in sai_engine.MCU_TARGETS]
+        plans = archlib.random_plans(spec, targets, ctx.dir, p.get("goal", "balanced"), p.get("budgets"),
+                                     log=ctx.log, name="fitcheck")
+        ctx.stage("plan", "done")
+        ctx.result({"spec": spec, "summary": summ, "plans": plans})
+        return
     torch.manual_seed(0)
     net = archspec.SpecNet(spec)
     net.eval()
@@ -676,6 +825,9 @@ def start_board_run(job_id: str, target: str | None, board_id: str | None, org_i
     if not job or job["status"] != "succeeded" or job["kind"] != "train":
         raise ValueError("board runs need a finished training job")
     res = job["result"]
+    if res.get("backend") == "xmodels":
+        raise ValueError("board runs of sequence models (SAI front end, XModels) are not available yet: the lab "
+                         "harness runs SAI Core packages; the front end verified this build on QEMU")
     sel = res["selected"]
     target = target or sel["target"]
     if target not in sai_engine.MCU_TARGETS:
@@ -734,6 +886,8 @@ def run_rebuild(ctx: Ctx, p: dict):
     src = get(p["job_id"])
     if not src or src["status"] != "succeeded" or src["kind"] != "train":
         raise ValueError("rebuild needs a finished training job")
+    if (src["result"] or {}).get("backend") == "xmodels":
+        raise ValueError("rebuild compares SAI Core builds; this project was built by SAI's front end (XModels)")
     prov = (src["result"] or {}).get("provenance") or {}
     model = config.DATA_DIR / "jobs" / p["job_id"] / "model.onnx"
     ctx.stage("compile")
@@ -932,6 +1086,74 @@ int sai_infer(const float *raw) {{
 """
 
 
+def run_multimodel(ctx: Ctx, p: dict):
+    """Several finished projects on one board with one shared workspace (SAI's multi-model plugin)."""
+    from . import commercial, multimodel
+    if not multimodel.available():
+        raise ValueError(multimodel.why_unavailable())
+    target, budgets = p["target"], {k: v for k, v in (p.get("budgets") or {}).items() if v}
+    ctx.stage("collect")
+    wl = ctx.dir / "workload"
+    used, models, reasons = set(), [], []
+    for jid in p["job_ids"]:
+        j = get(jid)
+        res = j["result"] or {}
+        name = (j["params"] or {}).get("name") or jid
+        mid = multimodel.model_id(name, used)
+        dst = wl / "models" / f"{mid}.onnx"
+        multimodel.copy_model(config.DATA_DIR / "jobs" / jid, dst)
+        models.append({"id": mid, "job_id": jid, "project": name, "template_id": (j["params"] or {}).get("template_id"),
+                       "sha256": multimodel.sha256(dst)})
+        if res.get("deployable") is False and res.get("evaluation_reason"):
+            reasons.append(f"{name}: {res['evaluation_reason']}")
+        ctx.log(f"model {mid}: project {name} ({jid}), {res.get('selected', {}).get('target')} build, "
+                f"sha256 {models[-1]['sha256'][:12]}")
+    (wl / "workload.yaml").write_text(multimodel.workload(p.get("name"), models, target, budgets))
+    ctx.log(f"workload: {len(models)} models, run one after another on {target}, minimum peak RAM, shared workspace")
+    ctx.stage("collect", "done")
+
+    ctx.stage("compile")
+    r = multimodel.run(["inspect", "workload.yaml"], wl, timeout=600)
+    for line in (r.stdout or "").strip().splitlines()[-4:]:
+        ctx.log("inspect: " + line.strip())
+    out = ctx.dir / "bundle"
+    r = multimodel.run(["eval-bundle", "workload.yaml", "--target", target, "--output", str(out)], wl)
+    if r.returncode or not (out / "eval-bundle.json").exists():
+        msg = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        raise ValueError(f"sai-multimodel eval-bundle failed (exit {r.returncode}): " + (msg[-1] if msg else ""))
+    bundle = json.loads((out / "eval-bundle.json").read_text())
+    summ = multimodel.summarize(bundle, models, target, budgets)
+    for m in summ["models"]:
+        ctx.log(f"{m['id']}: ABI {m['abi']}, workspace {m['workspace']} B, stack {m['stack']} B, "
+                f"flash {m['linked_flash']} B")
+    ctx.log(f"one shared build: {summ['device_ram']:,} B device RAM ({summ['evidence']}) vs {summ['separate_ram']:,} B "
+            f"side by side: saves {summ['saved_ram']:,} B; flash {summ['flash']:,} B; SAI verify "
+            f"{summ['verify']['passed']}/{summ['verify']['total']} builds")
+    for v in summ["violations"]:
+        ctx.log("warning: " + v)
+    ctx.stage("compile", "done")
+
+    ctx.stage("package")
+    reason = "; ".join(["SAI's multi-model plugin output is EVALUATION_ONLY (test signatures, no board run yet)"]
+                       + reasons)
+    report = {"kind": "multimodel", "name": p.get("name"), **summ, "deployable": False,
+              "evaluation_reason": reason, "sai": bundle.get("sai"), "budgets": budgets,
+              "workload": (wl / "workload.yaml").read_text()}
+    (ctx.dir / "report.json").write_text(json.dumps(report, indent=1, default=str))
+    multimodel.package(ctx.dir, out, report, reason)
+    with db.conn() as c:
+        org_id = (c.execute("SELECT org_id FROM jobs WHERE id=?", (ctx.id,)).fetchone() or [None])[0]
+    sig = commercial.sign_package(ctx.dir / "package.zip", {
+        "job": ctx.id, "org": org_id, "deployable": False, "platform_version": config.PLATFORM_VERSION,
+        "sai_version": (bundle.get("sai") or {}).get("version"), "plan_digest": None, "target": target})
+    ctx.log(f"package signed (Ed25519, key {sig['key_id']}); package.zip ready")
+    ctx.stage("package", "done")
+    report["downloads"] = ["package.zip", "report.json"]
+    report["signature"] = sig
+    shutil.rmtree(wl / "models", ignore_errors=True)       # copies of the projects' models; the bundle keeps builds
+    ctx.result(report)
+
+
 def run_archverify(ctx: Ctx, p: dict):
     """Check library architectures with SAI at their reference input on every board (see backend/archlib.py)."""
     from . import archlib
@@ -971,7 +1193,7 @@ def run_recommend(ctx: Ctx, p: dict):
             f"goal {p.get('goal', 'balanced')}")
     from . import archlib
     lib = [(a["id"], a["layers"]) for a in archlib.all_visible(p.get("_org_id"), platform=False)
-           if archlib.compatible(a, X.shape[1:], task, n_out)["ok"]]
+           if not archspec.is_sequence({"layers": a["layers"]}) and archlib.compatible(a, X.shape[1:], task, n_out)["ok"]]
     res = recommend.recommend(X, y, task, labels, tpl, n_out, p.get("goal", "balanced"), targets, p.get("budgets"),
                               ctx.dir, library=lib, sample_rate_hz=rate, n_train=int(round(len(X) * pcfg["split"]["train"])),
                               max_candidates=int(p.get("max_candidates") or 8), calibration=boards_mod.calibration(),

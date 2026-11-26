@@ -45,6 +45,16 @@ SAI_REPO=/path/to/sai-compiler-checkout docker compose up -d --build     # http:
   `--secret id=extra_ca,src=proxy-ca.crt` to `docker build`.
 * Jobs run in the `worker` service (`python -m backend.worker`); scale it with `docker compose up --scale worker=N`.
 
+## SAI compiler branches and plugins
+
+The platform runs SAI in place from `SAI_REPO` (never installed or copied): `bin/sai` (Core), `bin/sai-front` (the
+unified front end; Core for CNNs, the XModels backend for LSTM / GRU / RNN / attention / LayerNorm) and
+`bin/sai-multimodel` (several models on one board, one shared workspace). Sequence models and multi-model builds
+need `SAI_REPO` on the SAI repository's **`product/sai-unified`** branch and `pip install -r
+requirements-sai-plugins.txt` (TensorFlow, Keras, PyYAML). Without them the platform keeps working with SAI Core and
+says what is missing. Both plugins describe their own output as EVALUATION_ONLY (not qualified, no board run yet),
+so those packages are marked evaluation-only.
+
 ## Quick start (development)
 
 ```bash
@@ -84,6 +94,8 @@ The SAI-dependent tests and the pool x board regression run on a machine with th
 | `backend/trainer.py` | Training (settings in `TRAIN_DEFAULTS`: optimizer, LR and schedule, batch, early stopping, clip, label smoothing, seed, QAT), per-epoch metrics for the live monitor |
 | Model editor (wizard) | Any size, library architecture or recommendation as a baseline: add / remove / reorder layers, edit parameters, live check on your data (`/api/models/preview`), SAI fit check (`/api/models/fitcheck`), trained as a custom variant |
 | `backend/archlib.py` | Architecture library: 32 built-in SAI-verified architectures (see docs/ARCHITECTURE_RESEARCH.md) (1-D, 2-D, dense, autoencoder) plus custom ones; compatibility with real data; SAI verification per board |
+| `backend/seqfront.py` | Sequence models (LSTM / GRU / RNN / attention): float ONNX -> SAI's front end (`bin/sai-front`, XModels backend) per board, plan rows, host bit-exact run of the generated C |
+| `backend/multimodel.py` | Several projects on one board: workload manifest -> `bin/sai-multimodel eval-bundle`, shared vs side-by-side RAM |
 | `backend/approvals.py` | Compiled packages and their release approval (request → manager approves/rejects → download; revoke; audited) |
 | `backend/recommend.py` | Architecture recommender: data profile → rules → candidates → exact SAI cost per board → pick for the goal |
 | `backend/regression.py` | Nightly pool x boards regression |

@@ -38,7 +38,7 @@ def test_spec_validation_and_shapes():
     with pytest.raises(archspec.SpecError):
         archspec.normalize({"input": {"channels": 1, "width": 64}, "layers": [{"op": "fc", "out": 4}, {"op": "conv", "out": 4}]})
     with pytest.raises(archspec.SpecError):
-        archspec.normalize({"input": {"channels": 1, "width": 64}, "layers": [{"op": "lstm"}]})
+        archspec.normalize({"input": {"channels": 1, "width": 64}, "layers": [{"op": "conv3d"}]})
 
 
 @pytest.mark.parametrize("tid", [t["id"] for t in catalog.BUILTIN])

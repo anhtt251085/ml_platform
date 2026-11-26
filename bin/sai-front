@@ -1,0 +1,8 @@
+#!/bin/sh
+# Copyright (c) 2026 TLA Lab. All rights reserved. Proprietary and confidential; see LICENSE.
+# Runs SAI's unified front end (sai_front: Core for CNNs, the XModels backend for LSTM / GRU / attention) in place
+# from the SAI repository checkout ($SAI_REPO, branch product/sai-unified). Nothing is installed or copied.
+: "${SAI_REPO:?set SAI_REPO to the folder of your SAI compiler checkout}"
+export PYTHONPATH="$SAI_REPO:$SAI_REPO/converter${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1 TF_CPP_MIN_LOG_LEVEL=3
+exec "${SAI_PYTHON:-python3}" -m sai_front "$@"
