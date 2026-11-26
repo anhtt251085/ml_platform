@@ -83,7 +83,7 @@ The SAI-dependent tests and the pool x board regression run on a machine with th
 | `harness/` + `backend/hil.py` | HIL harness firmware, board ports, QEMU runner |
 | `backend/trainer.py` | Training (settings in `TRAIN_DEFAULTS`: optimizer, LR and schedule, batch, early stopping, clip, label smoothing, seed, QAT), per-epoch metrics for the live monitor |
 | Model editor (wizard) | Any size, library architecture or recommendation as a baseline: add / remove / reorder layers, edit parameters, live check on your data (`/api/models/preview`), SAI fit check (`/api/models/fitcheck`), trained as a custom variant |
-| `backend/archlib.py` | Architecture library: 17 built-in SAI-verified architectures (1-D, 2-D, dense, autoencoder) plus custom ones; compatibility with real data; SAI verification per board |
+| `backend/archlib.py` | Architecture library: 32 built-in SAI-verified architectures (see docs/ARCHITECTURE_RESEARCH.md) (1-D, 2-D, dense, autoencoder) plus custom ones; compatibility with real data; SAI verification per board |
 | `backend/approvals.py` | Compiled packages and their release approval (request → manager approves/rejects → download; revoke; audited) |
 | `backend/recommend.py` | Architecture recommender: data profile → rules → candidates → exact SAI cost per board → pick for the goal |
 | `backend/regression.py` | Nightly pool x boards regression |

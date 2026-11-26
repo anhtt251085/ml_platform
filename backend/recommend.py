@@ -25,6 +25,7 @@ import numpy as np
 from . import archspec
 
 RF_MIN = 8
+MAX_LIBRARY = 6
 
 
 def _r4(x: float) -> int:
@@ -188,13 +189,19 @@ def candidates(prof: dict, rl: dict, template: dict, n_outputs: int, max_candida
         add(f"pool:{size}", layers, "pool")
         if len(rows) > before:
             pool.append(rows.pop())
+    lib = []
     for aid, layers in library or []:         # architecture library entries that build on this input
         before = len(rows)
         add(f"lib:{aid}", layers, "library")
         if len(rows) > before:
             r = rows.pop()
-            if r["params"] <= rl["param_cap"] * 2:
-                pool.append(r)
+            if rl["param_floor"] * 0.5 <= r["params"] <= rl["param_cap"] and \
+                    (not (conv and rl["rf_target"]) or (r["receptive_field"] or 0) >= rl["rf_target"] * 0.5):
+                lib.append(r)
+    lib.sort(key=lambda r: r["params"])
+    if len(lib) > MAX_LIBRARY:                # at most a handful, spread over the capacity range (each costs a SAI run)
+        lib = [lib[i] for i in np.unique(np.linspace(0, len(lib) - 1, MAX_LIBRARY).round().astype(int))]
+    pool += lib
     ok = [r for r in rows if r["params"] <= rl["param_cap"] and r["params"] >= rl["param_floor"] * 0.5]
     if conv and rl["rf_target"]:
         reach = [r for r in ok if r["receptive_field"] >= rl["rf_target"]]

@@ -44,10 +44,15 @@ TS, D2, FV = ["timeseries"], ["2d"], ["features"]
 CR = ["classification", "regression"]
 
 
-def _a(aid, name, family, size, inputs, tasks, layers, summary, notes=""):
+def _a(aid, name, family, size, inputs, tasks, layers, summary, notes="", ref=""):
+    """ref: the published design this entry follows, and how it was adapted to the platform's operator set."""
     return {"id": aid, "name": name, "family": family, "size": size, "inputs": inputs, "tasks": tasks,
-            "layers": layers, "summary": summary, "notes": notes, "source": "builtin", "status": "published",
-            "org_id": None}
+            "layers": layers, "summary": summary, "notes": notes, "ref": ref, "source": "builtin",
+            "status": "published", "org_id": None}
+
+
+FA = ["anomaly"]
+CRA = ["classification", "regression"]
 
 
 BUILTIN = [
@@ -106,6 +111,79 @@ BUILTIN = [
        "Trained on normal data only."),
     _a("ae-m", "Autoencoder M", "Dense autoencoder", "m", FV, ["anomaly"], [FC(48), FC(16), FC(8), FC(16), FC(48)],
        "A deeper bottleneck for richer feature vectors."),
+
+    # ==== research additions: published TinyML designs, adapted to the platform's operator set ===================
+    # (identity residual = conv-conv-add with equal channels; square kernels <= 31; dense layers flatten)
+    # ---- 1-D ----
+    _a("ib-tcn-s", "Inverted-bottleneck TCN S", "Inverted-bottleneck TCN", "s", TS, CRA,
+       [C(16, 3, 2), PW(48), DW(9), PW(16), PW(48), DW(9, 2), PW(24), PW(72), DW(9), PW(24), GAP],
+       "Expand (1x1) - depthwise k9 - project blocks: wide temporal context at very few parameters.",
+       "Good for keyword-like events in 1-D signals and sensor bursts.",
+       "TENet (Li et al., Interspeech 2020) inverted bottleneck blocks; block skip connections removed "
+       "(the platform's residual only wraps two equal-width convolutions)."),
+    _a("sep-largek-tcn", "Large-kernel separable TCN", "Time-channel separable TCN", "m", TS, CRA,
+       [C(32, 11, 2), DW(13), PW(32), DW(15), PW(32), DW(17), PW(32), DW(21, 1, 2), PW(32), PW(32), GAP, DROP],
+       "Depthwise kernels 13-21 (the last dilated) on a 32-channel stem: receptive field of ~150 samples with "
+       "few multiplies.", "Slow, long patterns: battery cycles, ECG beats, machine cycles. Cortex-M7 class parts: at a "
+       "3x256 window it needs more than MD6605's 4 KB AI arena.",
+       "MatchboxNet / QuartzNet (NVIDIA, 2020) time-channel separable blocks; single repeats, no residuals."),
+    _a("strided-ds-tcn", "Strided DS-TCN (no pooling)", "Depthwise-separable TCN", "m", TS, CRA,
+       [C(12, 5, 2), DW(3, 2), PW(16), DW(3, 2), PW(24), DW(3, 2), PW(32), GAP],
+       "Downsamples with stride-2 depthwise convolutions instead of max-pooling: fewer layers, learned "
+       "downsampling.", "", "MobileNet-style strided depthwise downsampling applied to 1-D."),
+    _a("raw-cnn-m5", "Raw-signal CNN (M5-style)", "Raw-waveform CNN", "m", TS, CRA,
+       [C(32, 31, 4), MP(4), C(32, 3), MP(4), C(64, 3), MP(4), C(64, 3), GAP],
+       "A long strided first kernel on the raw waveform, then three small convolutions with 4x pooling.",
+       "Raw audio or vibration at high sample rates (windows of 1,024+ samples).",
+       "M5 (Dai et al., ICASSP 2017); first kernel 80 -> 31 (the platform's maximum)."),
+    _a("res-tcn-s", "Residual TCN S", "Residual TCN", "s", TS, CRA,
+       [C(12, 5, 2), RES(3), MP(2), PW(16), RES(3), GAP],
+       "Two identity residual blocks: the smallest residual network, trains stably on small datasets."),
+    _a("tcn-dense-head", "TCN + dense head", "Depthwise-separable TCN", "m", TS, CRA,
+       [C(12, 5, 4), DW(3), PW(16), MP(2), DW(3), PW(24), MP(2), FC(32), DROP],
+       "Keeps the temporal order to the end (flatten instead of global average), then a dense layer.",
+       "When *where* in the window something happens matters (e.g. fault position in a cycle).",
+       "Classic CNN-1D + dense classifier head used in many HAR and fault-diagnosis papers."),
+    # ---- 2-D ----
+    _a("ds-cnn-2d-l", "DS-CNN 2D L (64 ch)", "Depthwise-separable CNN-2D", "l", D2, CRA,
+       [C(64, 3, 2), DW(3), PW(64), DW(3), PW(64), DW(3), PW(64), DW(3), PW(64), GAP, DROP],
+       "Four 64-channel depthwise-separable blocks: the reference keyword-spotting size.",
+       "Cortex-M7 class parts; large for MD6605.",
+       "DS-CNN (Zhang et al., 'Hello Edge', 2017; MLPerf Tiny KWS); stem 10x4 kernel -> square 3x3."),
+    _a("mobilenet-v1-025", "MobileNetV1-style 0.25", "MobileNet", "m", D2, CRA,
+       [C(8, 3, 2), DW(3), PW(16), DW(3, 2), PW(32), DW(3), PW(32), DW(3, 2), PW(64), DW(3), PW(64), GAP],
+       "Width-0.25 MobileNet body: strided depthwise downsampling and doubling channels.",
+       "Small images (thermal, low-resolution grayscale).",
+       "MobileNetV1 (Howard et al., 2017) at width 0.25 as in MLPerf Tiny visual wake words; truncated depth."),
+    _a("resnet8-style", "ResNet-style 2D S", "Residual CNN-2D", "s", D2, CRA,
+       [C(8, 3), RES(3), C(16, 3, 2), RES(3), C(32, 3, 2), RES(3), GAP],
+       "Three stages of identity residual blocks with strided convolutions between them.",
+       "", "ResNet-8 (MLPerf Tiny image classification) at half width (8-16-32); projection shortcuts replaced "
+           "by a strided convolution before each identity residual block."),
+    _a("tinyconv", "TinyConv (micro-speech style)", "Single-layer CNN", "xs", D2, CR,
+       [C(8, 9, 2), FC(16)],
+       "One strided 9x9 convolution and a small dense layer: the smallest spectrogram model that works.",
+       "First bring-up on a new board; 2-4 keyword classes.",
+       "TensorFlow Lite Micro 'micro_speech' tiny_conv (8 filters 10x8, stride 2); kernel made square."),
+    _a("lenet5-style", "LeNet-5 style", "Classic CNN-2D", "s", D2, CR,
+       [C(6, 5), AP(2), C(16, 5), AP(2), FC(64), FC(32)],
+       "Two 5x5 convolutions with average pooling and two dense layers.",
+       "Tiny images where spatial layout matters (thermal arrays, 8x8 to 32x32).",
+       "LeNet-5 (LeCun et al., 1998) with SAME padding and smaller dense layers."),
+    _a("vgg-tiny-2d", "VGG-tiny 2D", "Classic CNN-2D", "s", D2, CR,
+       [C(8, 3), C(8, 3), MP(2), C(16, 3), C(16, 3), MP(2), GAP],
+       "Pairs of 3x3 convolutions before each pooling: simple, regular, compiler-friendly.",
+       "", "VGG (Simonyan & Zisserman, 2014) pattern at MCU scale."),
+    # ---- feature vectors ----
+    _a("linear", "Linear baseline", "Linear model", "xs", FV + TS, CR, [DROP],
+       "No hidden layer: a linear (logistic) model on the flattened input. The baseline every other model "
+       "must beat.", "Use it to check that a deeper model earns its RAM and flash."),
+    _a("mlp-l", "MLP L", "Dense network", "l", FV, CR, [FC(128), DROP, FC(64), FC(32)],
+       "Three wider dense layers for rich feature vectors (spectral statistics, many sensors)."),
+    _a("ae-l", "Autoencoder L (MLPerf-style)", "Dense autoencoder", "l", FV, FA,
+       [FC(128), FC(128), FC(8), FC(128), FC(128)],
+       "Two 128-unit layers on each side of an 8-value bottleneck.", "Trained on normal data only.",
+       "MLPerf Tiny anomaly-detection FC autoencoder (ToyADMOS), 4 hidden layers per side reduced to 2."),
 ]
 _BUILTIN = {a["id"]: a for a in BUILTIN}
 
