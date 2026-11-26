@@ -45,7 +45,7 @@ def _package_exists(job_id: str) -> bool:
 
 
 def request(u: dict, job: dict, note: str = "") -> dict:
-    if job["kind"] != "train" or job["status"] != "succeeded" or not _package_exists(job["id"]):
+    if job["kind"] not in ("train", "multimodel") or job["status"] != "succeeded" or not _package_exists(job["id"]):
         raise ApprovalError(400, "only a finished project with a compiled package can be requested")
     cur = get(job["id"])
     if cur["status"] in ("pending", "approved"):
@@ -107,6 +107,13 @@ def count_download(job_id: str):
 
 
 def _summary(job_dir: Path, result: dict) -> dict:
+    if result.get("kind") == "multimodel":
+        pz = job_dir / "package.zip"
+        return {"target": result.get("target"), "plan": f"{len(result.get('models') or [])} models, one shared workspace",
+                "size": "multi-model", "ram": result.get("device_ram"), "flash": result.get("flash"),
+                "latency_ms": None, "accuracy": None, "metric": None, "sai": (result.get("sai") or {}).get("version"),
+                "signed_key": (result.get("signature") or {}).get("key_id"), "deployable": False,
+                "package_bytes": pz.stat().st_size if pz.exists() else None, "kind": "multimodel"}
     sel = result.get("selected") or {}
     sig = result.get("signature") or {}
     pz = job_dir / "package.zip"
@@ -120,7 +127,7 @@ def _summary(job_dir: Path, result: dict) -> dict:
 
 def packages(org_id: str | None, status: str | None = None, limit: int = 500) -> list[dict]:
     """Every compiled package (succeeded project) visible to the caller, with its approval state."""
-    where, args = ["j.kind='train'", "j.status='succeeded'"], []
+    where, args = ["j.kind IN ('train', 'multimodel')", "j.status='succeeded'"], []
     if org_id:
         where.append("j.org_id=?"); args.append(org_id)
     q = ("SELECT j.id, j.org_id, j.params, j.result, j.created, j.updated, o.name AS org_name, a.status AS a_status"

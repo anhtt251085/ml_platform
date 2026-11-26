@@ -28,8 +28,12 @@ RUN curl -fsSL -o /tmp/xp.tgz "https://github.com/xpack-dev-tools/riscv-none-elf
 
 WORKDIR /app
 COPY requirements.txt .
+COPY requirements-sai-plugins.txt .
+# SAI_PLUGINS=1: dependencies of SAI's front end (sequence models) and multi-model plugin, run from SAI_REPO
+ARG SAI_PLUGINS=1
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && if [ "$SAI_PLUGINS" = "1" ]; then pip install --no-cache-dir -r requirements-sai-plugins.txt; fi
 
 COPY . .
 ARG SAI_PLATFORM_VERSION=dev

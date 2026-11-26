@@ -181,9 +181,14 @@ function projectsTable(rows) {
     <td>${statusBadge(p.job_status, p.job_progress)}</td><td class="muted">${ago(p.created)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 const GATED = ["package.zip", "model.onnx", "report.json"];
-const LAYER_PARAMS = { conv: ["out", "k", "stride", "dilation", "relu"], dwconv: ["k", "stride", "dilation", "relu"], pwconv: ["out", "relu"], maxpool: ["k"], avgpool: ["k"], gap: [], fc: ["out", "relu"], residual: ["k"], dropout: ["p"] };
-const LAYER_DEF = { conv: { out: 16, k: 3, stride: 1, relu: true }, dwconv: { k: 3, stride: 1, relu: true }, pwconv: { out: 16, relu: true }, maxpool: { k: 2 }, avgpool: { k: 2 }, gap: {}, fc: { out: 16, relu: true }, residual: { k: 3 }, dropout: { p: 0.1 } };
-const PARAM_RANGE = { out: [1, 1024, 1, "output channels / units"], k: [1, 31, 1, "kernel / pool size"], stride: [1, 8, 1, "stride"], dilation: [1, 32, 1, "dilation"], p: [0, 0.9, 0.05, "dropout rate (training only)"] };
+const LAYER_PARAMS = { conv: ["out", "k", "stride", "dilation", "relu"], dwconv: ["k", "stride", "dilation", "relu"], pwconv: ["out", "relu"], maxpool: ["k"], avgpool: ["k"], gap: [], fc: ["out", "relu"], residual: ["k"], dropout: ["p"],
+  lstm: ["units", "bidirectional", "sequences"], gru: ["units", "bidirectional", "sequences"], rnn: ["units", "bidirectional", "sequences"], attention: ["heads"], layernorm: [] };
+const LAYER_DEF = { conv: { out: 16, k: 3, stride: 1, relu: true }, dwconv: { k: 3, stride: 1, relu: true }, pwconv: { out: 16, relu: true }, maxpool: { k: 2 }, avgpool: { k: 2 }, gap: {}, fc: { out: 16, relu: true }, residual: { k: 3 }, dropout: { p: 0.1 },
+  lstm: { units: 16, bidirectional: false, sequences: false }, gru: { units: 16, bidirectional: false, sequences: false }, rnn: { units: 16, bidirectional: false, sequences: false }, attention: { heads: 2 }, layernorm: {} };
+const PARAM_RANGE = { out: [1, 1024, 1, "output channels / units"], k: [1, 31, 1, "kernel / pool size"], stride: [1, 8, 1, "stride"], dilation: [1, 32, 1, "dilation"], p: [0, 0.9, 0.05, "dropout rate (training only)"], units: [1, 512, 1, "recurrent units (state size)"], heads: [1, 16, 1, "attention heads (must divide the features)"] };
+const BOOL_PARAMS = { relu: ["ReLU", true], bidirectional: ["both directions", false], sequences: ["pass every step on", false] };
+const SEQ_OPS = ["lstm", "gru", "rnn", "attention", "layernorm"];
+const paramInput = (l, p, w = 78) => BOOL_PARAMS[p] ? `<label class="check small" title="${p}"><input type="checkbox" data-f="${p}" ${(l[p] ?? BOOL_PARAMS[p][1]) ? "checked" : ""}>${BOOL_PARAMS[p][0]}</label>` : `<label class="f" title="${PARAM_RANGE[p][3]}" style="width:${w}px">${p}<input data-f="${p}" type="number" min="${PARAM_RANGE[p][0]}" max="${PARAM_RANGE[p][1]}" step="${PARAM_RANGE[p][2]}" value="${l[p] ?? (p === "stride" || p === "dilation" ? 1 : "")}"></label>`;
 // Model editor: start from a baseline, add / remove / reorder layers and change their parameters; every change is
 // checked on the user's data (shapes, MACs, parameters, receptive field) and can be compiled with SAI.
 function modelEditor(box, o) {
@@ -195,7 +200,7 @@ function modelEditor(box, o) {
       <p class="small muted" style="margin-top:6px">Your baseline is <b>${esc(o.baseName)}</b>. Add, remove or reorder layers and change their parameters; every change is checked on your data. Only SAI operators are offered, and the output head is added for you.</p>
       <div class="tbl-wrap"><table class="t layers"><thead><tr><th>#</th><th>Layer</th><th>Parameters</th><th>Output</th><th class="n">MACs</th><th class="n">Params</th><th></th></tr></thead><tbody id="ed_rows">
       ${layers.map((l, i) => `<tr data-i="${i}"><td class="muted">${i + 1}</td><td><select data-f="op">${ops.map((x) => `<option ${x === l.op ? "selected" : ""}>${x}</option>`).join("")}</select><div class="small muted">${esc(o.ops[l.op] || "")}</div></td>
-        <td><div class="row" style="gap:6px;flex-wrap:wrap">${LAYER_PARAMS[l.op].map((p) => p === "relu" ? `<label class="check small"><input type="checkbox" data-f="relu" ${l.relu !== false ? "checked" : ""}>ReLU</label>` : `<label class="f" title="${PARAM_RANGE[p][3]}" style="width:78px">${p}<input data-f="${p}" type="number" min="${PARAM_RANGE[p][0]}" max="${PARAM_RANGE[p][1]}" step="${PARAM_RANGE[p][2]}" value="${l[p] ?? (p === "stride" || p === "dilation" ? 1 : "")}"></label>`).join("") || `<span class="small muted">no parameters</span>`}</div></td>
+        <td><div class="row" style="gap:6px;flex-wrap:wrap">${LAYER_PARAMS[l.op].map((p) => paramInput(l, p)).join("") || `<span class="small muted">no parameters</span>`}</div></td>
         <td class="mono small" data-shape="${i}"></td><td class="n mono small" data-macs="${i}"></td><td class="n mono small" data-par="${i}"></td>
         <td style="white-space:nowrap"><button class="btn ghost sm" data-a="up" title="move up">↑</button><button class="btn ghost sm" data-a="dn" title="move down">↓</button><button class="btn ghost sm" data-a="dup" title="duplicate">⧉</button><button class="btn ghost sm" data-a="rm" title="remove">✕</button></td></tr>`).join("")}
       <tr class="muted"><td></td><td>head</td><td class="small">output layer, automatic</td><td class="mono small" data-shape="head"></td><td class="n mono small" data-macs="head"></td><td class="n mono small" data-par="head"></td><td></td></tr></tbody></table></div>
@@ -206,7 +211,7 @@ function modelEditor(box, o) {
     $("#ed_rows").onchange = (e) => {
       const tr = e.target.closest("tr[data-i]"); if (!tr) return; const i = +tr.dataset.i, f = e.target.dataset.f;
       if (f === "op") { layers[i] = { op: e.target.value, ...LAYER_DEF[e.target.value] }; return draw(); }
-      layers[i][f] = f === "relu" ? e.target.checked : e.target.value === "" ? undefined : +e.target.value; check();
+      layers[i][f] = BOOL_PARAMS[f] ? e.target.checked : e.target.value === "" ? undefined : +e.target.value; check();
     };
     $("#ed_rows").onclick = (e) => {
       const a = e.target.dataset.a; if (!a) return; const i = +e.target.closest("tr").dataset.i;
@@ -252,12 +257,13 @@ function modelEditor(box, o) {
       r.summary.layers.forEach((row, i) => { const k = row.head ? "head" : i; const set = (a, v) => { const x = $(`[data-${a}="${k}"]`, box); if (x) x.textContent = v; }; set("shape", row.shape.join("×")); set("macs", fmt(row.macs)); set("par", row.params ? fmt(row.params) : ""); });
       const s = r.summary;
       $("#ed_sum").innerHTML = `<div class="kpis"><div class="kpi"><div class="l">Parameters</div><div class="v">${fmt(s.params)}</div></div><div class="kpi"><div class="l">MACs</div><div class="v">${fmt(s.macs)}</div></div><div class="kpi"><div class="l">Receptive field</div><div class="v">${r.receptive_field ? fmt(r.receptive_field) : "–"}</div></div><div class="kpi"><div class="l">Largest activation</div><div class="v">${bytes(s.peak_activation_bytes)}</div></div></div>
-        <p class="small muted" style="margin-top:6px">Input ${s.layers.length ? "" : ""}${esc(r.spec.input.channels + "×" + r.spec.input.height + "×" + r.spec.input.width)} after your preprocessing · ${r.spec.outputs} output(s) · weights ≈ ${bytes(s.weight_bytes_int8)} INT8. RAM and flash come from SAI: use “Check with SAI”.</p>`;
+        <p class="small muted" style="margin-top:6px">Input ${esc(r.spec.input.channels + "×" + r.spec.input.height + "×" + r.spec.input.width)} after your preprocessing · ${r.spec.outputs} output(s) · weights ≈ ${bytes(s.weight_bytes_int8)} INT8. RAM and flash come from SAI: use “Check with SAI”.</p>
+        ${r.backend === "xmodels" ? `<div class="callout info" style="margin-top:6px"><b>Sequence model</b> (LSTM / GRU / RNN / attention): compiled by SAI's front end through the XModels backend. The model reads the window as ${esc(r.spec.input.height === 1 ? r.spec.input.width + " steps of " + r.spec.input.channels + " features" : r.spec.input.height + " steps of " + (r.spec.input.channels * r.spec.input.width) + " features")}; its package is <b>evaluation-only</b> until the front end is qualified.</div>` : ""}`;
     }, 250);
   };
   draw();
 }
-const archChain = (layers) => layers.map((l) => l.op + (l.out ? l.out : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "") + (l.dilation > 1 ? "d" + l.dilation : "")).join(" → ") + " → fc(head)";
+const archChain = (layers) => layers.map((l) => (l.bidirectional ? "bi" : "") + l.op + (l.out ? l.out : "") + (l.units ? l.units : "") + (l.heads ? "h" + l.heads : "") + (l.sequences ? "·seq" : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "") + (l.dilation > 1 ? "d" + l.dilation : "")).join(" → ") + " → fc(head)";
 function archChecks(a, targets) {
   const ts = targets || Object.keys(a.checks || {});
   if (!ts.length || !Object.keys(a.checks || {}).length) return `<span class="badge">not SAI-checked yet</span>`;
@@ -271,7 +277,7 @@ function dur(sec) {
 function jobTitle(job) {
   const p = job.params || {};
   return { train: p.name || "Project", fitcheck: "Studio fit check", rebuild: "Reproducibility rebuild", regression: "Pool regression",
-    basetrain: "Pool base weights", recommend: "Architecture recommendation", archverify: "Architecture library SAI check", ingest: `Import ${p.filename || "dataset"}` }[job.kind] || `Analyze ${p.filename || "model"}`;
+    basetrain: "Pool base weights", recommend: "Architecture recommendation", archverify: "Architecture library SAI check", multimodel: p.name || "Multi-model build", ingest: `Import ${p.filename || "dataset"}` }[job.kind] || `Analyze ${p.filename || "model"}`;
 }
 function statusBadge(s, p) {
   const c = { succeeded: "b-ok", failed: "b-bad", running: "b-acc", queued: "", cancelled: "b-warn" }[s] || "";
@@ -757,6 +763,30 @@ route(/^\/architectures$/, async (el) => {
   load();
 });
 
+route(/^\/multimodel$/, async (el) => {
+  const [av, jobs, sys] = await Promise.all([api("/api/multimodel/available"), api("/api/jobs?kind=train"), system()]);
+  const done = jobs.filter((j) => j.status === "succeeded");
+  let picked = [];
+  el.innerHTML = `<div class="page-h"><div><h1>Several models on one board</h1><p class="muted">Put finished projects on the same MCU, run one after another with <b>one shared workspace</b>. SAI's multi-model plugin plans the models jointly, proves the combined RAM and verifies every build.</p></div></div>
+    ${av.multimodel ? "" : `<div class="callout bad">${esc(av.reason)}</div>`}
+    <div class="grid g2"><div class="card"><h2>1. Projects</h2><p class="small muted">Finished SAI Core projects (2 to 8). Sequence models (XModels) are not supported by the plugin yet.</p><div id="mmlist"><span class="small muted">Loading…</span></div></div>
+    <div class="card"><h2>2. Board and limits</h2><div class="stack"><label class="f">Name<input id="mmname" value="Multi-model build"></label>
+      <label class="f">Board<select id="mmtgt">${sys.targets.filter((t) => ["md6605", "cortex-m7"].includes(t.id)).map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select></label>
+      <div class="grid g2"><label class="f">Max RAM (bytes)<input id="mmram" type="number" placeholder="board limit"></label><label class="f">Max flash (bytes)<input id="mmflash" type="number" placeholder="board limit"></label></div>
+      <button class="btn primary" id="mmgo" ${av.multimodel ? "" : "disabled"}>Build together</button><p class="small muted">The result is evaluation-only (the plugin's own status: test signatures, no board run yet) and its download needs a manager's approval.</p></div></div></div>
+    <div class="card" style="margin-top:16px"><h2>Previous multi-model builds</h2><div id="mmprev"></div></div>`;
+  const results = await Promise.all(done.slice(0, 40).map((j) => api(`/api/jobs/${j.id}`).catch(() => null)));
+  const ok = results.filter((j) => j && j.result && j.result.backend !== "xmodels");
+  $("#mmlist").innerHTML = ok.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th></th><th>Project</th><th>Built for</th><th class="n">RAM</th><th class="n">Flash</th></tr></thead><tbody>${ok.map((j) => { const s = j.result.selected; return `<tr><td><input type="checkbox" data-pick="${esc(j.id)}"></td><td><a href="#/job/${esc(j.id)}">${esc(j.params.name || j.id)}</a><div class="small muted">${esc(j.params.template_id)}</div></td><td class="small">${esc(s.target)} · ${esc(s.size)}</td><td class="n">${bytes(s.ram)}</td><td class="n">${bytes(s.flash)}</td></tr>`; }).join("")}</tbody></table></div>` : `<div class="empty small">No finished SAI Core projects yet.</div>`;
+  $("#mmlist").onchange = () => { picked = $$("[data-pick]:checked").map((x) => x.dataset.pick); };
+  $("#mmgo").onclick = async () => {
+    if (picked.length < 2) return toast("Pick at least two projects");
+    try { const j = await api("/api/multimodel", { json: { name: $("#mmname").value, job_ids: picked, target: $("#mmtgt").value, budgets: { max_ram: +$("#mmram").value || null, max_flash: +$("#mmflash").value || null } } }); location.hash = `#/job/${j.id}`; } catch (e) { toast(e.message); }
+  };
+  const prev = (await api("/api/jobs?kind=multimodel"));
+  $("#mmprev").innerHTML = prev.length ? `<table class="t"><tbody>${prev.map((j) => `<tr><td><a href="#/job/${esc(j.id)}">${esc(j.params.name || j.id)}</a></td><td>${statusBadge(j.status, j.progress)}</td><td class="small">${esc(j.params.target)} · ${(j.params.job_ids || []).length} models</td><td class="small muted">${ago(j.created)}</td></tr>`).join("")}</tbody></table>` : `<p class="small muted">None yet.</p>`;
+});
+
 async function refreshPending() {
   const el = $("#pendingCount"); if (!el || !ME) return;
   try {
@@ -780,7 +810,7 @@ route(/^\/packages$/, async (el) => {
     $("#pt").innerHTML = list.length ? `<table class="t"><thead><tr><th>Project</th><th>Board · plan</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Accuracy</th><th>SAI</th><th>Built</th><th>Approval</th><th class="n">Downloads</th><th></th></tr></thead><tbody>
       ${list.map((p) => { const a = p.approval, [lab, cls] = ST[a.status];
         const acts = [];
-        if (a.status === "approved") acts.push(`<a class="btn primary sm" href="/api/jobs/${esc(p.job_id)}/download/package.zip" title="compiled package">⬇ package</a><a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/model.onnx">model</a><a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/report.json">report</a>`);
+        if (a.status === "approved") acts.push(`<a class="btn primary sm" href="/api/jobs/${esc(p.job_id)}/download/package.zip" title="compiled package">⬇ package</a>${p.kind === "multimodel" ? "" : `<a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/model.onnx">model</a>`}<a class="btn sm" href="/api/jobs/${esc(p.job_id)}/download/report.json">report</a>`);
         if (["not_requested", "rejected", "revoked"].includes(a.status)) acts.push(`<button class="btn sm" data-act="request" data-j="${esc(p.job_id)}">Request</button>`);
         if (a.status === "pending" && can && a.requested_by !== ME.id) acts.push(`<button class="btn primary sm" data-act="approve" data-j="${esc(p.job_id)}">Approve</button><button class="btn sm" data-act="reject" data-j="${esc(p.job_id)}">Reject</button>`);
         if (a.status === "pending" && can && a.requested_by === ME.id) acts.push(`<span class="small muted">your request: another manager decides</span>`);
@@ -816,7 +846,7 @@ route(/^\/packages$/, async (el) => {
 route(/^\/jobs$/, async (el) => {
   let timer = null, kind = "", status = "";
   el.innerHTML = `<div class="page-h"><div><h1>Jobs &amp; logs</h1><p class="muted">Every training run, recommendation, import, rebuild and regression, live. Open a job for its training monitor and full log.</p></div></div>
-    <div class="row" style="margin-bottom:12px"><select id="jk"><option value="">All kinds</option>${["train", "recommend", "archverify", "ingest", "fitcheck", "analyze", "rebuild", "basetrain", "regression"].map((k) => `<option>${k}</option>`).join("")}</select>
+    <div class="row" style="margin-bottom:12px"><select id="jk"><option value="">All kinds</option>${["train", "multimodel", "recommend", "archverify", "ingest", "fitcheck", "analyze", "rebuild", "basetrain", "regression"].map((k) => `<option>${k}</option>`).join("")}</select>
     <select id="js"><option value="">Any status</option>${["running", "queued", "succeeded", "failed", "cancelled"].map((k) => `<option>${k}</option>`).join("")}</select><span class="spacer"></span><span class="small muted" id="jupd"></span></div>
     <div class="card"><div class="tbl-wrap" id="jt"></div></div>`;
   async function load() {
@@ -929,13 +959,14 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     const a = await api(`/api/packages/${jid}`);
     const who = (x) => esc(x || "");
     if (a.status === "approved") {
-      b.innerHTML = GATED.map((d, i) => `<a class="btn ${i ? "" : "primary"} sm" href="/api/jobs/${jid}/download/${d}">${i ? "" : "⬇ "}${d}</a>`).join("");
+      b.innerHTML = GATED.filter((d) => ((job.result || {}).downloads || GATED).includes(d)).map((d, i) => `<a class="btn ${i ? "" : "primary"} sm" href="/api/jobs/${jid}/download/${d}">${i ? "" : "⬇ "}${d}</a>`).join("");
       $("#pkgnote").innerHTML = `<span class="badge b-ok">approved</span> by ${who(a.decided_by_name)} ${ago(a.decided_at)}${a.decision_note ? ` – “${esc(a.decision_note)}”` : ""} · <a href="#/packages">Compiled packages</a>`;
     } else if (a.status === "pending") {
       b.innerHTML = `<button class="btn sm" disabled>⏳ package, model &amp; report awaiting approval</button>`;
       $("#pkgnote").innerHTML = `Requested by ${who(a.requested_by_name)} ${ago(a.requested_at)}. A manager approves it on <a href="#/packages">Compiled packages</a>.`;
     } else {
-      b.innerHTML = `<button class="btn primary sm" id="pkgreq">Request download (package, model, report)</button>`;
+      const files = GATED.filter((d) => ((job.result || {}).downloads || GATED).includes(d)).map((d) => d.split(".")[0]).join(", ");
+      b.innerHTML = `<button class="btn primary sm" id="pkgreq">Request download (${esc(files)})</button>`;
       $("#pkgnote").innerHTML = a.status === "not_requested" ? `The compiled package, the model and the report are released after a manager's approval.` : `<span class="badge b-bad">${esc(a.status)}</span> ${esc(a.decision_note || "")} – you can request again.`;
       $("#pkgreq").onclick = async () => {
         const note = prompt("Why do you need the compiled package? (shown to the approving manager)", "");
@@ -943,6 +974,22 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
         try { await api(`/api/packages/${jid}/request`, { json: { note } }); toast("Requested: a manager will review it"); drawPackageButton(); refreshPending(); } catch (e) { toast(e.message); }
       };
     }
+  }
+  function drawMulti(r) {
+    const pct0 = r.separate_ram ? Math.round(r.saved_ram / r.separate_ram * 100) : 0;
+    $("#res").innerHTML = `<div class="callout bad" style="margin-top:16px"><b>Evaluation only:</b> ${esc(r.evaluation_reason)}</div>
+      <div class="hero" style="margin-top:16px"><div class="card"><h2>${esc(r.name || "Multi-model build")} · ${esc(r.target)}</h2>
+        <div class="kpis"><div class="kpi"><div class="l">Device RAM, one shared build</div><div class="v">${bytes(r.device_ram)}</div><div class="small">${ev(r.evidence === "proven_upper_bound" ? "proven bound" : r.evidence)}</div></div>
+        <div class="kpi"><div class="l">Same models side by side</div><div class="v">${bytes(r.separate_ram)}</div><div class="small muted">each with its own workspace</div></div>
+        <div class="kpi"><div class="l">Saved</div><div class="v" style="color:var(--ok)">${bytes(r.saved_ram)}</div><div class="small">${pct0}% less RAM</div></div>
+        <div class="kpi"><div class="l">Flash (all models)</div><div class="v">${bytes(r.flash)}</div><div class="small">${r.fits ? `<span class="badge b-ok">fits ${esc(r.target)}</span>` : `<span class="badge b-bad">${esc(r.violations.join("; "))}</span>`}</div></div></div>
+        <p class="small muted" style="margin-top:10px">Shared workspace ${bytes(r.shared.shared_workspace)} · stack ${bytes(r.shared.stack)} · static ${bytes(r.shared.static)} · caller buffers ${bytes((r.shared.caller_inputs || 0) + (r.shared.caller_outputs || 0))} · SAI verify ${r.verify.passed}/${r.verify.total} builds passed</p>
+        <div class="row" style="margin-top:10px"><span id="pkgbtn" class="row" style="gap:8px"></span></div><div id="pkgnote" class="small" style="margin-top:6px"></div></div>
+      <div class="card"><h2>Models</h2><div class="tbl-wrap"><table class="t"><thead><tr><th>Model</th><th>ABI</th><th class="n">Workspace</th><th class="n">Stack</th><th class="n">Flash</th><th class="n">Alone (RAM bound)</th></tr></thead><tbody>
+        ${r.models.map((m) => `<tr><td><a href="#/job/${esc(m.job_id)}">${esc(m.project)}</a><div class="mono small muted">${esc(m.id)}</div></td><td>${esc(m.abi)}</td><td class="n">${bytes(m.workspace)}</td><td class="n">${bytes(m.stack)}</td><td class="n">${bytes(m.linked_flash)}</td><td class="n">${bytes(m.ram_bound)}</td></tr>`).join("")}</tbody></table></div>
+        <p class="small muted" style="margin-top:8px">Run one after another (no concurrent calls); ABI 1.1 builds keep the model input inside the shared workspace.</p></div></div>
+      <div class="card" style="margin-top:16px"><h2>What this build does not claim</h2><ul class="small">${r.not_claimed.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+    drawPackageButton().catch(() => {});
   }
   function drawRecommend(r) {
     const rec = r.recommended;
@@ -953,10 +1000,12 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     if (job.status !== "succeeded") return;
     const r = job.result;
     if (job.kind === "fitcheck" || job.kind === "analyze") return drawPlansOnly(r);
+    if (job.kind === "multimodel") return drawMulti(r);
     const sel = r.selected, v = r.variants.find((x) => x.size === sel.size), task = r.template.task;
     const mt = (m) => task === "classification" ? pct(m.value) : fmt(m.value, 3);
     $("#res").innerHTML = `
     ${r.deployable === false ? `<div class="callout bad" style="margin-top:16px"><b>Evaluation only:</b> ${esc(r.evaluation_reason || "dataset licence")}. The package carries an EVALUATION_ONLY marker and a compile-time warning.</div>` : ""}
+    ${r.backend === "xmodels" ? `<div class="callout info" style="margin-top:16px"><b>Sequence model</b> built by SAI's front end through the XModels backend (${esc(sel.schedule || "")}). The accuracy below is the generated C run on every test window; board runs and rebuilds are for SAI Core packages and are not available for it yet.</div>` : ""}
     ${r.signature ? `<p class="small muted" style="margin-top:10px">Package signed (Ed25519, key <code>${esc(r.signature.key_id)}</code>); verify with <code>tools/verify_package.py</code> and <code>/api/signing/public-key</code>.</p>` : ""}
     ${(r.preprocessing || {}).preprocess ? (() => { const pp = r.preprocessing.preprocess; return `<p class="small muted" style="margin-top:10px">Preprocessing: ${pp.window_ops ? `channels ${pp.channels ? esc(pp.channels.join(",")) : "all"}, decimate ÷${pp.decimate}${pp.demean ? ", mean removed" : ""} (C, on the MCU too) · ` : ""}${esc(pp.normalization)} normalization${pp.clip ? `, clip ±${pp.clip}` : ""} · input ${esc((r.preprocessing.raw_shape || []).join("×"))} → ${esc((r.preprocessing.model_input_shape || []).join("×"))} · <code>sai_app_prepare()</code> in the package.</p>`; })() : ""}
     ${r.split_mode ? `<p class="small muted" style="margin-top:10px">Test split: ${r.split_mode === "recording" ? "whole recordings held out (no leakage between windows of one recording)" : r.split_mode === "mixed" ? "recordings where available, windows elsewhere" : "random windows (no recording information in the data)"}.</p>` : ""}
@@ -1061,7 +1110,7 @@ function tierCard(r) {
 function provCard(r, jid) {
   const p = r.provenance; if (!p) return "";
   const rows = [["Platform", p.platform_version], ["SAI", p.sai_version], ["Toolchain", p.toolchain], ["Toolchain digest", p.toolchain_digest], ["Build digest", p.build_digest], ["Plan digest", p.plan_digest], ["Dataset SHA-256", p.dataset_sha256], ["Python / torch", `${p.python} / ${p.torch}`], ["Seeds", JSON.stringify(p.seeds)]];
-  return `<div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Provenance</h2><span class="spacer"></span><button class="btn sm" id="rebuild">Rebuild & compare</button></div>
+  return `<div class="card" style="margin-top:16px"><div class="row"><h2 style="margin:0">Provenance</h2><span class="spacer"></span>${r.backend === "xmodels" ? `<span class="small muted">built by ${esc(p.compiler || "SAI front end")}</span>` : `<button class="btn sm" id="rebuild">Rebuild & compare</button>`}</div>
     <div class="tbl-wrap" style="margin-top:8px"><table class="t"><tbody>${rows.map(([k, v]) => `<tr><td class="muted" style="width:170px">${k}</td><td class="mono small" style="word-break:break-all">${esc(v ?? "–")}</td></tr>`).join("")}</tbody></table></div></div>`;
 }
 
@@ -1106,8 +1155,7 @@ route(/^\/studio$/, async (el) => {
   const builtins = mine.filter((t) => t.source === "builtin"), research = mine.filter((t) => t.source === "studio");
   let m = BLANK(), size = "tiny", vtimer = null;
   const OPS = Object.keys(sys.ops);
-  const PARAMS = { conv: ["out", "k", "stride", "dilation", "relu"], dwconv: ["k", "stride", "dilation", "relu"], pwconv: ["out", "relu"], maxpool: ["k"], avgpool: ["k"], gap: [], fc: ["out", "relu"], residual: ["k"], dropout: ["p"] };
-  const DEF = { conv: { out: 16, k: 3, stride: 1, relu: true }, dwconv: { k: 3, stride: 1, relu: true }, pwconv: { out: 16, relu: true }, maxpool: { k: 2 }, avgpool: { k: 2 }, gap: {}, fc: { out: 16, relu: true }, residual: { k: 3 }, dropout: { p: 0.1 } };
+  const PARAMS = LAYER_PARAMS, DEF = LAYER_DEF;
   el.innerHTML = `<div class="page-h"><div><h1>Model Studio</h1><p class="muted">Design a model type for the pool. Every layer maps to a SAI operator; a fit check compiles it for every board in seconds, before any training.</p></div>
     <div class="row"><select id="load"><option value="">Load…</option><optgroup label="Research templates">${research.map((t) => `<option value="${esc(t.id)}">${esc(t.name)} (${esc(t.status)})</option>`).join("")}</optgroup><optgroup label="Copy a built-in">${builtins.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</optgroup></select><button class="btn" id="newb">New</button></div></div>
     <div class="grid studio-grid"><div class="card" id="meta"></div><div class="stack"><div class="card" id="arch"></div><div class="card" id="fit"><h2>SAI fit check</h2><p class="small muted">Builds the selected size with random weights, exports INT8 and asks SAI for every plan on every board. Resource numbers do not depend on trained weights.</p><button class="btn primary" id="runfit">Run fit check</button><div id="fitres"></div></div></div></div>`;
@@ -1146,7 +1194,7 @@ route(/^\/studio$/, async (el) => {
     $("#arch").innerHTML = `<div class="row"><h2 style="margin:0">Architecture</h2><span class="spacer"></span><div class="tabs" style="margin:0;border:0">${["tiny", "small", "base"].map((s) => `<button class="tab ${s === size ? "on" : ""}" data-s="${s}">${s} <span class="small muted">${(m.variants[s] || []).length}</span></button>`).join("")}</div></div>
       <div class="tbl-wrap"><table class="t layers"><thead><tr><th>#</th><th>Op</th><th>Parameters</th><th>Output</th><th class="n">MACs</th><th></th></tr></thead><tbody id="lrows">
       ${layers.map((l, i) => `<tr data-i="${i}"><td class="muted">${i}</td><td><select data-f="op">${OPS.map((o) => `<option ${o === l.op ? "selected" : ""}>${o}</option>`).join("")}</select><div class="small muted">${esc(sys.ops[l.op] || "")}</div></td>
-        <td><div class="row" style="gap:6px">${PARAMS[l.op].map((p) => p === "relu" ? `<label class="check small"><input type="checkbox" data-f="relu" ${l.relu ? "checked" : ""}>ReLU</label>` : `<label class="f">${p}<input data-f="${p}" type="number" step="${p === "p" ? 0.05 : 1}" value="${l[p] ?? ""}"></label>`).join("")}</div></td>
+        <td><div class="row" style="gap:6px">${PARAMS[l.op].map((p) => paramInput(l, p, 70)).join("")}</div></td>
         <td class="mono small" data-shape="${i}"></td><td class="n mono small" data-macs="${i}"></td>
         <td><button class="btn ghost sm" data-a="up">↑</button><button class="btn ghost sm" data-a="dn">↓</button><button class="btn ghost sm" data-a="rm">✕</button></td></tr>`).join("")}
       <tr class="muted"><td></td><td>head</td><td class="small">fc(${nOut()}), automatic</td><td class="mono small" data-shape="head"></td><td class="n mono small" data-macs="head"></td><td></td></tr></tbody></table></div>
@@ -1158,7 +1206,7 @@ route(/^\/studio$/, async (el) => {
     $("#lrows").onchange = (e) => {
       const tr = e.target.closest("tr[data-i]"); if (!tr) return; const l = layers[+tr.dataset.i], f = e.target.dataset.f;
       if (f === "op") { layers[+tr.dataset.i] = { op: e.target.value, ...DEF[e.target.value] }; drawArch(); return; }
-      l[f] = f === "relu" ? e.target.checked : e.target.value === "" ? undefined : +e.target.value; validate();
+      l[f] = BOOL_PARAMS[f] ? e.target.checked : e.target.value === "" ? undefined : +e.target.value; validate();
     };
     $("#lrows").onclick = (e) => {
       const a = e.target.dataset.a; if (!a) return; const i = +e.target.closest("tr").dataset.i;

@@ -14,6 +14,11 @@ its input), `residual` (two equal-width convolutions plus an identity add), `dro
 ReLU where it applies. Kernels are square (k x k on 2-D inputs, k on 1-D), at most 31. The output head is added
 automatically.
 
+Sequence models add `lstm`, `gru`, `rnn` (units, optionally bidirectional, last state or every step), `attention`
+(self-attention with residual and LayerNorm) and `layernorm`. They read the window as time steps of features
+([T, C] for 1-D signals, rows of [C*W] for 2-D inputs) and may also use `conv` (1-D, valid padding), per-step `fc`,
+`gap` (average over time, not directly after a recurrent layer) and `dropout`.
+
 ## Method
 
 1. Survey: MLPerf Tiny reference models, keyword-spotting and audio models, mobile CNNs, sensor and HAR models,
@@ -25,10 +30,14 @@ automatically.
 
 ## Results
 
-32 architectures; SAI compiles all of them. 31 fit both boards at the reference input; one (large-kernel
-separable TCN) needs a Cortex-M7 class part. Fit depends on the customer's input, so every project costs its
-choices again on the real data.
+40 architectures. The 32 CNN and dense ones are compiled by SAI Core: 31 fit both boards at the reference
+input, one (large-kernel separable TCN) needs a Cortex-M7 class part. The 8 sequence models (LSTM, GRU,
+SimpleRNN, BiLSTM, stacked LSTM, CRNN, tiny transformer, LSTM + LayerNorm) are compiled by SAI's front end through
+its XModels backend: all fit Cortex-M7, five also fit MD6605's 4 KB AI arena. Fit depends on the customer's input,
+so every project costs its choices again on the real data.
 
+Sequence models need the SAI repository's `product/sai-unified` branch (`SAI_REPO`); the platform calls its front
+end through `bin/sai-front`. Their packages are evaluation-only until that front end is qualified.
 
 ### Time series [C, 1, T]
 
@@ -77,22 +86,35 @@ choices again on the real data.
 | MLP L | Dense network | 18,788 | ✓ | ✓ | Platform design |
 | Autoencoder L (MLPerf-style) | Dense autoencoder | 51,784 | ✓ | ✓ | MLPerf Tiny anomaly-detection FC autoencoder (ToyADMOS), 4 hidden layers per side reduced to 2. |
 
+### Sequence models (SAI front end, XModels backend)
+
+| Architecture | Family | Params | MD6605 | Cortex-M7 | Based on / adaptation |
+|---|---|---:|:-:|:-:|---|
+| LSTM S | Recurrent (XModels) | 1,412 | ✓ | ✓ | Classic LSTM classifier (Hochreiter & Schmidhuber, 1997) at MCU scale. |
+| GRU S | Recurrent (XModels) | 2,188 | ✓ | ✓ | GRU (Cho et al., 2014). |
+| SimpleRNN S | Recurrent (XModels) | 404 | ✓ | ✓ | Platform design |
+| BiLSTM S | Recurrent (XModels) | 1,732 | ✗ (RAM) | ✓ | Bidirectional RNN (Schuster & Paliwal, 1997). |
+| Stacked LSTM M | Recurrent (XModels) | 7,684 | ✓ | ✓ | Platform design |
+| CRNN S | Convolutional-recurrent (XModels) | 1,956 | ✓ | ✓ | CRNN (e.g. DeepConvLSTM-style conv + recurrent layers) with valid padding. |
+| Tiny transformer encoder | Attention (XModels) | 1,524 | ✗ (RAM) | ✓ | Transformer encoder (Vaswani et al., 2017) at KWT-style MCU scale (Berg et al., 2021). |
+| LSTM + LayerNorm | Recurrent (XModels) | 1,444 | ✗ (RAM) | ✓ | Platform design |
+
 Params at the reference input with 4 outputs (64 for autoencoders). ✓ = SAI finds a plan within the board's AI
 arena, stack reserve and AI flash budget.
 
-## Surveyed but not expressible yet
+## Surveyed, not in the library yet
 
-| Design | Needs | Closest library entry |
+| Design | Status | Closest library entry |
 |---|---|---|
-| MobileNetV2 / MCUNet inverted residuals | identity add around an expand-depthwise-project block | Inverted-bottleneck TCN S, Mobile-style 2D M |
-| ResNet downsampling blocks | projection (1x1, strided) shortcut on the add | ResNet-style 2D S |
-| Inception / InceptionTime, DenseNet | concatenation of branches | Dilated TCN, DS-TCN L |
-| Squeeze-and-excitation (EfficientNet, MobileNetV3) | channel-wise multiply by a pooled gate; hard-swish | Mobile-style 2D M |
-| BC-ResNet (broadcasted residual) | broadcast add between 1-D and 2-D branches | DS-CNN 2D M |
-| DeepConvLSTM, GRU/LSTM keyword spotters | recurrent layers | Dilated TCN M, Large-kernel separable TCN |
-| Attention / transformer (KWT, TinyTransformer) | matmul between activations, softmax, layer norm | DS-CNN 2D L |
-| Convolutional autoencoders | transposed convolution / upsampling | Dense autoencoders S/M/L |
-| Non-square kernels (DS-CNN 10x4 stem, TinyConv 10x8) | k_h != k_w | DS-CNN 2D, TinyConv (square kernels) |
+| DeepConvLSTM, GRU / LSTM keyword spotters | available now as sequence models | CRNN S, LSTM S, GRU S |
+| Attention / transformer (KWT, TinyTransformer) | available now as sequence models (self-attention + LayerNorm) | Tiny transformer encoder |
+| MobileNetV2 / MCUNet inverted residuals | needs an add around an expand-depthwise-project block in the platform's builder | Inverted-bottleneck TCN S, Mobile-style 2D M |
+| ResNet downsampling blocks | needs a projection (1x1, strided) shortcut on the add | ResNet-style 2D S |
+| Inception / InceptionTime, DenseNet | needs concatenation of branches in the builder | Dilated TCN, DS-TCN L |
+| Squeeze-and-excitation (EfficientNet, MobileNetV3) | needs a channel-wise multiply by a pooled gate; hard-swish | Mobile-style 2D M |
+| BC-ResNet (broadcasted residual) | needs a broadcast add between 1-D and 2-D branches | DS-CNN 2D M |
+| Convolutional autoencoders | needs transposed convolution / upsampling | Dense autoencoders S/M/L |
+| Non-square kernels (DS-CNN 10x4 stem, TinyConv 10x8) | needs k_h != k_w | DS-CNN 2D, TinyConv (square kernels) |
 
-Each row is an operator the platform's model builder would need first (and, for the deployed program, an INT8
-kernel); they are listed in the order that would unlock the most designs for MCU-class targets.
+The model builder is a linear stack of layers; branch-and-merge designs (adds, multiplies, concatenations) are
+the next step and would go through SAI's front end like the sequence models.

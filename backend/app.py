@@ -775,8 +775,9 @@ def model_preview(body: ModelIn, u: dict = Depends(auth.current)):
     from .recommend import receptive_field
     s = archspec.summary(spec)
     conv = any(layer["op"] in ("conv", "dwconv", "pwconv", "residual") for layer in spec["layers"])
-    return {"ok": True, "spec": spec, "summary": s, "task": task,
-            "receptive_field": receptive_field(spec["layers"]) if conv else None}
+    seq = spec.get("layout") == "sequence"
+    return {"ok": True, "spec": spec, "summary": s, "task": task, "backend": "xmodels" if seq else "core",
+            "receptive_field": receptive_field(spec["layers"]) if conv and not seq else None}
 
 
 @app.post("/api/models/fitcheck")
@@ -793,6 +794,47 @@ def model_fitcheck(body: ModelIn, u: dict = Depends(auth.current)):
     return pipeline.create("fitcheck", {"spec": spec, "targets": targets,
                                         "goal": body.goal if body.goal != "accuracy" else "balanced"},
                            org_id=u["org_id"], user_id=u["id"], priority=2)
+
+
+# ---- several models on one board (SAI multi-model plugin) ----------------------------------------------------------
+class MultiIn(BaseModel):
+    name: str = "Multi-model"
+    job_ids: list[str]
+    target: str = "cortex-m7"
+    budgets: dict = {}
+
+
+@app.post("/api/multimodel")
+def multimodel_start(body: MultiIn, u: dict = Depends(auth.current)):
+    from . import multimodel
+    if not multimodel.available():
+        raise HTTPException(400, multimodel.why_unavailable())
+    ids = list(dict.fromkeys(body.job_ids))
+    if not 2 <= len(ids) <= 8:
+        raise HTTPException(400, "choose 2 to 8 finished projects")
+    if body.target not in sai_engine.MCU_TARGETS:
+        raise HTTPException(400, f"target must be one of {sai_engine.MCU_TARGETS}")
+    for jid in ids:
+        j = _job(jid, u)
+        res = j.get("result") or {}
+        if j["kind"] != "train" or j["status"] != "succeeded":
+            raise HTTPException(400, f"{jid} is not a finished project")
+        if res.get("backend") == "xmodels":
+            raise HTTPException(400, f"{(j['params'] or {}).get('name') or jid}: sequence models (XModels) are not "
+                                     "supported by the multi-model plugin yet; choose SAI Core projects")
+        if not (config.DATA_DIR / "jobs" / jid / "model.onnx").exists():
+            raise HTTPException(400, f"{jid} has no model file")
+    job = pipeline.create("multimodel", {"name": body.name[:80], "job_ids": ids, "target": body.target,
+                                         "budgets": body.budgets}, org_id=u["org_id"], user_id=u["id"], priority=1)
+    auth.audit(u, "multimodel_started", job["id"], {"projects": ids, "target": body.target})
+    return job
+
+
+@app.get("/api/multimodel/available")
+def multimodel_available(u: dict = Depends(auth.current)):
+    from . import multimodel, seqfront
+    return {"multimodel": multimodel.available(), "sequence_models": seqfront.available(),
+            "reason": None if multimodel.available() else multimodel.why_unavailable()}
 
 
 # ---- architecture library -----------------------------------------------------------------------------------------
@@ -916,7 +958,7 @@ def package_get(jid: str, u: dict = Depends(auth.current)):
     j = _job(jid, u)
     hist = [a for a in auth.audit_log(None if auth.has(u, "platform_admin") else u["org_id"], limit=1000)
             if a["target"] == jid and (a["action"].startswith("package_") or a["action"] == "download")]
-    return {**approvals.get(jid), "available": j["kind"] == "train" and j["status"] == "succeeded"
+    return {**approvals.get(jid), "available": j["kind"] in ("train", "multimodel") and j["status"] == "succeeded"
             and (config.DATA_DIR / "jobs" / jid / "package.zip").exists(), "history": hist,
             "can_approve": auth.has(u, "approve")}
 

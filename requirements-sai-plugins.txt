@@ -1,0 +1,5 @@
+# Runtime dependencies of SAI's front end / XModels backend and multi-model plugin, which run in place from
+# SAI_REPO (branch product/sai-unified). Needed for sequence models (LSTM / GRU / attention) and multi-model builds.
+tensorflow>=2.16
+keras>=3.5,<4
+PyYAML>=6,<7

@@ -59,6 +59,8 @@ def job_intermediates(job_dir: Path, keep: set[str] | None = None) -> int:
     for name in ("exact",):
         if (job_dir / name).exists():
             _remove(job_dir / name, report, "intermediate")
+    for p in list(job_dir.glob("seq_*")):         # SAI front-end builds per size and board, calibration / test data
+        _remove(p, report, "intermediate")
     return report["freed_bytes"]
 
 

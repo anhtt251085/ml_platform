@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Build image and check it starts
         run: |
-          docker build --build-arg SAI_PLATFORM_VERSION=${{ github.sha }} -t sai-platform:ci .
+          docker build --build-arg SAI_PLATFORM_VERSION=${{ github.sha }} --build-arg SAI_PLUGINS=0 -t sai-platform:ci .
           docker run -d --name plat -e SAI_PLATFORM_ADMIN_PASSWORD=ci-pass-1234 -p 8000:8000 sai-platform:ci
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/api/health && break; sleep 2; done
           curl -fsS http://127.0.0.1:8000/api/health

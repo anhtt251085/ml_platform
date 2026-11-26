@@ -47,7 +47,7 @@ def test_compatibility_is_decided_on_the_real_input():
 @pytest.mark.parametrize("body, msg", [
     ({"name": "x", "inputs": ["timeseries"], "tasks": ["classification"], "layers": [{"op": "gap"}]}, "name"),
     ({"name": "Bad", "inputs": [], "tasks": ["classification"], "layers": [{"op": "gap"}]}, "input kind"),
-    ({"name": "Bad", "inputs": ["timeseries"], "tasks": ["classification"], "layers": [{"op": "lstm"}]}, "unknown op"),
+    ({"name": "Bad", "inputs": ["timeseries"], "tasks": ["classification"], "layers": [{"op": "conv3d"}]}, "unknown op"),
     ({"name": "Bad", "inputs": ["timeseries"], "tasks": ["classification"], "layers": []}, "layers")])
 def test_custom_entries_are_validated(body, msg):
     with pytest.raises(archlib.LibError, match=msg):

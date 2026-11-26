@@ -215,8 +215,10 @@ def preview(X, y, labels, meta, cfg, task) -> dict:
 
 
 # ---- generated C ------------------------------------------------------------------------------------------------
-def c_prepare(cfg: dict, off, sc, qin: dict, raw_shape) -> str:
-    """`sai_app_prepare(raw, q)`: raw window (channel-major, raw channels x raw samples, float) -> model int8 input."""
+def c_prepare(cfg: dict, off, sc, qin: dict, raw_shape, seq_width: int | None = None) -> str:
+    """`sai_app_prepare(raw, q)`: raw window (channel-major, raw channels x raw samples, float) -> model int8 input.
+    seq_width: for sequence models, write the [time, features] layout (archspec.to_sequence) instead of the channel-
+    major one: 1 for 1-D inputs ([T, C]), the width W for 2-D inputs ([H, C*W])."""
     C_raw, T_raw = int(raw_shape[0]), int(raw_shape[1]) * int(raw_shape[2])     # H x W flattened per channel
     chans = cfg["channels"] or list(range(C_raw))
     t_out = T_raw // cfg["decimate"] if cfg["window_ops"] else T_raw
@@ -249,6 +251,9 @@ def c_prepare(cfg: dict, off, sc, qin: dict, raw_shape) -> str:
               "        float v = (buf[c * SAI_APP_IN_SAMPLES + t] - sai_app_off[c]) / sai_app_sc[c];",
               *([clip] if clip else []),
               f"        float r = rintf(v / {f(qin['scale'])}) + {int(qin['zero_point'])}.0f;",
-              "        q[c * SAI_APP_IN_SAMPLES + t] = (int8_t)(r < -128.0f ? -128 : r > 127.0f ? 127 : (int)r);",
+              ("        q[c * SAI_APP_IN_SAMPLES + t] = (int8_t)(r < -128.0f ? -128 : r > 127.0f ? 127 : (int)r);"
+               if not seq_width else
+               f"        q[(t / {seq_width}) * (SAI_APP_IN_CHANNELS * {seq_width}) + c * {seq_width} + t % {seq_width}] = "
+               "(int8_t)(r < -128.0f ? -128 : r > 127.0f ? 127 : (int)r);   /* [time][features] */"),
               "      }", "    return 0;", "}", "", "#endif", ""]
     return "\n".join(lines)

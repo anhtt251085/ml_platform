@@ -133,7 +133,7 @@ def test_api_validates_recommend_and_custom_variants():
         assert c.post("/api/recommend", json={"template_id": "gas-sense", "dataset_id": ds["id"],
                                               "goal": "nonsense"}).status_code == 400
         bad = c.post("/api/projects", json={"name": "x", "template_id": "gas-sense", "dataset_id": ds["id"],
-                                            "sizes": ["auto"], "custom_variants": {"auto": [{"op": "lstm"}]}})
+                                            "sizes": ["auto"], "custom_variants": {"auto": [{"op": "conv3d"}]}})
         assert bad.status_code == 400 and "unknown op" in bad.text
         bad = c.post("/api/projects", json={"name": "x", "template_id": "gas-sense", "dataset_id": ds["id"],
                                             "sizes": ["auto"], "custom_variants": {"../x": [{"op": "gap"}]}})
