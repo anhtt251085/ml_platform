@@ -254,7 +254,7 @@ def reference(job_id: str, dataset_id: str) -> dict:
                                       for c in range(X.shape[1])]
     m = _model(job_id)
     if m and m.task == "classification":
-        pr = m.predict_proba(X[:500])
+        pr = m.predict_proba(X[:500], features_ready=True)          # dataset windows hold front-end features
         ref["pred_mix"] = (np.bincount(pr.argmax(1), minlength=len(m.labels)) / len(pr)).tolist()
         ref["confidence"] = float(pr.max(1).mean())
         ref["labels"] = m.labels
@@ -307,16 +307,18 @@ def check(job: dict, X: np.ndarray, source: str, channel_names: list[str] | None
     return out
 
 
-def windows_from_recording(rec: dict, raw_shape: list) -> np.ndarray:
-    from . import recordings
-    C, T = int(raw_shape[0]), int(raw_shape[-1])
+def windows_from_recording(rec: dict, raw_shape: list, frontend: dict | None = None) -> np.ndarray:
+    """Windows in the layout the training data was stored in (front-end features for MFCC / band-energy types)."""
+    from . import features, recordings
+    C, T = int(raw_shape[0]), int(frontend["raw_length"]) if frontend else int(raw_shape[-1])
     if len(rec["channels"]) != C:
         raise ValueError(f"the project reads {C} channels; the recording has {len(rec['channels'])}")
     sig = np.asarray(recordings.signal(rec), np.float32)
     starts = range(0, len(sig) - T + 1, T)
     if not len(starts):
         raise ValueError(f"the recording is shorter than one window ({T} samples)")
-    return np.stack([sig[s:s + T].T for s in starts])[:, :, None, :][:5000]
+    X = np.stack([sig[s:s + T].T for s in starts])[:, :, None, :][:5000]
+    return features.apply(frontend, X) if frontend else X
 
 
 def save(job: dict, out: dict) -> dict:

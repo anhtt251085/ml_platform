@@ -151,6 +151,7 @@ def run_emulated(elf: str, port: str, timeout: int = 120) -> dict:
         stdout = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         stderr = f"timeout after {timeout} s"
     res = parse(stdout)
+    res["uart"] = stdout[-6000:]
     if res["status"] != "ok":
         raise HilError(f"{port}: harness did not finish ({res['status']}); output tail: {stdout[-300:]!r}; "
                        f"qemu: {stderr.strip()[-300:]!r}")

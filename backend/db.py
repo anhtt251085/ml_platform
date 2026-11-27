@@ -118,6 +118,17 @@ MIGRATIONS: list[str] = [
                                status TEXT, result TEXT);
     CREATE INDEX drift_checks_i ON drift_checks(job_id, created);
     """,
+    # 11: customer-VPC workers (data access inside the customer's network) and partner-hosted boards
+    """
+    CREATE TABLE vpc_workers (id TEXT PRIMARY KEY, org_id TEXT, name TEXT, token_hash TEXT, created REAL,
+                              last_seen REAL, disabled INTEGER DEFAULT 0, info TEXT);
+    CREATE TABLE vpc_tasks (id TEXT PRIMARY KEY, org_id TEXT, connection_id TEXT, kind TEXT, payload TEXT,
+                            status TEXT, worker_id TEXT, result TEXT, error TEXT, created REAL, updated REAL);
+    CREATE INDEX vpc_tasks_i ON vpc_tasks(org_id, status, created);
+    ALTER TABLE agents ADD COLUMN partner TEXT;
+    CREATE TABLE partner_boards (id TEXT PRIMARY KEY, partner TEXT, board TEXT, vendor TEXT, mcu TEXT, core TEXT,
+                                 target TEXT, status TEXT, url TEXT, notes TEXT, created REAL);
+    """,
 ]
 
 

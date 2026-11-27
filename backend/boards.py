@@ -107,7 +107,8 @@ QUARANTINE_AFTER = 3
 
 def list_boards() -> list[dict]:
     with db.conn() as c:
-        rows = [db.row(r) for r in c.execute("SELECT * FROM boards ORDER BY target, name")]
+        rows = [db.row(r) for r in c.execute("SELECT b.*, a.partner AS partner FROM boards b LEFT JOIN agents a"
+                                             " ON a.id = b.agent_id ORDER BY b.target, b.name")]
     t = db.now()
     for r in rows:
         r["info"] = db.uj(r["info"], {})

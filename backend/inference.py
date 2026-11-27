@@ -34,11 +34,28 @@ class ProjectModel:
         self.raw_channels = int(shape[0])
         self.raw_window = int(fe["raw_length"]) if fe else int(shape[-1])
 
-    def outputs(self, X: np.ndarray) -> np.ndarray:
+    def quantized(self, X: np.ndarray, features_ready: bool = False) -> np.ndarray:
+        """X: raw windows (or, features_ready, a dataset's stored front-end features) -> the model's int8 input
+        (what sai_app_prepare() produces on the MCU)."""
+        X = np.asarray(X, np.float32)
+        fe = self.pre.get("frontend")
+        if fe and not features_ready:
+            X = features.apply(fe, X)
+        cfg = self.pre["preprocess"]
+        X = preprocess.window_ops(X, cfg)
+        Xn = preprocess.apply_norm(X, np.asarray(self.pre["mean"], np.float32), np.asarray(self.pre["std"], np.float32),
+                                   cfg.get("clip"))
+        q = self.pre["input"]
+        return preprocess.quantize(Xn, q["scale"], q["zero_point"])
+
+    def dequantize(self, out_q: np.ndarray) -> np.ndarray:
+        return qexport.dequantize_output(np.asarray(out_q).reshape(len(out_q), -1), self.pre["output"])
+
+    def outputs(self, X: np.ndarray, features_ready: bool = False) -> np.ndarray:
         """X: raw windows [N, C, 1, T] float -> dequantized outputs [N, n_out]."""
         X = np.asarray(X, np.float32)
         fe = self.pre.get("frontend")
-        if fe:
+        if fe and not features_ready:
             X = features.apply(fe, X)
         cfg = self.pre["preprocess"]
         X = preprocess.window_ops(X, cfg)
@@ -50,7 +67,7 @@ class ProjectModel:
         out = qexport.ort_int8_outputs(self.path, xq)
         return qexport.dequantize_output(out.reshape(len(X), -1), self.pre["output"])
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        o = self.outputs(X).astype(np.float64)
+    def predict_proba(self, X: np.ndarray, features_ready: bool = False) -> np.ndarray:
+        o = self.outputs(X, features_ready).astype(np.float64)
         e = np.exp(o - o.max(1, keepdims=True))
         return e / e.sum(1, keepdims=True)

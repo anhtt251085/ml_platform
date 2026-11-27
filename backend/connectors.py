@@ -101,15 +101,18 @@ def _clean(kind: str, cfg: dict, secrets_in: dict | None, old_secret: dict | Non
         else:
             v = str(v or "").strip()[:300]
         out[key] = v
+    out["via_worker"] = bool(cfg.get("via_worker"))
     sec = dict(old_secret or {})
     for key, _label in spec["secrets"]:
         if (secrets_in or {}).get(key):
             sec[key] = str(secrets_in[key])
+    if out["via_worker"]:
+        sec = {}             # the customer-VPC worker holds the credentials; the platform never sees them
     if kind == "s3" and not out["bucket"]:
         raise ConnectorError("bucket is required")
     if kind == "azure" and not (re.fullmatch(r"[a-z0-9]{3,24}", out["account"]) and out["container"]):
         raise ConnectorError("give the storage account (3-24 lowercase letters/digits) and the container")
-    if kind == "influxdb" and not (out["url"].startswith("https://") and out["org"]):
+    if kind == "influxdb" and not ((out["url"].startswith("https://") or cfg.get("via_worker")) and out["org"]):
         raise ConnectorError("InfluxDB needs an https:// URL and the organisation")
     if kind == "postgres" and not (out["host"] and out["database"] and out["user"]):
         raise ConnectorError("host, database and user are required")
@@ -198,9 +201,10 @@ def https(method: str, url: str, headers: dict | None = None, body: bytes | None
     import ssl
 
     u = urlsplit(url)
-    if u.scheme != "https" or not u.hostname:
+    plain = u.scheme == "http" and private_allowed()          # inside the customer's network (MinIO on http)
+    if (u.scheme != "https" and not plain) or not u.hostname:
         raise ConnectorError("only https:// endpoints are accepted")
-    port = u.port or 443
+    port = u.port or (80 if plain else 443)
     ip = _resolve(u.hostname, port)
     ctx = ssl.create_default_context()
 
@@ -208,7 +212,11 @@ def https(method: str, url: str, headers: dict | None = None, body: bytes | None
         def connect(self):
             self.sock = ctx.wrap_socket(socket.create_connection((ip, port), timeout=60), server_hostname=u.hostname)
 
-    conn = _Pinned(u.hostname, port, timeout=120, context=ctx)
+    class _PinnedPlain(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket.create_connection((ip, port), timeout=60)
+
+    conn = _PinnedPlain(u.hostname, port, timeout=120) if plain else _Pinned(u.hostname, port, timeout=120, context=ctx)
     try:
         conn.request(method, (u.path or "/") + (f"?{u.query}" if u.query else ""), body=body,
                      headers={"User-Agent": "sai-platform-connector/0.3", **(headers or {})})
@@ -262,14 +270,15 @@ def sigv4(method: str, url: str, region: str, access_key: str, secret_key: str, 
 
 
 def _s3_url(cfg: dict, key: str = "", query: str = "") -> str:
-    ep = cfg["endpoint"].replace("https://", "").strip("/") or "s3.amazonaws.com"
+    scheme = "http" if cfg["endpoint"].startswith("http://") else "https"
+    ep = cfg["endpoint"].replace("https://", "").replace("http://", "").strip("/") or "s3.amazonaws.com"
     if ep == "s3.amazonaws.com" and cfg["region"] not in ("", "us-east-1"):
         ep = f"s3.{cfg['region']}.amazonaws.com"
     k = quote(key, safe="/-_.~")
     if cfg.get("path_style"):
-        base = f"https://{ep}/{cfg['bucket']}/{k}"
+        base = f"{scheme}://{ep}/{cfg['bucket']}/{k}"
     else:
-        base = f"https://{cfg['bucket']}.{ep}/{k}"
+        base = f"{scheme}://{cfg['bucket']}.{ep}/{k}"
     return base + (f"?{query}" if query else "")
 
 
@@ -293,7 +302,10 @@ def _xml_items(raw: bytes, item: str, fields: tuple) -> list[dict]:
 
 # ---- operations ---------------------------------------------------------------------------------------------------
 def browse(cid: str, prefix: str = "") -> list[dict]:
-    kind, cfg, sec = _full(cid)
+    return browse_with(*_full(cid), prefix)
+
+
+def browse_with(kind: str, cfg: dict, sec: dict, prefix: str = "") -> list[dict]:
     prefix = (cfg.get("prefix") or "") + (prefix or "")
     if kind == "s3":
         raw = _s3(cfg, sec, "", "list-type=2&max-keys=%d&prefix=%s" % (MAX_LIST, quote(prefix, safe="")))
@@ -319,7 +331,10 @@ def browse(cid: str, prefix: str = "") -> list[dict]:
 
 
 def fetch(cid: str, key: str) -> tuple[bytes, str]:
-    kind, cfg, sec = _full(cid)
+    return fetch_with(*_full(cid), key)
+
+
+def fetch_with(kind: str, cfg: dict, sec: dict, key: str) -> tuple[bytes, str]:
     if not key or ".." in key.split("/"):
         raise ConnectorError("give an object key")
     name = key.rsplit("/", 1)[-1]
@@ -347,8 +362,11 @@ SELECT_RE = re.compile(r"^\s*(select|with)\b", re.I)
 
 
 def query(cid: str, q: str, max_rows: int = MAX_ROWS) -> bytes:
+    return query_with(*_full(cid), q, max_rows)
+
+
+def query_with(kind: str, cfg: dict, sec: dict, q: str, max_rows: int = MAX_ROWS) -> bytes:
     """Run a query; the result comes back as CSV text with a header row."""
-    kind, cfg, sec = _full(cid)
     q = (q or "").strip()
     if not q:
         raise ConnectorError("write a query")
@@ -416,14 +434,17 @@ def _pg(cfg, sec, q, max_rows):
 
 
 def test(cid: str) -> dict:
-    kind, cfg, _ = _full(cid)
+    return test_with(*_full(cid))
+
+
+def test_with(kind: str, cfg: dict, sec: dict) -> dict:
     if kind in ("s3", "azure"):
-        items = browse(cid)
+        items = browse_with(kind, cfg, sec)
         return {"ok": True, "detail": f"listed {len(items)} object(s)"}
     if kind == "influxdb":
-        items = browse(cid)
+        items = browse_with(kind, cfg, sec)
         return {"ok": True, "detail": f"{len(items)} measurement(s) in {cfg['bucket'] or 'the bucket'}"}
-    query(cid, "SELECT 1 AS ok")
+    query_with(kind, cfg, sec, "SELECT 1 AS ok")
     return {"ok": True, "detail": "connected (read-only)"}
 
 

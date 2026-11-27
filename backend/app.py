@@ -22,8 +22,8 @@ from pydantic import BaseModel
 import numpy as np
 from xml.etree.ElementTree import ParseError as ET_ERRORS
 
-from . import (approvals, archlib, archspec, auth, boards, commercial, config, connectors, data, db, insight,
-               opgaps, physics, pipeline, recordings, sai_engine, store)
+from . import (approvals, archlib, archspec, auth, baselines, boards, commercial, config, connectors, data, db,
+               devboard, insight, mlperf, opgaps, physics, pipeline, recordings, sai_engine, store, vpc)
 
 app = FastAPI(title=config.BRAND_NAME, version=config.PLATFORM_VERSION)
 FRONT = config.ROOT / "frontend"
@@ -239,7 +239,7 @@ def admin_agents(u: dict = Depends(auth.require("farm_admin"))):
 
 @app.post("/api/admin/agents")
 def admin_agent_create(body: dict, u: dict = Depends(auth.require("farm_admin"))):
-    a, token = auth.create_agent(body.get("name") or "lab agent")
+    a, token = auth.create_agent(body.get("name") or "lab agent", (body.get("partner") or "").strip()[:80] or None)
     auth.audit(u, "agent_created", a["id"], {"name": a["name"]})
     return {**a, "token": token, "note": "shown once; store it on the lab PC"}
 
@@ -735,7 +735,13 @@ def connector_delete(cid: str, u: dict = Depends(auth.current)):
 
 @app.post("/api/connectors/{cid}/test")
 def connector_test(cid: str, u: dict = Depends(auth.current)):
-    _con(cid, u)
+    c = _con(cid, u)
+    if c["config"].get("via_worker"):
+        r = vpc.submit(c["org_id"] or u["org_id"], cid, "test", {})
+        r = vpc.wait(r["id"], vpc.WAIT_S)
+        if r["status"] == "succeeded":
+            return r["result"]
+        return {"ok": False, "detail": r.get("error") or "no VPC worker answered within 20 s (is one running?)"}
     try:
         return connectors.test(cid)
     except data.DataError as e:
@@ -744,7 +750,9 @@ def connector_test(cid: str, u: dict = Depends(auth.current)):
 
 @app.get("/api/connectors/{cid}/browse")
 def connector_browse(cid: str, prefix: str = "", u: dict = Depends(auth.current)):
-    _con(cid, u)
+    c = _con(cid, u)
+    if c["config"].get("via_worker"):
+        return _via_worker(c, "browse", {"prefix": prefix}, u)
     try:
         return {"items": connectors.browse(cid, prefix)}
     except (data.DataError, ET_ERRORS) as e:
@@ -766,17 +774,10 @@ class ConnImportIn(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-@app.post("/api/connectors/{cid}/import")
-def connector_import(cid: str, body: dict, u: dict = Depends(auth.current)):
-    c = _con(cid, u)
-    b = ConnImportIn(**{("as_" if k == "as" else k): v for k, v in body.items()})
+def _ingest_connector(c: dict, b: "ConnImportIn", raw: bytes, fname: str, u: dict) -> dict:
+    """Turn fetched bytes into a recording or a dataset (direct imports and VPC-worker imports alike)."""
+    cid = c["id"]
     try:
-        if b.key:
-            raw, fname = connectors.fetch(cid, b.key)
-        elif b.query:
-            raw, fname = connectors.time_to_seconds(connectors.query(cid, b.query)), f"{c['name']}-query.csv"
-        else:
-            raise data.DataError("give an object key or a query")
         if b.as_ == "recording":
             if not fname.lower().endswith((".csv", ".txt")) and not b.query:
                 raise data.DataError("recordings import CSV objects")
@@ -790,12 +791,156 @@ def connector_import(cid: str, body: dict, u: dict = Depends(auth.current)):
                                  hop=b.hop, mapping=b.mapping, licence=b.licence)
     except (data.DataError, ET_ERRORS) as e:
         _bad(e)
+    return _store_connector_dataset(c, b, meta, u)
+
+
+def _store_connector_dataset(c: dict, b: "ConnImportIn", meta: dict, u: dict) -> dict:
+    cid = c["id"]
     meta["source"] = f"connector:{c['kind']}"
     if b.name:
         meta["name"] = b.name[:120]
     store.add_dataset(meta, u["org_id"])
     auth.audit(u, "dataset_imported", meta["id"], {"connection": cid, "key": b.key, "query": bool(b.query)})
     return {"dataset": meta}
+
+
+def _via_worker(c: dict, kind: str, payload: dict, u: dict):
+    """Run a connector operation on the organisation's VPC worker; answer when it is done within ~20 s, else
+    return the pending task for the UI to poll."""
+    t = vpc.submit(c["org_id"] or u["org_id"], c["id"], kind, payload)
+    t = vpc.wait(t["id"], vpc.WAIT_S)
+    if t["status"] == "failed":
+        raise HTTPException(400, f"VPC worker: {t['error']}")
+    if t["status"] != "succeeded":
+        online = [w for w in vpc.workers(c["org_id"]) if w["online"]]
+        return JSONResponse({"pending": True, "task": t["id"], "workers_online": len(online),
+                             "detail": "waiting for your VPC worker" + ("" if online else " (none is online)")},
+                            status_code=202)
+    return t["result"]
+
+
+@app.post("/api/connectors/{cid}/import")
+def connector_import(cid: str, body: dict, u: dict = Depends(auth.current)):
+    c = _con(cid, u)
+    b = ConnImportIn(**{("as_" if k == "as" else k): v for k, v in body.items()})
+    if c["config"].get("via_worker"):
+        if not (b.key or b.query):
+            _bad("give an object key or a query")
+        return _via_worker(c, "import", {"options": b.model_dump(), "user": {"id": u["id"], "org_id": u["org_id"]}}, u)
+    try:
+        if b.key:
+            raw, fname = connectors.fetch(cid, b.key)
+        elif b.query:
+            raw, fname = connectors.time_to_seconds(connectors.query(cid, b.query)), f"{c['name']}-query.csv"
+        else:
+            raise data.DataError("give an object key or a query")
+    except (data.DataError, ET_ERRORS) as e:
+        _bad(e)
+    return _ingest_connector(c, b, raw, fname, u)
+
+
+# ---- customer-VPC workers -----------------------------------------------------------------------------------------
+@app.get("/api/admin/vpc-workers")
+def vpc_workers(u: dict = Depends(auth.require("org_admin"))):
+    return vpc.workers(auth.scope(u))
+
+
+@app.post("/api/admin/vpc-workers")
+def vpc_worker_create(body: dict, u: dict = Depends(auth.require("org_admin"))):
+    w, token = vpc.create_worker(u["org_id"], str(body.get("name") or "VPC worker"))
+    auth.audit(u, "vpc_worker_created", w["id"], {"name": w["name"]})
+    return {**w, "token": token, "note": "shown once; put it in the worker's environment (SAI_VPC_TOKEN)"}
+
+
+@app.post("/api/admin/vpc-workers/{wid}/disable")
+def vpc_worker_disable(wid: str, u: dict = Depends(auth.require("org_admin"))):
+    w = next((x for x in vpc.workers(auth.scope(u)) if x["id"] == wid), None)
+    if not w:
+        raise HTTPException(404, "unknown worker")
+    vpc.disable_worker(wid)
+    auth.audit(u, "vpc_worker_disabled", wid)
+    return {"ok": True}
+
+
+def _vpc_worker(authorization: str | None = Header(None)) -> dict:
+    tok = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    w = vpc.worker_from_token(tok)
+    if not w:
+        raise HTTPException(401, "bad VPC worker token")
+    return w
+
+
+@app.post("/api/vpc/claim")
+def vpc_claim(body: dict | None = None, w: dict = Depends(_vpc_worker)):
+    vpc.heartbeat(w["id"], (body or {}).get("info") or {})
+    t = vpc.claim(w)
+    if not t:
+        return Response(status_code=204)
+    c = connectors.get(t["connection_id"])
+    if not c:
+        vpc.finish(t["id"], False, error="the connection was deleted")
+        return Response(status_code=204)
+    p = dict(t["payload"])
+    p.pop("user", None)
+    return {"id": t["id"], "kind": t["kind"], "payload": p,
+            "connection": {"id": c["id"], "name": c["name"], "kind": c["kind"], "config": c["config"]}}
+
+
+def _worker_task(tid: str, w: dict) -> dict:
+    t = vpc.get(tid)
+    if not t or t["org_id"] != w["org_id"] or t["worker_id"] != w["id"] or t["status"] != "running":
+        raise HTTPException(404, "no such running task for this worker")
+    return t
+
+
+@app.post("/api/vpc/tasks/{tid}/complete")
+def vpc_complete(tid: str, body: dict, w: dict = Depends(_vpc_worker)):
+    t = _worker_task(tid, w)
+    if t["kind"] == "import" and body.get("ok"):
+        raise HTTPException(400, "import results are uploaded as a file")
+    res = body.get("result") if isinstance(body.get("result"), dict) else None
+    if res and "items" in res:
+        res = {"items": [{"key": str(i.get("key"))[:500], "size": i.get("size"), "modified": i.get("modified")}
+                         for i in res["items"][:connectors.MAX_LIST]]}
+    elif res:
+        res = {"ok": bool(res.get("ok")), "detail": str(res.get("detail", ""))[:300]}
+    vpc.finish(tid, bool(body.get("ok")), res, body.get("error"))
+    return {"ok": True}
+
+
+@app.post("/api/vpc/tasks/{tid}/file")
+async def vpc_file(tid: str, request: Request, x_filename: str = Header("import.csv"),
+                   w: dict = Depends(_vpc_worker)):
+    t = _worker_task(tid, w)
+    if t["kind"] != "import":
+        raise HTTPException(400, "only import tasks upload a file")
+    raw = await request.body()
+    if len(raw) > config.MAX_UPLOAD_BYTES:
+        vpc.finish(tid, False, error="file too large")
+        raise HTTPException(413, "file too large")
+    c = connectors.get(t["connection_id"])
+    user = t["payload"]["user"]
+    with db.conn() as con:
+        r = con.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+    u = {**(db.row(r) if r else {}), "id": user["id"], "org_id": user["org_id"], "role": (db.row(r) if r else {}).get("role", "engineer")}
+    b = ConnImportIn(**t["payload"]["options"])
+    try:
+        out = await run_in_threadpool(_ingest_connector, c, b, raw, x_filename.rsplit("/", 1)[-1][:120], u)
+    except HTTPException as e:
+        vpc.finish(tid, False, error=str(e.detail))
+        raise
+    vpc.finish(tid, True, out)
+    return {"ok": True}
+
+
+@app.get("/api/vpc/tasks/{tid}")
+def vpc_task(tid: str, u: dict = Depends(auth.current)):
+    t = vpc.get(tid)
+    if not t:
+        raise HTTPException(404, "unknown task")
+    _own(u, t["org_id"], "task")
+    t["payload"].pop("user", None)
+    return t
 
 
 @app.get("/api/datasets")
@@ -1097,7 +1242,8 @@ def job_drift(jid: str, body: DriftIn, u: dict = Depends(auth.current)):
             r = _rec(body.recording_id, u)
             if r["status"] == "capturing":
                 raise HTTPException(409, "stop the capture first")
-            X, src = insight.windows_from_recording(r, raw), f"recording {r['name']}"
+            X, src = (insight.windows_from_recording(r, raw, (j["result"].get("preprocessing") or {}).get("frontend")),
+                      f"recording {r['name']}")
         elif body.dataset_id:
             d = _ds(body.dataset_id, u)
             X = data.load(body.dataset_id)[0]
@@ -1111,6 +1257,130 @@ def job_drift(jid: str, body: DriftIn, u: dict = Depends(auth.current)):
     out = insight.save(j, out)
     auth.audit(u, "drift_checked", jid, {"status": out["status"], "psi": out["psi"]})
     return out
+
+
+@app.get("/api/jobs/{jid}/compare")
+def job_compare(jid: str, u: dict = Depends(auth.current)):
+    """The project's SAI numbers next to TFLM + CMSIS-NN (Arm) / TFLM reference kernels for the same graph."""
+    j = _done_project(jid, u)
+    try:
+        return baselines.compare(j["result"], jid)
+    except (ValueError, archspec.SpecError) as e:
+        _bad(e)
+
+
+@app.put("/api/jobs/{jid}/compare/measured")
+def job_compare_measured(jid: str, body: dict, u: dict = Depends(auth.current)):
+    """Store the customer's own TFLM build numbers (map file, board run) for a target; they replace the model."""
+    _done_project(jid, u)
+    t = body.get("target")
+    if t not in sai_engine.MCU_TARGETS:
+        raise HTTPException(400, f"target must be one of {sai_engine.MCU_TARGETS}")
+    try:
+        baselines.save_measured(jid, t, body)
+    except (TypeError, ValueError) as e:
+        _bad(e)
+    auth.audit(u, "baseline_measured", jid, {"target": t})
+    return baselines.compare(_job(jid, u)["result"], jid)
+
+
+@app.get("/api/benchmarks")
+def benchmarks(u: dict = Depends(auth.current)):
+    """The corpus (MLPerf Tiny reference tasks + model types) and the latest benchmark runs."""
+    runs = [j for j in pipeline.list_jobs("benchmark") if j["status"] in ("succeeded", "running", "queued")][:10]
+    latest = next((j for j in runs if j["status"] == "succeeded"), None)
+    return {"corpus": [{k: e[k] for k in ("id", "suite", "task", "reference", "deviation", "summary")}
+                       for e in mlperf.corpus(store.templates())],
+            "runs": [{k: j.get(k) for k in ("id", "status", "created", "progress")} for j in runs],
+            "latest": pipeline.get(latest["id"]) ["result"] if latest else None,
+            "can_run": auth.has(u, "publish") or auth.has(u, "farm_admin")}
+
+
+@app.post("/api/benchmarks/run")
+def benchmark_run(body: dict | None = None, u: dict = Depends(auth.current)):
+    if not (auth.has(u, "publish") or auth.has(u, "farm_admin")):
+        raise HTTPException(403, "benchmark runs are for SAI researchers and admins")
+    _busy(pipeline.active_jobs("benchmark"), "a benchmark run")
+    ids = [str(x) for x in (body or {}).get("ids") or []] or None
+    return pipeline.create("benchmark", {"ids": ids, "explore_seconds": 5}, org_id=u["org_id"], user_id=u["id"])
+
+
+@app.get("/api/devboard/available")
+def devboard_available(u: dict = Depends(auth.current)):
+    return {"targets": devboard.available()}
+
+
+class DevboardIn(BaseModel):
+    target: str
+    inputs: dict = {}
+
+
+@app.post("/api/jobs/{jid}/devboard")
+def devboard_start(jid: str, body: DevboardIn, u: dict = Depends(auth.current)):
+    """Run the project's firmware on a virtual (emulated) board with your own inputs (background job)."""
+    j = _done_project(jid, u)
+    if j["result"].get("backend") == "xmodels":
+        raise HTTPException(400, "the virtual board runs SAI Core packages; sequence models were verified on QEMU "
+                                 "by SAI's front end during the build")
+    if body.target not in devboard.PORT:
+        raise HTTPException(400, f"virtual boards: {', '.join(devboard.PORT)}")
+    if body.inputs.get("recording_id"):
+        _rec(body.inputs["recording_id"], u)
+    if body.inputs.get("dataset_id"):
+        _ds(body.inputs["dataset_id"], u)
+    _busy(pipeline.active_jobs("devboard", lambda p: p.get("job_id") == jid, u["org_id"]),
+          "a virtual board session of this project")
+    return pipeline.create("devboard", {"job_id": jid, "target": body.target, "inputs": body.inputs},
+                           org_id=u["org_id"], user_id=u["id"], priority=2)
+
+
+@app.get("/api/partner-boards")
+def partner_boards(u: dict = Depends(auth.current)):
+    with db.conn() as c:
+        rows = [db.row(r) for r in c.execute("SELECT * FROM partner_boards ORDER BY partner, board")]
+        agents = {r[0]: r[1] for r in c.execute("SELECT id, partner FROM agents WHERE partner IS NOT NULL")}
+    live = [b for b in boards.list_boards() if agents.get(b.get("agent_id"))]
+    for r in rows:
+        r["online_boards"] = [b["id"] for b in live if agents.get(b["agent_id"]) == r["partner"] and b["target"] == r["target"]
+                              and b["online"]]
+    return {"boards": rows, "targets": sai_engine.MCU_TARGETS}
+
+
+class PartnerBoardIn(BaseModel):
+    partner: str
+    board: str
+    vendor: str = ""
+    mcu: str = ""
+    core: str = ""
+    target: str
+    status: str = "planned"
+    url: str = ""
+    notes: str = ""
+
+
+@app.post("/api/partner-boards")
+def partner_board_add(body: PartnerBoardIn, u: dict = Depends(auth.require("farm_admin"))):
+    if body.target not in sai_engine.MCU_TARGETS:
+        raise HTTPException(400, f"SAI target must be one of {sai_engine.MCU_TARGETS} (the board's SAI build)")
+    if body.status not in ("planned", "community", "certified"):
+        raise HTTPException(400, "status: planned, community or certified")
+    if body.url and not body.url.startswith("https://"):
+        raise HTTPException(400, "url must be https://")
+    bid = "pb_" + uuid.uuid4().hex[:8]
+    with db.conn() as c:
+        c.execute("INSERT INTO partner_boards VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (bid, body.partner[:80], body.board[:80], body.vendor[:80], body.mcu[:80], body.core[:80],
+                   body.target, body.status, body.url[:300], body.notes[:500], db.now()))
+    auth.audit(u, "partner_board_added", bid, {"partner": body.partner, "board": body.board})
+    return {"id": bid}
+
+
+@app.delete("/api/partner-boards/{bid}")
+def partner_board_delete(bid: str, u: dict = Depends(auth.require("farm_admin"))):
+    with db.conn() as c:
+        c.execute("DELETE FROM partner_boards WHERE id=?", (bid,))
+    auth.audit(u, "partner_board_removed", bid)
+    return {"ok": True}
 
 
 @app.get("/api/admin/operator-gaps")

@@ -59,7 +59,7 @@ async function system() { if (!SYS) SYS = await api("/api/system"); return SYS; 
 const routes = [];
 const route = (re, fn) => routes.push([re, fn]);
 let cleanup = [];
-const NAV_ALIAS = { "/recordings": "/data", "/recording": "/data", "/connectors": "/data", "/physics": "/data" };
+const NAV_ALIAS = { "/recordings": "/data", "/recording": "/data", "/connectors": "/data", "/physics": "/data", "/devboard": "/projects" };
 function onLeave(fn) { cleanup.push(fn); }
 function leave() { GEN++; cleanup.forEach((f) => f()); cleanup = []; }
 async function render() {
@@ -1069,9 +1069,9 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     const box = $("#insight"); if (!box) return;
     let tab = "whatif";
     const draw = () => {
-      box.innerHTML = `<div class="row"><h2 style="margin:0">Explore this model</h2><span class="spacer"></span></div><div class="tabs" style="margin-top:8px">${[["whatif", "What-if: window & channels"], ["battery", "Battery life & power"], ["drift", "Drift"]].map(([k, t]) => `<button class="tab ${k === tab ? "on" : ""}" data-it="${k}">${t}</button>`).join("")}</div><div id="ibody"><span class="small muted">Loading…</span></div>`;
+      box.innerHTML = `<div class="row"><h2 style="margin:0">Explore this model</h2><span class="spacer"></span></div><div class="tabs" style="margin-top:8px">${[["whatif", "What-if: window & channels"], ["battery", "Battery life & power"], ["drift", "Drift"], ["compare", "vs TFLite Micro"], ["devboard", "Virtual dev board"]].map(([k, t]) => `<button class="tab ${k === tab ? "on" : ""}" data-it="${k}">${t}</button>`).join("")}</div><div id="ibody"><span class="small muted">Loading…</span></div>`;
       $$("[data-it]", box).forEach((b) => (b.onclick = () => { tab = b.dataset.it; draw(); }));
-      ({ whatif: drawWhatIf, battery: drawBattery, drift: drawDrift })[tab]().catch((e) => { if (!(e instanceof Stale) && $("#ibody")) $("#ibody").innerHTML = `<div class="callout">${esc(e.message)}</div>`; });
+      ({ whatif: drawWhatIf, battery: drawBattery, drift: drawDrift, compare: drawCompare, devboard: drawDevboardTab })[tab]().catch((e) => { if (!(e instanceof Stale) && $("#ibody")) $("#ibody").innerHTML = `<div class="callout">${esc(e.message)}</div>`; });
     };
     draw();
   }
@@ -1133,6 +1133,35 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
       $$("#ibody input").forEach((i) => (i.onchange = () => { p = { ...p, mah: num("#bmah"), volts: num("#bv"), inferences_per_s: num("#brate"), sensor_mw: num("#bsen"), radio_uj: num("#brad"), events_per_hour: num("#bev"), active_mw: num("#bact"), sleep_uw: num("#bsl") }; run(); }));
     };
     await run();
+  }
+  async function drawCompare() {
+    let r = await api(`/api/jobs/${jid}/compare`);
+    const evb = (e) => ev(e === "replayed" ? "estimate" : e === "assumed" ? "assumed" : e);
+    const cell = (sai, other, f, evd) => `<td class="n">${f(sai)}</td><td class="n">${f(other)} ${evd || ""}</td><td class="n">${sai && other ? `<b>${(other / sai).toFixed(1)}×</b>` : "–"}</td>`;
+    const draw = () => {
+      $("#ibody").innerHTML = `<p class="small muted">The same INT8 model under SAI and under TensorFlow Lite for Microcontrollers. ${esc(r.method)}</p>
+        ${r.rows.map((x) => { const t = x.measured || x.tflm; const evs = x.measured ? { arena: "measured", flash: "measured", latency: "measured" } : x.tflm.evidence; return `<div class="card" style="margin-top:10px;padding:12px"><div class="row"><b>${esc(x.board)}</b><span class="badge" style="color:${TARGET_COLOR[x.target]}">${esc(x.target)}</span><span class="spacer"></span><span class="small muted">${esc(x.measured ? x.measured.runtime + " (your measured build)" : x.tflm.runtime)}</span></div>
+          ${x.tflm.note ? `<p class="small muted">${esc(x.tflm.note)}</p>` : ""}
+          ${x.sai ? `<div class="tbl-wrap"><table class="t"><thead><tr><th></th><th class="n">SAI</th><th class="n">${esc(x.measured ? "TFLM (measured)" : x.tflm.runtime)}</th><th class="n">TFLM / SAI</th></tr></thead><tbody>
+            <tr><td>RAM (arena / workspace + stack)</td>${cell(x.sai.ram, t.ram, bytes, x.measured ? ev("measured") : evb(evs.arena))}</tr>
+            <tr><td>Flash (code + weights)</td>${cell(x.sai.flash, t.flash, bytes, x.measured ? ev("measured") : evb(evs.flash))}</tr>
+            <tr><td>Latency</td>${cell(x.sai.latency_ms, t.latency_ms, (v) => ms(v), x.measured ? ev("measured") : evb(evs.latency))}</tr></tbody></table></div>
+            <p class="small muted">SAI: ${ev(x.sai.evidence.ram)} RAM, ${ev(x.sai.evidence.flash)} flash, ${ev(x.sai.evidence.latency)} latency · plan <code>${esc(x.sai.schedule || "")}</code>${x.measured ? "" : ` · TFLM arena = activations ${bytes(x.tflm.arena_parts.activations)} + scratch ${bytes(x.tflm.arena_parts.scratch)} + persistent ${bytes(x.tflm.arena_parts.persistent)}; flash = weights ${bytes(x.tflm.flash_parts.weights_and_biases)} + metadata ${bytes(x.tflm.flash_parts.flatbuffer_metadata)} + code ${bytes(x.tflm.flash_parts.code)}`}</p>
+            ${!x.tflm_fits ? `<div class="callout bad">TFLM would not fit this board's ${bytes(x.ram_total)} RAM / ${bytes(x.flash_total)} flash.</div>` : ""}`
+          : `<p class="small muted">This project was not planned for ${esc(x.target)}. TFLM model: RAM ${bytes(x.tflm.ram)}, flash ${bytes(x.tflm.flash)}, ${ms(x.tflm.latency_ms)}.</p>`}
+          <details style="margin-top:6px"><summary class="small">Enter your own TFLM build's numbers</summary><div class="grid g3" style="margin-top:6px"><label class="f">RAM (B)<input data-m="ram" data-t="${x.target}" type="number"></label><label class="f">Flash (B)<input data-m="flash" data-t="${x.target}" type="number"></label><label class="f">Latency (ms)<input data-m="latency_ms" data-t="${x.target}" type="number" step="any"></label></div><div class="row" style="margin-top:6px"><input data-m="runtime" data-t="${x.target}" placeholder="TFLM version / flags"><button class="btn sm" data-save="${x.target}">Save measured</button></div></details></div>`; }).join("")}`;
+      $$("[data-save]").forEach((b) => (b.onclick = () => busy(b, "Saving…", async () => {
+        const t = b.dataset.save, body = { target: t };
+        $$(`[data-t="${t}"]`).forEach((i) => { if (i.value !== "") body[i.dataset.m] = i.dataset.m === "runtime" ? i.value : +i.value; });
+        r = await api(`/api/jobs/${jid}/compare/measured`, { method: "PUT", json: body }); draw();
+      })));
+    };
+    draw();
+  }
+  async function drawDevboardTab() {
+    const av = await api("/api/devboard/available");
+    $("#ibody").innerHTML = `<p class="small">Run this project's firmware on an emulated board with your own inputs (dataset windows, a stretch of a recording, or pasted values) and see what the board prints, its outputs and predictions, checked bit-exactly against the host program.</p>
+      <div class="row">${Object.entries(av.targets).map(([t, ok]) => `<span class="badge ${ok ? "b-ok" : "b-warn"}">${esc(t)}: ${ok ? "available" : "emulator not installed"}</span>`).join(" ")}<span class="spacer"></span><a class="btn primary" href="#/devboard/${esc(jid)}">Open the virtual dev board</a></div>`;
   }
   async function drawDrift() {
     const [hist, recs, dsets] = await Promise.all([api(`/api/jobs/${jid}/drift`), api("/api/recordings"), api(`/api/datasets?template_id=${encodeURIComponent(job.params.template_id)}`)]);
@@ -1410,14 +1439,14 @@ route(/^\/explorer$/, async (el) => {
 /* ------------------------------------------------------------------------------------------------ board farm */
 route(/^\/boards$/, async (el) => {
   const draw = async () => {
-    const [b, reg] = await Promise.all([api("/api/boards"), api("/api/regressions")]);
+    const [b, reg, pb] = await Promise.all([api("/api/boards"), api("/api/regressions"), api("/api/partner-boards")]);
     const kind = (x) => x.kind === "physical" ? "" : `<span class="badge ${x.kind === "emulated" ? "b-info" : "b-warn"}">${esc(x.kind)}</span>`;
     const dot = (x) => x.status === "quarantined" ? "off" : x.status === "busy" ? "busy" : x.online ? "on" : "off";
     el.innerHTML = `<div class="page-h"><div><h1>Board Farm</h1><p class="muted">MCU boards on lab agents. Every run builds the HIL harness around the SAI package, checks outputs bit-exactly, and — on physical boards — measures cycles and stack.</p></div>
       ${ME.perms.farm_admin ? `<button class="btn" id="regrun">Run regression now</button>` : ""}</div>
     ${b.boards.length && b.boards.every((x) => x.kind !== "physical") ? `<div class="callout info" style="margin-bottom:16px">No physical boards are connected yet. The <b>emulated</b> boards run the real cross-compiled firmware on QEMU (Cortex-M7, RV32IMAFC): outputs are real and checked bit-exactly; QEMU cycles are not latency and never calibrate. Connect a lab agent (Admin → Lab agents) to add NUCLEO-H753ZI or MD6605 EVB boards.</div>` : ""}
     <div class="grid g2"><div class="card"><h2>Boards</h2><div class="tbl-wrap"><table class="t"><thead><tr><th>Board</th><th>Target</th><th>Agent</th><th>Health</th><th>Status</th><th></th></tr></thead><tbody>
-      ${b.boards.map((x) => `<tr><td>${esc(x.name)} ${kind(x)}</td><td><span style="color:${TARGET_COLOR[x.target]}">●</span> ${esc(x.target)}</td><td class="mono small">${esc(x.agent_id)}</td>
+      ${b.boards.map((x) => `<tr><td>${esc(x.name)} ${kind(x)}</td><td><span style="color:${TARGET_COLOR[x.target]}">●</span> ${esc(x.target)}</td><td class="mono small">${esc(x.agent_id)}${x.partner ? `<div><span class="badge b-info">hosted by ${esc(x.partner)}</span></div>` : ""}</td>
         <td class="small">${esc(x.health.probe || x.info.probe || "")}${x.fail_count ? ` · ${x.fail_count} fail(s)` : ""}</td><td><span class="dot ${dot(x)}"></span> ${esc(x.status)}</td>
         <td>${x.status === "quarantined" && ME.perms.farm_admin ? `<button class="btn sm" data-reset="${esc(x.id)}">Reset</button>` : ""}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">No boards registered</td></tr>`}
     </tbody></table></div><p class="small muted" style="margin-top:8px">A board that fails 3 runs in a row is quarantined until the lab resets it; agents power-cycle a failing board once (uhubctl) before reporting.</p></div>
@@ -1426,6 +1455,9 @@ route(/^\/boards$/, async (el) => {
       <div class="log">pip install numpy pyserial pyocd
 python agent/board_agent.py --server ${esc(location.origin)} \\
   --token $SAI_AGENT_TOKEN --boards boards.json</div></div></div>
+    <div class="card" style="margin-top:16px"><h2>Partner boards</h2><p class="small muted">Boards beyond the reference ones, mapped to the SAI build they run. A partner can host them in their own lab with a partner lab agent (Admin → Lab agents, with a partner name); they then appear above and take runs like any board.</p>
+      ${pb.boards.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Board</th><th>Partner</th><th>MCU</th><th>SAI build</th><th>Status</th><th>In the farm</th>${ME.perms.farm_admin ? "<th></th>" : ""}</tr></thead><tbody>${pb.boards.map((x) => `<tr><td><b>${esc(x.board)}</b>${x.url ? ` <a class="small" href="${esc(x.url)}" target="_blank" rel="noopener">info</a>` : ""}<div class="small muted">${esc(x.vendor)}</div></td><td>${esc(x.partner)}</td><td class="small">${esc(x.mcu)} ${esc(x.core)}</td><td><span style="color:${TARGET_COLOR[x.target]}">●</span> ${esc(x.target)}</td><td><span class="badge ${x.status === "certified" ? "b-ok" : x.status === "community" ? "b-info" : ""}">${esc(x.status)}</span></td><td class="small">${x.online_boards.length ? esc(x.online_boards.join(", ")) : `<span class="muted">not connected</span>`}</td>${ME.perms.farm_admin ? `<td><button class="btn sm ghost" data-pbdel="${esc(x.id)}">Remove</button></td>` : ""}</tr>`).join("")}</tbody></table></div>` : `<div class="empty small">No partner boards yet.</div>`}
+      ${ME.perms.farm_admin ? `<details style="margin-top:8px"><summary class="small">Add a partner board</summary><div class="grid g3" style="margin-top:8px"><label class="f">Partner<input id="pbp"></label><label class="f">Board<input id="pbb"></label><label class="f">Vendor<input id="pbv"></label><label class="f">MCU / core<input id="pbm"></label><label class="f">SAI build<select id="pbt">${pb.targets.map((t) => `<option>${t}</option>`).join("")}</select></label><label class="f">Status<select id="pbs"><option>planned</option><option>community</option><option>certified</option></select></label></div><button class="btn sm primary" id="pbadd" style="margin-top:8px">Add</button></details>` : ""}</div>
     <div class="card" style="margin-top:16px"><h2>Nightly regression</h2>${reg.latest.length ? `<p class="small muted">Run ${esc(reg.runs[0].run_id)} · SAI ${esc(reg.runs[0].sai_version)} · ${ago(reg.runs[0].created)}</p>
       <div class="tbl-wrap"><table class="t"><thead><tr><th>Model type (tiny)</th><th>Board</th><th class="n">RAM</th><th class="n">Flash</th><th class="n">Plans that fit</th><th>Emulated HIL</th></tr></thead><tbody>
       ${reg.latest.map((r) => `<tr><td>${esc(r.template)}</td><td>${esc(r.target)}</td><td class="n">${bytes(r.ram)}</td><td class="n">${bytes(r.flash)}</td><td class="n">${r.feasible}</td><td>${r.hil_match === null ? "–" : r.hil_match ? `<span class="badge b-ok">bit-exact</span>` : `<span class="badge b-bad">mismatch</span>`}</td></tr>`).join("")}</tbody></table></div>` : `<p class="small muted">No regression run yet. It checks every pool model type on every board against the current SAI release and alerts on RAM/flash growth, lost fits or HIL mismatches (also run by tools/full_check.sh).</p>`}</div>
@@ -1440,9 +1472,80 @@ python agent/board_agent.py --server ${esc(location.origin)} \\
     })));
     const rr = $("#regrun");
     if (rr) rr.onclick = () => busy(rr, "Starting…", async () => { const j = await api("/api/admin/regression", { json: {} }); location.hash = `#/job/${j.id}`; });
+    $$("[data-pbdel]").forEach((x) => (x.onclick = () => busy(x, "…", async () => { await api(`/api/partner-boards/${x.dataset.pbdel}`, { method: "DELETE" }); draw(); })));
+    if ($("#pbadd")) $("#pbadd").onclick = () => busy($("#pbadd"), "Adding…", async () => { await api("/api/partner-boards", { json: { partner: $("#pbp").value, board: $("#pbb").value, vendor: $("#pbv").value, mcu: $("#pbm").value, target: $("#pbt").value, status: $("#pbs").value } }); draw(); });
   };
   await draw();
   const t = setInterval(draw, 4000); onLeave(() => clearInterval(t));
+});
+
+/* ------------------------------------------------------------------------------------------------ virtual dev board */
+route(/^\/devboard\/(job_[0-9a-f]+)$/, async (el, jid) => {
+  const [job, av, recs] = await Promise.all([api(`/api/jobs/${jid}`), api("/api/devboard/available"), api("/api/recordings")]);
+  const r = job.result, sel = r.selected;
+  const targets = Object.entries(av.targets).filter(([, ok]) => ok).map(([t]) => t);
+  const okRecs = recs.filter((x) => x.status === "ready" && x.channels.length === (r.preprocessing.raw_shape || [0])[0]);
+  let timer = null;
+  el.innerHTML = `<div class="page-h"><div><h1>Virtual dev board</h1><p class="muted"><a href="#/job/${esc(jid)}">${esc(job.params.name)}</a> · ${esc(r.template.name || job.params.template_id)} · the real firmware (SAI library + HIL harness, cross-compiled with SAI's flags) booted in QEMU.</p></div></div>
+    ${targets.length ? "" : `<div class="callout bad">No emulator or cross compiler is installed on this server.</div>`}
+    <div class="grid g2"><div class="card"><h2>1. Board</h2><div class="stack"><label class="f">Virtual board<select id="vt">${targets.map((t) => `<option value="${t}" ${t === sel.target ? "selected" : ""}>${t === "cortex-m7" ? "Cortex-M7 (QEMU MPS2-AN500)" : "RV32IMAFC, MD6605 class (QEMU virt)"}</option>`).join("")}</select></label>
+        <p class="small muted">A board other than the project's (${esc(sel.target)}) gets the same model compiled by SAI for it first. Cycle counts are QEMU's instruction clock: they show the program runs on that ISA, not real-board speed.</p></div></div>
+      <div class="card"><h2>2. Inputs</h2><div class="tabs" id="vsrc"><button class="tab on" data-s="dataset">Dataset windows</button><button class="tab" data-s="recording">Recording</button><button class="tab" data-s="values">Paste values</button></div><div id="vin"></div>
+        <button class="btn primary" id="vgo" style="margin-top:10px" ${targets.length ? "" : "disabled"}>Run on the virtual board</button></div></div>
+    <div id="vres" style="margin-top:16px"></div>`;
+  let src = "dataset";
+  const C = (r.preprocessing.raw_shape || [1])[0], T = (r.preprocessing.frontend || {}).raw_length || (r.preprocessing.raw_shape || [1, 1, 1])[2];
+  const drawIn = () => {
+    $("#vin").innerHTML = src === "dataset" ? `<label class="f">Window numbers (comma separated, up to 16; empty = 6 random)<input id="vidx" placeholder="e.g. 0, 12, 40"></label>`
+      : src === "recording" ? (okRecs.length ? `<div class="grid g3"><label class="f">Recording<select id="vrec">${okRecs.map((x) => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join("")}</select></label><label class="f">Start (s)<input id="vst" type="number" step="any" value="0"></label><label class="f">Windows<input id="vn" type="number" value="4"></label></div>` : `<p class="small muted">No recording with ${C} channel(s). <a href="#/recordings">Capture or import one</a>.</p>`)
+      : `<label class="f">One window per line: ${C} channel(s) × ${T} values, channels after each other, comma separated<textarea id="vval" rows="5" class="mono small" placeholder="${C * T} numbers per line"></textarea></label>`;
+  };
+  $$("#vsrc .tab").forEach((b) => (b.onclick = () => { src = b.dataset.s; $$("#vsrc .tab").forEach((x) => x.classList.toggle("on", x === b)); drawIn(); }));
+  drawIn();
+  const show = (s) => {
+    const res = s.result;
+    if (s.status !== "succeeded") { $("#vres").innerHTML = `<div class="card">${statusBadge(s.status)} ${s.status === "failed" ? `<div class="callout bad" style="margin-top:8px">${esc(s.error)}</div>` : `<span class="small muted">${esc((s.logs || []).slice(-1).map((l) => l.line).join("") || "starting…")}</span>`}</div>`; return; }
+    $("#vres").innerHTML = `<div class="grid g2"><div class="card"><div class="row"><h2 style="margin:0">Board output</h2><span class="spacer"></span>${res.all_bit_exact ? `<span class="badge b-ok">bit-exact with the host program</span>` : `<span class="badge b-bad">mismatch</span>`}</div>
+        <p class="small muted">${esc(res.board)} · firmware text ${bytes(res.firmware.text)}, bss ${bytes(res.firmware.bss)} · stack used ${bytes(res.stack_painted)} · ${fmt(res.cycles.avg)} instructions per inference ${ev("estimate")}</p>
+        <div class="tbl-wrap"><table class="t"><thead><tr><th>Input</th><th></th><th>Prediction</th><th class="n">Confidence</th><th>Expected</th><th>int8 out</th></tr></thead><tbody>
+        ${res.windows.map((w) => `<tr><td class="small">${esc(w.name)}</td><td style="width:140px">${sparkSeries(w.input_preview, 140, 34)}</td><td>${w.prediction ? `<b>${esc(w.prediction)}</b>${w.truth ? (w.truth === w.prediction ? ` <span class="badge b-ok">= label</span>` : ` <span class="badge b-warn">label ${esc(w.truth)}</span>`) : ""}` : esc(JSON.stringify(w.value))}</td><td class="n">${w.confidence != null ? pct(w.confidence) : ""}</td><td>${w.bit_exact ? `<span class="badge b-ok">match</span>` : `<span class="badge b-bad">differs</span>`}</td><td class="mono small">[${w.output_int8.join(", ")}]</td></tr>`).join("")}</tbody></table></div></div>
+      <div class="card"><h2>UART</h2><div class="log" style="max-height:420px;overflow:auto">${esc(res.uart)}</div></div></div>`;
+  };
+  $("#vgo").onclick = () => busy($("#vgo"), "Building firmware…", async () => {
+    const inputs = { source: src };
+    if (src === "dataset") inputs.indices = ($("#vidx").value || "").split(",").map((x) => x.trim()).filter(Boolean).map(Number);
+    if (src === "recording") { if (!$("#vrec")) return toast("No recording"); const rec = okRecs.find((x) => x.id === $("#vrec").value); Object.assign(inputs, { recording_id: rec.id, start: Math.round(+$("#vst").value * rec.sample_rate), count: +$("#vn").value }); }
+    if (src === "values") inputs.windows = $("#vval").value.trim().split("\n").filter(Boolean).map((l) => { const v = l.split(/[ ,;]+/).filter(Boolean).map(Number); return Array.from({ length: C }, (_, c) => v.slice(c * T, (c + 1) * T)); });
+    const s = await api(`/api/jobs/${jid}/devboard`, { json: { target: $("#vt").value, inputs } });
+    clearInterval(timer);
+    const poll = async () => { const j = await api(`/api/jobs/${s.id}`); show(j); if (["succeeded", "failed", "cancelled"].includes(j.status)) clearInterval(timer); };
+    timer = setInterval(() => poll().catch(() => {}), 1500); poll();
+  });
+  onLeave(() => clearInterval(timer));
+});
+
+/* ------------------------------------------------------------------------------------------------ benchmarks */
+route(/^\/benchmarks$/, async (el) => {
+  const draw = async () => {
+    const b = await api("/api/benchmarks");
+    const L = b.latest;
+    const by = {};
+    (L ? L.rows : []).forEach((x) => { (by[x.id] = by[x.id] || {})[x.target] = x; });
+    const targets = L ? L.targets : ["md6605", "cortex-m7"];
+    const running = b.runs.find((x) => x.status !== "succeeded");
+    el.innerHTML = `<div class="page-h"><div><h1>Benchmarks</h1><p class="muted">The MLPerf Tiny reference tasks and every built-in model type, compiled by SAI for every board, next to TFLite Micro on the same graph. A resource benchmark (random weights, no accuracy claim); each run is compared with the previous one, so it doubles as a regression suite across SAI releases.</p></div>
+      ${b.can_run ? `<button class="btn primary" id="brun" ${running ? "disabled" : ""}>${running ? `Running (${pct(running.progress)})` : "Run the corpus"}</button>` : ""}</div>
+      ${L ? `<p class="small muted">Latest run <a href="#/job/${esc(L.job_id)}">${esc(L.job_id)}</a> · SAI ${esc((L.sai_version || {}).sai || (L.sai_version || {}).version || "")}${L.previous_job ? ` · compared with <a href="#/job/${esc(L.previous_job)}">${esc(L.previous_job)}</a>` : ""}</p>
+        ${L.alerts.length ? L.alerts.map((a) => `<div class="callout bad">${esc(a)}</div>`).join("") : `<div class="callout ok">No RAM / flash regression against the previous run.</div>`}` : `<div class="callout info">No benchmark run yet.</div>`}
+      <div class="card" style="margin-top:12px"><div class="tbl-wrap"><table class="t"><thead><tr><th>Model</th><th class="n">MACs</th>${targets.map((t) => `<th>${esc(t)}: SAI RAM / flash</th><th>TFLM RAM / flash</th>`).join("")}</tr></thead><tbody>
+        ${b.corpus.map((c) => `<tr><td><b>${esc(c.task)}</b><div class="small muted">${esc(c.suite)} · ${esc(c.reference)}</div>${c.deviation ? `<div class="small" style="color:var(--warn)">Differs from the reference: ${esc(c.deviation)}</div>` : ""}</td><td class="n">${fmt(c.summary.macs / 1e6, 2)}M</td>
+          ${targets.map((t) => { const x = (by[c.id] || {})[t]; if (!x) return `<td class="muted small">–</td><td class="muted small">–</td>`; const s = x.sai; return `<td class="small">${s ? `${bytes(s.ram)} / ${bytes(s.flash)}${s.fits ? "" : ` <span class="badge b-bad" title="${esc((s.violations || []).join("; "))}">does not fit</span>`}<div class="muted">${ms(s.latency_ms)} ${ev(s.latency_evidence)}${x.prev && x.prev.ram && x.prev.ram !== s.ram ? ` · was ${bytes(x.prev.ram)}` : ""}</div>` : `<span class="badge b-warn" title="${esc(x.error || "")}">no plan</span>`}</td>
+            <td class="small">${bytes(x.tflm.ram)} / ${bytes(x.tflm.flash)}${s && s.ram ? ` <b>${(x.tflm.ram / s.ram).toFixed(1)}×</b>` : ""}<div class="muted">${ms(x.tflm.latency_ms)} ${ev("assumed")}</div></td>`; }).join("")}</tr>`).join("")}</tbody></table></div>
+        <p class="small muted" style="margin-top:8px">TFLM columns: arena replayed with TFLM's greedy planner on the same graph, flash and latency from assumed code sizes and cycles/MAC (CMSIS-NN on Cortex-M7, reference kernels on RV32). Not an MLPerf submission.</p></div>`;
+    if ($("#brun")) $("#brun").onclick = () => busy($("#brun"), "Starting…", async () => { await api("/api/benchmarks/run", { json: {} }); draw(); });
+  };
+  await draw();
+  const t = setInterval(() => draw().catch(() => {}), 6000); onLeave(() => clearInterval(t));
 });
 
 /* ------------------------------------------------------------------------------------------------ system */
@@ -1692,11 +1795,13 @@ route(/^\/connectors$/, async (el) => {
   <div class="grid g2"><div class="card"><h2>Connections</h2><div id="clist"></div></div>
     <div class="card"><h2>New connection</h2><div class="tabs" id="ktabs">${Object.entries(r.kinds).map(([k, v]) => `<button class="tab ${k === kind ? "on" : ""}" data-k="${k}">${esc({ s3: "S3 / GCS", azure: "Azure Blob", influxdb: "InfluxDB", postgres: "PostgreSQL" }[k] || k)}</button>`).join("")}</div><div id="kform"></div></div></div>
   <div class="card" style="margin-top:16px" id="cdetail" hidden></div>`;
-  const drawList = () => { $("#clist").innerHTML = r.connections.length ? `<table class="t"><tbody>${r.connections.map((c) => `<tr><td><b>${esc(c.name)}</b><div class="small muted">${esc(r.kinds[c.kind].label)} · ${esc(c.config.bucket || c.config.container || c.config.database || c.config.org || "")}</div></td><td class="small muted">secrets: ${c.secrets_set.length ? esc(c.secrets_set.join(", ")) + " set" : "none"}</td><td><button class="btn sm" data-open="${esc(c.id)}">Open</button></td></tr>`).join("")}</tbody></table>` : `<div class="empty small">No connections yet.</div>`; $$("[data-open]").forEach((b) => (b.onclick = () => openConn(b.dataset.open))); };
+  const drawList = () => { $("#clist").innerHTML = r.connections.length ? `<table class="t"><tbody>${r.connections.map((c) => `<tr><td><b>${esc(c.name)}</b>${c.config.via_worker ? ` <span class="badge b-info">VPC worker</span>` : ""}<div class="small muted">${esc(r.kinds[c.kind].label)} · ${esc(c.config.bucket || c.config.container || c.config.database || c.config.org || "")}</div></td><td class="small muted">secrets: ${c.secrets_set.length ? esc(c.secrets_set.join(", ")) + " set" : "none"}</td><td><button class="btn sm" data-open="${esc(c.id)}">Open</button></td></tr>`).join("")}</tbody></table>` : `<div class="empty small">No connections yet.</div>`; $$("[data-open]").forEach((b) => (b.onclick = () => openConn(b.dataset.open))); };
   const drawForm = () => {
     const k = r.kinds[kind];
     $("#kform").innerHTML = `<div class="stack"><label class="f">Name<input id="kn" value="${esc(k.label.split(" (")[0])}"></label>${k.fields.map(([f, l, d]) => typeof d === "boolean" ? `<label class="row small"><input type="checkbox" data-f="${f}" ${d ? "checked" : ""}> ${esc(l)}</label>` : `<label class="f">${esc(l)}<input data-f="${f}" value="${esc(d)}"></label>`).join("")}
-      ${k.secrets.map(([f, l]) => `<label class="f">${esc(l)}<input type="password" data-s="${f}" autocomplete="off"></label>`).join("")}<p class="small muted">Secrets are encrypted at rest and never shown again.</p><button class="btn primary" id="ksave">Save connection</button></div>`;
+      <label class="row small"><input type="checkbox" data-f="via_worker" id="kvw"> Through a customer-VPC worker (private endpoint; the credentials stay on the worker)</label>
+      <div id="ksec">${k.secrets.map(([f, l]) => `<label class="f">${esc(l)}<input type="password" data-s="${f}" autocomplete="off"></label>`).join("")}<p class="small muted">Secrets are encrypted at rest and never shown again.</p></div><button class="btn primary" id="ksave">Save connection</button></div>`;
+    $("#kvw").onchange = () => { $("#ksec").hidden = $("#kvw").checked; };
     $("#ksave").onclick = () => busy($("#ksave"), "Saving…", async () => {
       const config = {}, secrets = {};
       $$("#kform [data-f]").forEach((i) => (config[i.dataset.f] = i.type === "checkbox" ? i.checked : i.value));
@@ -1707,6 +1812,17 @@ route(/^\/connectors$/, async (el) => {
   };
   $$("#ktabs [data-k]").forEach((b) => (b.onclick = () => { kind = b.dataset.k; $$("#ktabs .tab").forEach((x) => x.classList.toggle("on", x === b)); drawForm(); }));
   const ts = cat.filter((t) => t.input && t.input.kind !== "image");
+  const settle = async (out, label) => {
+    if (!out || !out.pending) return out;
+    toast(`${label}: waiting for your VPC worker${out.workers_online ? "" : " (none online)"}`);
+    for (let i = 0; i < 120; i++) {
+      await new Promise((res) => setTimeout(res, 2000));
+      const t = await api(`/api/vpc/tasks/${out.task}`);
+      if (t.status === "succeeded") return t.result;
+      if (t.status === "failed") throw new Error(`VPC worker: ${t.error}`);
+    }
+    throw new Error("the VPC worker did not answer in 4 minutes");
+  };
   const openConn = (cid) => {
     openId = cid;
     const c = r.connections.find((x) => x.id === cid);
@@ -1724,7 +1840,7 @@ route(/^\/connectors$/, async (el) => {
     $("#ctest").onclick = () => busy($("#ctest"), "Testing…", async () => { const t = await api(`/api/connectors/${cid}/test`, { method: "POST" }); $("#ctres").innerHTML = `<span class="badge ${t.ok ? "b-ok" : "b-bad"}">${t.ok ? "ok" : "failed"}</span> ${esc(t.detail)}`; });
     $("#cdel").onclick = () => { if (!confirm(`Delete connection "${c.name}"?`)) return; busy($("#cdel"), "…", async () => { await api(`/api/connectors/${cid}`, { method: "DELETE" }); r.connections = r.connections.filter((x) => x.id !== cid); box.hidden = true; drawList(); }); };
     if (store) $("#cbr").onclick = () => busy($("#cbr"), "Listing…", async () => {
-      const { items } = await api(`/api/connectors/${cid}/browse?prefix=${encodeURIComponent($("#cpre").value)}`);
+      const { items } = await settle(await api(`/api/connectors/${cid}/browse?prefix=${encodeURIComponent($("#cpre").value)}`), "Listing");
       $("#citems").innerHTML = items.length ? `<table class="t"><tbody>${items.map((it, i) => `<tr data-i="${i}" style="cursor:pointer"><td class="mono small">${esc(it.key)}</td><td class="n small">${it.size != null ? bytes(it.size) : ""}</td></tr>`).join("")}</tbody></table>` : `<div class="empty small">Nothing under this prefix.</div>`;
       $$("#citems [data-i]").forEach((tr) => (tr.onclick = () => { key = items[+tr.dataset.i].key; $("#csel").textContent = key; $$("#citems tr").forEach((x) => x.classList.toggle("sel", x === tr)); }));
     });
@@ -1732,7 +1848,7 @@ route(/^\/connectors$/, async (el) => {
       const as = $$('input[name="cas"]').find((x) => x.checked).value;
       if (store && !key) return toast("Pick an object first");
       const body = { as, template_id: $("#cimt").value, licence: $("#cil").value, name: $("#cin").value || null, ...(store ? { key } : { query: $("#cq").value }) };
-      const out = await api(`/api/connectors/${cid}/import`, { json: body });
+      const out = await settle(await api(`/api/connectors/${cid}/import`, { json: body }), "Import");
       $("#cires").innerHTML = out.dataset ? `<div class="callout ok">Dataset <a href="#/data/${esc(out.dataset.id)}">${esc(out.dataset.name)}</a>: ${fmt(out.dataset.n)} windows.</div>` : `<div class="callout ok">Recording <a href="#/recording/${esc(out.recording.id)}">${esc(out.recording.name)}</a> ready to label.</div>`;
     });
   };
@@ -1809,13 +1925,22 @@ route(/^\/plan$/, async (el) => {
 route(/^\/admin$/, async (el) => {
   const m = ME;
   if (!m.perms.org_admin) { el.innerHTML = `<div class="callout bad">Only admins can open the admin console (your role: <b>${esc(m.role)}</b>).</div>`; return; }
-  const tabs = [m.perms.org_admin && ["orgs", "Organisations"], m.perms.org_admin && ["users", "Users"], m.perms.farm_admin && ["agents", "Lab agents"], m.perms.org_admin && ["audit", "Audit log"], m.perms.org_admin && ["opgaps", "Operator gaps"], m.perms.platform_admin && ["queue", "Job queue"]].filter(Boolean);
+  const tabs = [m.perms.org_admin && ["orgs", "Organisations"], m.perms.org_admin && ["users", "Users"], m.perms.farm_admin && ["agents", "Lab agents"], m.perms.org_admin && ["audit", "Audit log"], m.perms.org_admin && ["opgaps", "Operator gaps"], m.perms.org_admin && ["vpc", "VPC workers"], m.perms.platform_admin && ["queue", "Job queue"]].filter(Boolean);
   let tab = tabs[0][0];
   const draw = async () => {
     el.innerHTML = `<div class="page-h"><div><h1>Admin</h1><p class="muted">${m.mode === "single" ? "Single-organisation install" : "Multi-tenant"} · signed in as ${esc(m.email)} (${esc(m.role)})</p></div></div>
       <div class="tabs">${tabs.map(([k, t]) => `<button class="tab ${k === tab ? "on" : ""}" data-t="${k}">${t}</button>`).join("")}</div><div id="adm"></div>`;
     $$(".tabs .tab", el).forEach((b) => (b.onclick = () => { tab = b.dataset.t; draw(); }));
     const box = $("#adm");
+    if (tab === "vpc") {
+      const ws = await api("/api/admin/vpc-workers");
+      box.innerHTML = `<div class="card"><h2>Customer-VPC workers</h2><p class="small muted">A worker runs inside your network, next to data the platform cannot reach (MinIO, an internal InfluxDB or PostgreSQL). It only makes outbound HTTPS calls to the platform; the credentials of your data sources stay in its local secrets file. Connections marked "through a VPC worker" are browsed and imported by it.</p>
+        <div class="tbl-wrap"><table class="t"><thead><tr><th>Worker</th><th>Host</th><th>Last seen</th><th>Status</th><th></th></tr></thead><tbody>${ws.map((w) => `<tr><td><b>${esc(w.name)}</b><div class="mono small muted">${esc(w.id)}</div></td><td class="small">${esc(w.info.host || "")}${(w.info.connections_with_secrets || []).length ? `<div class="muted">secrets for: ${esc(w.info.connections_with_secrets.join(", "))}</div>` : ""}</td><td class="muted">${w.last_seen ? ago(w.last_seen) : "never"}</td><td>${w.disabled ? `<span class="badge b-bad">disabled</span>` : w.online ? `<span class="badge b-ok">online</span>` : `<span class="badge">offline</span>`}</td><td>${w.disabled ? "" : `<button class="btn sm ghost" data-wd="${esc(w.id)}">Disable</button>`}</td></tr>`).join("") || `<tr><td colspan="5" class="empty">No workers yet</td></tr>`}</tbody></table></div>
+        <div class="row" style="margin-top:12px"><input id="wn" placeholder="e.g. Plant 3 data gateway"><button class="btn primary" id="wc">Create worker token</button></div><div id="wtok"></div></div>`;
+      $$("[data-wd]", box).forEach((b) => (b.onclick = async () => { if (!confirm("Disable this worker? Its token stops working.")) return; await api(`/api/admin/vpc-workers/${b.dataset.wd}/disable`, { method: "POST" }); draw(); }));
+      $("#wc").onclick = () => busy($("#wc"), "Creating…", async () => { const w = await api("/api/admin/vpc-workers", { json: { name: $("#wn").value } }); $("#wtok").innerHTML = `<div class="callout ok" style="margin-top:10px">Token for <b>${esc(w.name)}</b> (copy now, it will not be shown again):<div class="log" style="margin-top:6px">export SAI_VPC_TOKEN=${esc(w.token)}
+python tools/vpc_worker.py --server ${esc(location.origin)} --secrets vpc-secrets.json</div><p class="small muted">vpc-secrets.json maps each connection name to its secrets, e.g. {"plant MinIO": {"secret_key": "…"}}.</p></div>`; });
+    }
     if (tab === "opgaps") {
       const g = await api("/api/admin/operator-gaps");
       box.innerHTML = `<div class="card"><h2>Models refused for a missing operator</h2><p class="small muted">Every time SAI, SAI's front end or the model editor refuses an operator, it is logged here${m.perms.studio || m.perms.platform_admin ? " for all organisations" : " for your organisation"}: what customers need that the compiler cannot lower yet. ${fmt(g.total)} refusal(s) in the last year.</p>
@@ -1850,9 +1975,9 @@ route(/^\/admin$/, async (el) => {
       const ag = await api("/api/admin/agents");
       box.innerHTML = `<div class="card"><p class="small muted">Each lab PC gets its own token. Tokens are shown once and stored hashed.</p><div class="tbl-wrap"><table class="t"><thead><tr><th>Agent</th><th>Created</th><th>Last seen</th><th>Status</th><th></th></tr></thead><tbody>
         ${ag.map((a) => `<tr><td><b>${esc(a.name)}</b><div class="mono small muted">${esc(a.id)}</div></td><td class="muted">${ago(a.created)}</td><td class="muted">${a.last_seen ? ago(a.last_seen) : "never"}</td><td>${a.disabled ? `<span class="badge b-bad">disabled</span>` : `<span class="badge b-ok">active</span>`}</td><td>${a.disabled ? "" : `<button class="btn sm ghost" data-ad="${a.id}">Revoke</button>`}</td></tr>`).join("") || `<tr><td colspan="5" class="empty">No agents yet</td></tr>`}</tbody></table></div>
-        <div class="row" style="margin-top:12px"><input id="an" placeholder="e.g. Lab 1 - bench PC"><button class="btn primary" id="ac">Create agent token</button></div><div id="atok"></div></div>`;
+        <div class="row" style="margin-top:12px"><input id="an" placeholder="e.g. Lab 1 - bench PC"><input id="apn" placeholder="partner (optional, for a partner-hosted lab)"><button class="btn primary" id="ac">Create agent token</button></div><div id="atok"></div></div>`;
       $$("[data-ad]", box).forEach((b) => (b.onclick = async () => { if (!confirm("Revoke this agent token? Its boards go offline.")) return; await api(`/api/admin/agents/${b.dataset.ad}/disable`, { method: "POST" }); draw(); }));
-      $("#ac").onclick = async () => { const a = await api("/api/admin/agents", { json: { name: $("#an").value } }); $("#atok").innerHTML = `<div class="callout ok" style="margin-top:10px">Token for <b>${esc(a.name)}</b> (copy now, it will not be shown again):<div class="log" style="margin-top:6px">${esc(a.token)}</div></div>`; };
+      $("#ac").onclick = async () => { const a = await api("/api/admin/agents", { json: { name: $("#an").value, partner: $("#apn").value } }); $("#atok").innerHTML = `<div class="callout ok" style="margin-top:10px">Token for <b>${esc(a.name)}</b> (copy now, it will not be shown again):<div class="log" style="margin-top:6px">${esc(a.token)}</div></div>`; };
     }
     if (tab === "audit") {
       const log = await api("/api/admin/audit");

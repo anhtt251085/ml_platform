@@ -37,6 +37,8 @@ STAGES = {
     "recommend": [("profile", "Profile the data"), ("generate", "Generate candidates"), ("cost", "SAI cost per board"),
                   ("pick", "Recommend")],
     "regression": [("plans", "Pool x boards plan check"), ("hil", "Emulated HIL smoke"), ("compare", "Compare with last run")],
+    "benchmark": [("build", "Build corpus graphs"), ("plan", "SAI on every board"), ("compare", "Compare with last run")],
+    "devboard": [("prepare", "Prepare inputs"), ("run", "Run on the virtual board")],
 }
 KINDS = tuple(STAGES)
 STALE_RUNNING_S = 30 * 60          # no heartbeat (log/save) for this long = the worker is gone
@@ -301,7 +303,8 @@ def _run(jid: str, kind: str, params: dict):
     try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
          "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest,
-         "recommend": run_recommend, "archverify": run_archverify, "multimodel": run_multimodel}[kind](ctx, params)
+         "recommend": run_recommend, "archverify": run_archverify, "multimodel": run_multimodel,
+         "benchmark": run_benchmark, "devboard": run_devboard}[kind](ctx, params)
         ctx._save(status="succeeded", progress=1.0)
         ctx.log("job finished")
     except InterruptedError:
@@ -838,6 +841,92 @@ def run_analyze(ctx: Ctx, p: dict):
                                 "basis": "MAC count unknown for this format"}
     ctx.stage("plan", "done")
     ctx.result({"inspect": info, "macs": macs, "plans": plans})
+
+
+# ------------------------------------------------------------------------------------------------------------------
+def run_benchmark(ctx: Ctx, p: dict):
+    """Benchmark corpus (MLPerf Tiny reference tasks + the built-in model types): SAI's best plan per board for
+    each model (random INT8 weights: resources only), TFLM + CMSIS-NN modelled on the same graph, and the change
+    against the previous benchmark run (a RAM / flash / latency regression suite across SAI versions)."""
+    from . import baselines, mlperf, store
+    ctx.stage("build")
+    entries = mlperf.corpus(store.templates())
+    if p.get("ids"):
+        entries = [e for e in entries if e["id"] in p["ids"]]
+    targets = [t for t in (p.get("targets") or sai_engine.MCU_TARGETS) if t in sai_engine.MCU_TARGETS]
+    ctx.log(f"{len(entries)} corpus models x {len(targets)} boards")
+    ctx.stage("build", "done")
+    ctx.stage("plan")
+    ver = sai_engine.version()
+    rows = []
+    for n, e in enumerate(entries):
+        if ctx.cancelled():
+            raise InterruptedError("cancelled")
+        spec = e["spec"]
+        torch.manual_seed(0)
+        net = archspec.SpecNet(spec)
+        net.eval()
+        net.fold_bn()
+        i = spec["input"]
+        calib = np.random.default_rng(0).normal(0, 1, (32, i["channels"], i["height"], i["width"])).astype(np.float32)
+        path = ctx.dir / f"{e['id']}.onnx"
+        qexport.export_qdq(net, calib, path)
+        summ = archspec.summary(spec)
+        try:
+            plans = sai_engine.plan_search(path, summ["macs"], summ["spatial_axes"], targets, "min-ram", None,
+                                           boards_mod.calibration(), explore_seconds=int(p.get("explore_seconds", 5)),
+                                           measurements=boards_mod.measurements(), explore_builds=0)
+        except sai_engine.SaiFailure as ex:
+            plans = {"candidates": [], "errors": [str(ex)]}
+        for t in targets:
+            cands = [c for c in plans["candidates"] if c["target"] == t]
+            fit = [c for c in cands if c.get("fits")]
+            best = min(fit or cands, key=lambda c: c["ram"]) if cands else None
+            tf = baselines.tflm(spec, t)
+            rows.append({"id": e["id"], "suite": e["suite"], "task": e["task"], "target": t,
+                         "macs": summ["macs"], "params": summ["params"],
+                         "sai": None if not best else {"ram": best["ram"], "flash": best["flash"], "fits": best.get("fits"),
+                                                       "latency_ms": (best.get("latency") or {}).get("ms"),
+                                                       "latency_evidence": (best.get("latency") or {}).get("evidence"),
+                                                       "ram_evidence": best.get("workspace_evidence"),
+                                                       "schedule": best.get("schedule"),
+                                                       "violations": best.get("violations")},
+                         "error": None if best else "; ".join(plans.get("errors") or ["no plan"])[:300],
+                         "tflm": {k: tf[k] for k in ("ram", "flash", "latency_ms", "runtime")}})
+        ctx.log(f"{e['id']}: " + ", ".join(f"{r['target']} " + (f"RAM {r['sai']['ram']} B flash {r['sai']['flash']} B"
+                                                                  if r["sai"] else "no plan")
+                                            for r in rows if r["id"] == e["id"]))
+        ctx.progress_within("plan", (n + 1) / len(entries))
+        path.unlink(missing_ok=True)
+    ctx.stage("plan", "done")
+    ctx.stage("compare")
+    prev = None
+    with db.conn() as c:
+        r = c.execute("SELECT result FROM jobs WHERE kind='benchmark' AND status='succeeded' AND id<>? "
+                      "ORDER BY created DESC LIMIT 1", (ctx.id,)).fetchone()
+        prev = db.uj(r[0], {}) if r else None
+    alerts = []
+    if prev:
+        old = {(x["id"], x["target"]): x for x in prev.get("rows", [])}
+        for x in rows:
+            o = old.get((x["id"], x["target"]))
+            if not (o and o.get("sai") and x.get("sai")):
+                continue
+            x["prev"] = {k: o["sai"].get(k) for k in ("ram", "flash", "latency_ms")}
+            for k in ("ram", "flash"):
+                if o["sai"].get(k) and x["sai"].get(k) and x["sai"][k] > o["sai"][k] * 1.02:
+                    alerts.append(f"{x['id']} on {x['target']}: {k} {o['sai'][k]} -> {x['sai'][k]} B")
+    ctx.log(f"{len(alerts)} regression(s) against the previous run" if prev else "first benchmark run")
+    ctx.stage("compare", "done")
+    corpus = [{k: e[k] for k in ("id", "suite", "task", "reference", "deviation", "summary")} for e in entries]
+    ctx.result({"rows": rows, "corpus": corpus, "targets": targets, "sai_version": ver, "alerts": alerts,
+                "previous_job": prev and prev.get("job_id"), "job_id": ctx.id})
+
+
+def run_devboard(ctx: Ctx, p: dict):
+    """Virtual dev board session: the project's package on an emulated board with the user's own inputs."""
+    from . import devboard
+    devboard.run(ctx, p)
 
 
 # ------------------------------------------------------------------------------------------------------------------
