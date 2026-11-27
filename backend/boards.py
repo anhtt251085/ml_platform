@@ -175,7 +175,8 @@ def claim(agent_id: str) -> dict | None:
 
 
 RESULT_KEYS = {"ok": bool, "simulated": bool, "emulated": bool, "outputs": list, "cycles": int, "cycles_min": int,
-               "cycles_max": int, "latency_ms": float, "stack_painted": int, "energy_uj": float, "board": str,
+               "cycles_max": int, "latency_ms": float, "stack_painted": int, "energy_uj": float, "active_power_mw": float,
+               "sleep_power_uw": float, "board": str,
                "n_vectors": int, "firmware": str, "log": list, "error": str, "config": dict}
 
 

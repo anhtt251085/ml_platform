@@ -1057,10 +1057,102 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     <div class="card" style="margin-top:16px"><h2>Every plan SAI produced for the ${esc(sel.size)} model</h2>${planTable(v.plans.candidates)}${spaceNote(v.plans)}</div>
     ${tierCard(r)}
     ${provCard(r, jid)}
+    <div class="card" style="margin-top:16px" id="insight"></div>
     <div class="card" style="margin-top:16px" id="hil"></div>`;
     const rb = $("#rebuild");
     if (rb) rb.onclick = () => busy(rb, "Queuing…", async () => { const j = await api(`/api/jobs/${jid}/rebuild`, { method: "POST" }); toast("Rebuild queued"); location.hash = `#/job/${j.id}`; });
     drawHil();
+    drawInsight();
+  }
+  /* insight: what-if sliders, battery life & power, drift */
+  async function drawInsight() {
+    const box = $("#insight"); if (!box) return;
+    let tab = "whatif";
+    const draw = () => {
+      box.innerHTML = `<div class="row"><h2 style="margin:0">Explore this model</h2><span class="spacer"></span></div><div class="tabs" style="margin-top:8px">${[["whatif", "What-if: window & channels"], ["battery", "Battery life & power"], ["drift", "Drift"]].map(([k, t]) => `<button class="tab ${k === tab ? "on" : ""}" data-it="${k}">${t}</button>`).join("")}</div><div id="ibody"><span class="small muted">Loading…</span></div>`;
+      $$("[data-it]", box).forEach((b) => (b.onclick = () => { tab = b.dataset.it; draw(); }));
+      ({ whatif: drawWhatIf, battery: drawBattery, drift: drawDrift })[tab]().catch((e) => { if (!(e instanceof Stale) && $("#ibody")) $("#ibody").innerHTML = `<div class="callout">${esc(e.message)}</div>`; });
+    };
+    draw();
+  }
+  async function drawWhatIf() {
+    const w = await api(`/api/jobs/${jid}/whatif`);
+    const b = w.base;
+    let wi = w.windows.indexOf(b.window); if (wi < 0) wi = 0;
+    let ch = b.channels;
+    const names = w.channel_names || [];
+    $("#ibody").innerHTML = `<p class="small muted">Move the sliders to see what a longer or shorter window, or fewer or more sensor channels, would cost on <b>${esc(b.target)}</b>. ${esc(w.note)}</p>
+      <div class="grid g2"><label class="f">Window length <b id="wiv"></b><input type="range" id="wi" min="0" max="${w.windows.length - 1}" step="1" value="${wi}"></label>
+        <label class="f">Channels <b id="chv"></b><input type="range" id="chs2" min="1" max="${w.max_channels}" step="1" value="${ch}"></label></div>
+      <div class="kpis" id="wik" style="margin-top:10px"></div><div id="wiwarn"></div>
+      <div class="grid g2" style="margin-top:12px"><div><h3 class="small">RAM by window length (${"<span id='chl'></span>"} channels)</h3><div id="wichart"></div></div><div><h3 class="small">Latency by window length</h3><div id="wichart2"></div></div></div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="wicheck">Check exactly with SAI</button><span class="small muted" id="wicres"></span><span class="spacer"></span><span class="small muted">Accuracy changes too: retrain to measure it.</span></div>`;
+    const get = (win, c) => w.grid.find((g) => g.window === win && g.channels === c);
+    const delta = (a, b0, f = bytes) => a == null || b0 == null ? "" : a === b0 ? `<span class="muted">same</span>` : `<span style="color:${a > b0 ? "var(--bad)" : "var(--ok)"}">${a > b0 ? "+" : "−"}${f(Math.abs(a - b0))}</span>`;
+    const upd = () => {
+      wi = +$("#wi").value; ch = +$("#chs2").value;
+      const win = w.windows[wi], g = get(win, ch);
+      $("#wiv").textContent = `${fmt(win)} samples${w.sample_rate_hz ? ` (${fmt(win / w.sample_rate_hz * 1000, 1)} ms of signal)` : ""}${win === b.window ? " · current" : ""}`;
+      $("#chv").textContent = `${ch}${ch <= w.raw_channels ? (names.length ? ` (${names.slice(0, ch).join(", ")})` : "") : ` (${ch - w.raw_channels} more than the data has)`}${ch === b.channels ? " · current" : ""}`;
+      $("#chl").textContent = ch;
+      if (!g || !g.ok) { $("#wik").innerHTML = ""; $("#wiwarn").innerHTML = `<div class="callout bad">${esc((g && g.reason) || "not buildable")}</div>`; return; }
+      $("#wik").innerHTML = `<div class="kpi"><div class="l">RAM total</div><div class="v">${bytes(g.ram)}</div><div class="small">${delta(g.ram, b.ram)} ${ev("estimate")}</div></div>
+        <div class="kpi"><div class="l">Flash</div><div class="v">${bytes(g.flash)}</div><div class="small">${delta(g.flash, b.flash)}</div></div>
+        <div class="kpi"><div class="l">Latency</div><div class="v">${ms(g.latency_ms)}</div><div class="small">${delta(g.latency_ms, b.latency_ms, (x) => ms(x))}</div></div>
+        <div class="kpi"><div class="l">MACs</div><div class="v">${fmt(g.macs / 1000, 1)}k</div><div class="small">model input ${esc(g.model_input.join("×"))}</div></div>`;
+      $("#wiwarn").innerHTML = g.fits ? `<div class="callout ok" style="margin-top:8px">Fits the ${esc(b.target)} budget.</div>` : `<div class="callout bad" style="margin-top:8px">Does not fit: ${esc(g.violations.join("; "))}</div>`;
+      const row = w.windows.map((x) => get(x, ch)).filter((x) => x && x.ok);
+      $("#wichart").innerHTML = scatter(row.map((x) => ({ x: x.window, y: x.ram, color: x.fits ? "var(--c1)" : "var(--bad)", hollow: !x.fits, star: x.window === win, title: `${x.window}: ${bytes(x.ram)}` })), { w: 520, h: 200, xLabel: "window (samples)", yLabel: "RAM (B)" });
+      $("#wichart2").innerHTML = scatter(row.map((x) => ({ x: x.window, y: x.latency_ms, color: "var(--c2)", star: x.window === win, title: `${x.window}: ${ms(x.latency_ms)}` })), { w: 520, h: 200, xLabel: "window (samples)", yLabel: "latency (ms)" });
+    };
+    $("#wi").oninput = upd; $("#chs2").oninput = upd; upd();
+    $("#wicheck").onclick = () => busy($("#wicheck"), "Starting…", async () => {
+      const j = await api(`/api/jobs/${jid}/whatif/check`, { json: { window: w.windows[+$("#wi").value], channels: +$("#chs2").value } });
+      $("#wicres").innerHTML = `SAI fit check started: <a href="#/job/${esc(j.id)}">${esc(j.id)}</a>`;
+    });
+  }
+  async function drawBattery() {
+    let p = { battery: "2xaa" };
+    const run = async () => {
+      const r = await api(`/api/jobs/${jid}/battery`, { json: p });
+      const bk = r.breakdown_mw, tot = Object.values(bk).reduce((a, x) => a + x, 0) || 1;
+      $("#ibody").innerHTML = `<div class="grid g2"><div class="stack">
+          <div class="grid g2"><label class="f">Battery<select id="bb">${Object.entries(r.batteries).map(([k, v]) => `<option value="${k}" ${k === (p.battery || "2xaa") ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></label>
+            <label class="f">Capacity (mAh) / voltage<div class="row"><input id="bmah" type="number" value="${r.battery.mah || ""}" style="width:50%"><input id="bv" type="number" step="0.1" value="${r.battery.v || ""}" style="width:50%"></div></label></div>
+          <div class="grid g2"><label class="f">Inferences per second<input id="brate" type="number" step="any" value="${r.inferences_per_s}"></label><label class="f">Sensor power (mW)<input id="bsen" type="number" step="any" value="${p.sensor_mw || 0}"></label></div>
+          <div class="grid g2"><label class="f">Radio energy per report (µJ)<input id="brad" type="number" step="any" value="${p.radio_uj || 0}"></label><label class="f">Reports per hour<input id="bev" type="number" step="any" value="${p.events_per_hour || 0}"></label></div>
+          <div class="grid g2"><label class="f">MCU active power (mW)<input id="bact" type="number" step="any" placeholder="${r.active_mw}" value="${p.active_mw || ""}"></label><label class="f">MCU sleep power (µW)<input id="bsl" type="number" step="any" placeholder="${r.sleep_uw}" value="${p.sleep_uw || ""}"></label></div>
+          <p class="small muted">Default MCU power: ${esc(r.profile_basis)} ${ev(r.energy_evidence === "measured" ? "measured" : "assumed")}. Enter your board's numbers to override.</p></div>
+        <div><div class="stat"><span class="l">Battery life</span><span class="big">${r.life_days == null ? "–" : r.life_days > 730 ? `${fmt(r.life_days / 365, 1)} years` : `${fmt(r.life_days, 1)} days`}</span></div>
+          <p class="small">Average ${fmt(r.avg_mw * 1000, 1)} µW · ${fmt(r.energy_uj, 2)} µJ per inference ${ev(r.energy_evidence === "measured" ? "measured" : r.energy_evidence === "custom" ? "assumed" : "assumed")} · latency ${ms(r.latency_ms)} ${ev(r.latency_evidence)} · duty cycle ${(r.duty_cycle * 100).toFixed(2)}% · up to ${fmt(r.max_inferences_per_s)} inferences/s</p>
+          ${r.too_fast ? `<div class="callout bad">The model cannot run that often: one inference takes ${ms(r.latency_ms)}.</div>` : ""}
+          <h3 class="small" style="margin-top:10px">Where the energy goes</h3>${bars(Object.fromEntries(Object.entries(bk).map(([k, v]) => [k, +(v / tot * 100).toFixed(1)])))}<p class="small muted">% of average power</p>
+          ${r.measured ? `<div class="callout ok" style="margin-top:8px">Power measured on a physical board: ${r.measured.energy_uj ? `${fmt(r.measured.energy_uj, 2)} µJ per inference` : ""}${r.measured.active_mw ? ` · ${fmt(r.measured.active_mw, 1)} mW active` : ""} (${r.measured.runs} run(s)).</div>` : `<div class="callout info" style="margin-top:8px">No power measurement yet. A board-farm board with a power monitor (INA226, Joulescope, PPK2) reports <code>energy_uj</code> per inference with each run, and its number replaces the assumed one here.</div>`}</div></div>`;
+      $("#bb").onchange = () => { p = { ...p, battery: $("#bb").value, mah: null, volts: null }; run(); };
+      const num = (id) => ($(id).value === "" ? null : +$(id).value);
+      $$("#ibody input").forEach((i) => (i.onchange = () => { p = { ...p, mah: num("#bmah"), volts: num("#bv"), inferences_per_s: num("#brate"), sensor_mw: num("#bsen"), radio_uj: num("#brad"), events_per_hour: num("#bev"), active_mw: num("#bact"), sleep_uw: num("#bsl") }; run(); }));
+    };
+    await run();
+  }
+  async function drawDrift() {
+    const [hist, recs, dsets] = await Promise.all([api(`/api/jobs/${jid}/drift`), api("/api/recordings"), api(`/api/datasets?template_id=${encodeURIComponent(job.params.template_id)}`)]);
+    const okRecs = recs.filter((r) => r.status === "ready");
+    const badge = (s) => `<span class="badge ${s === "stable" ? "b-ok" : s === "watch" ? "b-warn" : "b-bad"}">${esc(s)}</span>`;
+    const show = (d) => `<div class="callout ${d.status === "stable" ? "ok" : d.status === "watch" ? "" : "bad"}" style="margin-top:10px">${badge(d.status)} <b>${esc(d.summary)}</b> ${d.windows} windows from ${esc(d.source)} · worst PSI ${d.psi}${(d.top || []).length ? `<div class="small">${d.top.map(esc).join(" · ")}</div>` : ""}</div>
+      <div class="grid g2" style="margin-top:10px"><div class="tbl-wrap"><table class="t"><thead><tr><th>Channel</th><th>Feature</th><th class="n">PSI</th><th class="n">Shift (sd)</th><th></th></tr></thead><tbody>${d.inputs.map((r) => `<tr><td>${esc(r.channel)}</td><td>${esc({ mean: "window mean", rms: "window RMS", p2p: "peak-to-peak" }[r.feature])}</td><td class="n">${r.psi}</td><td class="n">${r.shift_sd > 0 ? "+" : ""}${r.shift_sd}</td><td>${badge(r.status)}</td></tr>`).join("")}</tbody></table></div>
+      <div>${d.predictions ? `<h3 class="small">Predicted classes (training vs production)</h3><div class="tbl-wrap"><table class="t"><thead><tr><th>Class</th><th class="n">Training</th><th class="n">Production</th></tr></thead><tbody>${d.predictions.labels.map((l, i) => `<tr><td>${esc(l)}</td><td class="n">${pct(d.predictions.reference[i])}</td><td class="n">${pct(d.predictions.current[i])}</td></tr>`).join("")}</tbody></table></div><p class="small">Prediction-mix PSI ${d.predictions.psi} · mean confidence ${pct(d.predictions.confidence)} (training ${pct(d.predictions.confidence_ref)})${d.confidence_drop ? ` <span class="badge b-warn">confidence dropped</span>` : ""}</p>` : `<p class="small muted">Prediction drift needs a Core (CNN) project.</p>`}</div></div>`;
+    $("#ibody").innerHTML = `<p class="small muted">Compare data from the field with what this model was trained on: input distributions (population stability index per channel) and the model's own predictions. PSI below 0.1 is stable, 0.1–0.25 worth watching, above 0.25 drift.</p>
+      <div class="row" style="flex-wrap:wrap"><select id="dsrc"><optgroup label="Recordings">${okRecs.map((r) => `<option value="rec:${esc(r.id)}">${esc(r.name)} (${fmt(r.samples / r.sample_rate, 1)} s)</option>`).join("")}</optgroup><optgroup label="Datasets">${dsets.filter((d) => d.id !== job.params.dataset_id).map((d) => `<option value="ds:${esc(d.id)}">${esc(d.name)}</option>`).join("")}</optgroup></select><button class="btn primary" id="dgo2">Check drift</button><a class="small" href="#/recordings">Capture or import field data</a></div>
+      <div id="dres2"></div>
+      ${hist.length ? `<h3 class="small" style="margin-top:14px">History</h3><div class="tbl-wrap"><table class="t"><tbody>${hist.slice().reverse().map((h, i) => `<tr><td>${badge(h.status)}</td><td>${esc(h.source)}</td><td class="n">PSI ${h.psi}</td><td class="muted">${ago(h.created)}</td><td><button class="btn sm" data-h="${i}">Show</button></td></tr>`).join("")}</tbody></table></div>` : ""}`;
+    const rev = hist.slice().reverse();
+    $$("[data-h]").forEach((b) => (b.onclick = () => { $("#dres2").innerHTML = show(rev[+b.dataset.h]); }));
+    $("#dgo2").onclick = () => busy($("#dgo2"), "Comparing…", async () => {
+      const v = $("#dsrc").value; if (!v) return toast("Capture or import field data first");
+      const [k, id] = v.split(":");
+      const d = await api(`/api/jobs/${jid}/drift`, { json: k === "rec" ? { recording_id: id } : { dataset_id: id } });
+      $("#dres2").innerHTML = show(d);
+    });
   }
   let hilTimer = null;
   onLeave(() => clearTimeout(hilTimer));
@@ -1717,13 +1809,19 @@ route(/^\/plan$/, async (el) => {
 route(/^\/admin$/, async (el) => {
   const m = ME;
   if (!m.perms.org_admin) { el.innerHTML = `<div class="callout bad">Only admins can open the admin console (your role: <b>${esc(m.role)}</b>).</div>`; return; }
-  const tabs = [m.perms.org_admin && ["orgs", "Organisations"], m.perms.org_admin && ["users", "Users"], m.perms.farm_admin && ["agents", "Lab agents"], m.perms.org_admin && ["audit", "Audit log"], m.perms.platform_admin && ["queue", "Job queue"]].filter(Boolean);
+  const tabs = [m.perms.org_admin && ["orgs", "Organisations"], m.perms.org_admin && ["users", "Users"], m.perms.farm_admin && ["agents", "Lab agents"], m.perms.org_admin && ["audit", "Audit log"], m.perms.org_admin && ["opgaps", "Operator gaps"], m.perms.platform_admin && ["queue", "Job queue"]].filter(Boolean);
   let tab = tabs[0][0];
   const draw = async () => {
     el.innerHTML = `<div class="page-h"><div><h1>Admin</h1><p class="muted">${m.mode === "single" ? "Single-organisation install" : "Multi-tenant"} · signed in as ${esc(m.email)} (${esc(m.role)})</p></div></div>
       <div class="tabs">${tabs.map(([k, t]) => `<button class="tab ${k === tab ? "on" : ""}" data-t="${k}">${t}</button>`).join("")}</div><div id="adm"></div>`;
     $$(".tabs .tab", el).forEach((b) => (b.onclick = () => { tab = b.dataset.t; draw(); }));
     const box = $("#adm");
+    if (tab === "opgaps") {
+      const g = await api("/api/admin/operator-gaps");
+      box.innerHTML = `<div class="card"><h2>Models refused for a missing operator</h2><p class="small muted">Every time SAI, SAI's front end or the model editor refuses an operator, it is logged here${m.perms.studio || m.perms.platform_admin ? " for all organisations" : " for your organisation"}: what customers need that the compiler cannot lower yet. ${fmt(g.total)} refusal(s) in the last year.</p>
+        ${g.operators.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Operator</th><th class="n">Refusals</th><th class="n">Organisations</th><th>Targets</th><th>Where</th><th>Seen with</th><th>Last</th></tr></thead><tbody>${g.operators.map((o) => `<tr><td><b class="mono">${esc(o.op)}</b><div class="small muted">${esc(o.capability || "")}</div></td><td class="n">${fmt(o.count)}</td><td class="n">${fmt(o.orgs)}</td><td class="small">${Object.entries(o.targets).map(([k, v]) => `${esc(k)} ×${v}`).join(", ")}</td><td class="small">${Object.entries(o.sources).map(([k, v]) => `${esc(k)} ×${v}`).join(", ")}</td><td class="small mono">${esc(o.with.join(", "))}</td><td class="muted">${ago(o.last)}</td></tr>`).join("")}</tbody></table></div>
+        <h3 class="small" style="margin-top:14px">Latest</h3><div class="tbl-wrap"><table class="t"><tbody>${g.recent.slice(0, 15).map((r) => `<tr><td class="mono">${esc(r.op)}</td><td>${esc(r.target || "")}</td><td>${esc(r.source)}${r.kind ? ` · ${esc(r.kind)}` : ""}</td><td>${r.job_id ? `<a href="#/job/${esc(r.job_id)}">${esc(r.job_id)}</a>` : ""}</td><td class="small">${esc(r.reason)}</td><td class="muted">${ago(r.created)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">No refusals logged.</div>`}</div>`;
+    }
     if (tab === "orgs") {
       const orgs = await api("/api/admin/orgs");
       box.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="t"><thead><tr><th>Organisation</th><th>Tier</th><th>Deployment rights</th><th class="n">Users</th><th>Usage (all time)</th><th>Created</th></tr></thead><tbody>

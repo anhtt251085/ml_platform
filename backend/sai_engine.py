@@ -98,6 +98,8 @@ def run(args: list[str], timeout: int = 300) -> dict:
         data = {}
     if isinstance(data, dict) and "error" in data:
         err = data["error"]
+        from . import opgaps
+        opgaps.from_sai_error(err, args)
         raise SaiFailure(f"{err.get('code')}: {err.get('reason')}", err)
     if proc.returncode != 0 and (not data or args[0] in ("compile", "verify", "certify")):
         tail = (proc.stdout + proc.stderr).strip().splitlines()[-6:]

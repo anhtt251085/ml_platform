@@ -108,6 +108,16 @@ MIGRATIONS: list[str] = [
                               created_by TEXT, created REAL);
     CREATE INDEX connections_i ON connections(org_id);
     """,
+    # 10: models SAI refused for a missing operator (compiler roadmap signal) and drift checks of projects
+    """
+    CREATE TABLE operator_gaps (id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL, org_id TEXT, job_id TEXT,
+                                kind TEXT, source TEXT, op TEXT, target TEXT, capability TEXT, reason TEXT,
+                                model_ops TEXT);
+    CREATE INDEX operator_gaps_i ON operator_gaps(op, created);
+    CREATE TABLE drift_checks (id TEXT PRIMARY KEY, job_id TEXT, org_id TEXT, created REAL, source TEXT,
+                               status TEXT, result TEXT);
+    CREATE INDEX drift_checks_i ON drift_checks(job_id, created);
+    """,
 ]
 
 

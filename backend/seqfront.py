@@ -71,11 +71,16 @@ def compile(model: Path, target: str, out: Path, data: Path, test: Path | None, 
     if p.returncode != 0 or not rep_path.exists():
         txt = (p.stdout or "") + (p.stderr or "")
         reason = txt.strip().splitlines()[-1] if txt.strip() else f"exit {p.returncode}"
+        from . import opgaps
         try:
             err = json.loads(txt[txt.index("{"):]).get("error") or {}
             reason = err.get("reason") or err.get("message") or reason
+            if err.get("code") == "graph.unsupported" or err.get("status") == "unsupported":
+                opgaps.from_sai_error({**err, "target": target}, ["compile", str(model)])
+            else:
+                opgaps.from_text(txt, "sai-front", target, model)
         except (ValueError, AttributeError):
-            pass
+            opgaps.from_text(txt, "sai-front", target, model)
         raise sai_engine.SaiFailure(f"sai_front on {target}: {reason}", {"stdout": txt[-2000:]})
     rep = json.loads(rep_path.read_text())
     lib = out / "library"

@@ -12,12 +12,13 @@ Ideas grouped by who they serve. ★ = built, ◐ = partly, ○ = not built (sta
 | ★ | Bit-exact accuracy of the deployed C program (not a framework's approximation) | Removes the #1 TinyML surprise: accuracy drop after deployment |
 | ★ | Package: library, headers, `sai_app.h` (integer-only input quantization, decode), `main_example.c`, model card, SBOM, memory certificate | Drop-in for STM32CubeIDE / Eclipse projects |
 | ★ | Evidence badges on every number | Trust: exact vs proven vs estimated |
-| ○ | "What-if" sliders: window length, channels, sample rate → instant RAM/latency/accuracy curve | Lets the customer trade sensor cost against accuracy |
-| ○ | Duty-cycle and battery-life estimate (inferences/s × energy per inference from the board farm) | The question battery-product buyers actually ask |
+| ◐ | "What-if" sliders: window length and channels → instant RAM/flash/latency scaled from the project's SAI numbers, exact SAI check on demand (accuracy still needs a retrain) | Lets the customer trade sensor cost against accuracy |
+| ★ | Duty-cycle and battery-life estimate: inferences/s × energy per inference (assumed MCU profile, or measured `energy_uj` from physical board runs), sensor and radio budget | The question battery-product buyers actually ask |
 | ○ | Side-by-side vs TFLite Micro / CMSIS-NN (same model, same board, measured) | The sales proof point, generated per customer |
 | ○ | One-click CubeIDE / PlatformIO / Zephyr / MCUXpresso project export | Removes integration friction |
 | ◐ | Model versioning + A/B and OTA-ready packages (signed with `sai_signing`) | Field updates, rollbacks |
-| ○ | Drift monitor: the device logs feature statistics; the platform flags distribution shift and proposes retraining | Lifecycle revenue |
+| ◐ | Drift monitor: field recordings / datasets vs training data (PSI per channel feature, prediction mix, confidence), history per project (on-device statistics logging still open) |
+| ★ | Operator-gap log: every model refused for a missing operator (SAI, SAI front end, model editor) with target and co-occurring ops, grouped for the compiler roadmap | Tells the compiler team what to build next | Lifecycle revenue |
 
 ## 2. Data
 

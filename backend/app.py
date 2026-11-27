@@ -22,8 +22,8 @@ from pydantic import BaseModel
 import numpy as np
 from xml.etree.ElementTree import ParseError as ET_ERRORS
 
-from . import (approvals, archlib, archspec, auth, boards, commercial, config, connectors, data, db, physics,
-               pipeline, recordings, sai_engine, store)
+from . import (approvals, archlib, archspec, auth, boards, commercial, config, connectors, data, db, insight,
+               opgaps, physics, pipeline, recordings, sai_engine, store)
 
 app = FastAPI(title=config.BRAND_NAME, version=config.PLATFORM_VERSION)
 FRONT = config.ROOT / "frontend"
@@ -1026,6 +1026,104 @@ def _job(jid: str, u: dict, log_after: int = 0, metrics_after: int | None = None
 @app.get("/api/jobs")
 def job_list(kind: str | None = None, u: dict = Depends(auth.current)):
     return pipeline.list_jobs(kind, org_id=auth.scope(u))
+
+
+def _done_project(jid: str, u: dict) -> dict:
+    j = _job(jid, u)
+    if j["kind"] != "train" or j["status"] != "succeeded":
+        raise HTTPException(400, "this needs a finished project")
+    return j
+
+
+@app.get("/api/jobs/{jid}/whatif")
+def job_whatif(jid: str, u: dict = Depends(auth.current)):
+    """RAM / flash / latency of the selected model for other window lengths and channel counts (scaled)."""
+    j = _done_project(jid, u)
+    try:
+        return insight.whatif_grid(j["result"], _tpl(j["params"]["template_id"]))
+    except ValueError as e:
+        _bad(e)
+
+
+class WhatIfIn(BaseModel):
+    window: int
+    channels: int
+    targets: list[str] = []
+
+
+@app.post("/api/jobs/{jid}/whatif/check")
+def job_whatif_check(jid: str, body: WhatIfIn, u: dict = Depends(auth.current)):
+    """A real SAI fit check of the selected architecture with that input (background job)."""
+    j = _done_project(jid, u)
+    try:
+        spec = insight.whatif_spec(j["result"], body.window, body.channels)
+    except (ValueError, archspec.SpecError) as e:
+        _bad(e)
+    targets = [t for t in body.targets if t in sai_engine.MCU_TARGETS] or [j["result"]["selected"]["target"]]
+    _busy(pipeline.active_jobs("fitcheck", lambda p: p.get("spec") == spec and p.get("targets") == targets, u["org_id"]),
+          "an SAI check of this input")
+    return pipeline.create("fitcheck", {"spec": spec, "targets": targets, "goal": j["params"].get("goal", "balanced")
+                                        if j["params"].get("goal") != "accuracy" else "balanced",
+                                        "whatif_of": jid}, org_id=u["org_id"], user_id=u["id"], priority=1)
+
+
+@app.post("/api/jobs/{jid}/battery")
+def job_battery(jid: str, body: dict, u: dict = Depends(auth.current)):
+    j = _done_project(jid, u)
+    try:
+        return insight.battery(j["result"], jid, _tpl(j["params"]["template_id"]), body or {})
+    except (ValueError, TypeError) as e:
+        _bad(e)
+
+
+class DriftIn(BaseModel):
+    recording_id: str | None = None
+    dataset_id: str | None = None
+
+
+@app.get("/api/jobs/{jid}/drift")
+def job_drift_history(jid: str, u: dict = Depends(auth.current)):
+    _done_project(jid, u)
+    return insight.history(jid)
+
+
+@app.post("/api/jobs/{jid}/drift")
+def job_drift(jid: str, body: DriftIn, u: dict = Depends(auth.current)):
+    """Compare production data (a recording or a dataset) with the project's training data."""
+    j = _done_project(jid, u)
+    raw = (j["result"].get("preprocessing") or {}).get("raw_shape")
+    try:
+        if body.recording_id:
+            r = _rec(body.recording_id, u)
+            if r["status"] == "capturing":
+                raise HTTPException(409, "stop the capture first")
+            X, src = insight.windows_from_recording(r, raw), f"recording {r['name']}"
+        elif body.dataset_id:
+            d = _ds(body.dataset_id, u)
+            X = data.load(body.dataset_id)[0]
+            src = f"dataset {d.get('name')}"
+        else:
+            raise HTTPException(400, "give a recording or a dataset of production data")
+        names = (store.template(j["params"]["template_id"]) or {}).get("input", {}).get("channel_names")
+        out = insight.check(j, X, src, names)
+    except (ValueError, data.DataError) as e:
+        _bad(e)
+    out = insight.save(j, out)
+    auth.audit(u, "drift_checked", jid, {"status": out["status"], "psi": out["psi"]})
+    return out
+
+
+@app.get("/api/admin/operator-gaps")
+def operator_gaps(days: int = 365, u: dict = Depends(auth.current)):
+    """Operators SAI refused: all organisations for SAI researchers / platform admins, own organisation for an
+    organisation admin."""
+    if auth.has(u, "studio") or auth.has(u, "platform_admin"):
+        org = None
+    elif auth.has(u, "org_admin") or auth.has(u, "research"):
+        org = u["org_id"]
+    else:
+        raise HTTPException(403, "for researchers and admins")
+    return opgaps.summary(db.now() - max(1, days) * 86400, org)
 
 
 @app.get("/api/jobs/{jid}")
