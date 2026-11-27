@@ -69,8 +69,11 @@ def sweep(now: float | None = None) -> dict:
     report = {"freed_bytes": 0, "removed": {}, "at": now}
     root = config.DATA_DIR
     up = root / "uploads"
+    from . import pipeline
+    in_use = {Path(j["params"].get("path") or j["params"].get("model_path") or "").name
+              for j in pipeline.active_jobs(("ingest", "analyze"))}
     for p in up.iterdir() if up.exists() else []:
-        if _age(p, now) > UPLOAD_TTL_DAYS * DAY:
+        if _age(p, now) > UPLOAD_TTL_DAYS * DAY and p.name not in in_use:
             _remove(p, report, "uploads")
     for sub in ("tmp", "regression"):
         d = root / sub

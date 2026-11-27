@@ -61,8 +61,26 @@ def heartbeat(agent_id: str, health: dict | None = None):
             c.execute("UPDATE boards SET health=? WHERE id=? AND agent_id=?", (db.j(h), bid, agent_id))
 
 
-def reset_board(board_id: str):
-    """Lab action after fixing a board: fail its open run, clear the failure count, put it back in service."""
+def open_runs(job_id: str | None = None, board_id: str | None = None) -> list[dict]:
+    """Queued or running board runs of a project and/or on a board."""
+    where, args = ["status IN ('queued', 'running')"], []
+    if job_id:
+        where.append("job_id=?"); args.append(job_id)
+    if board_id:
+        where.append("board_id=?"); args.append(board_id)
+    with db.conn() as c:
+        return [db.row(r) for r in c.execute("SELECT id, job_id, board_id, status, updated FROM hil_runs WHERE "
+                                             + " AND ".join(where), args)]
+
+
+def reset_board(board_id: str, force: bool = False):
+    """Lab action after fixing a board: fail its open run, clear the failure count, put it back in service.
+    A board in the middle of a live run (lease not expired) is only reset with force."""
+    live = [r for r in open_runs(board_id=board_id) if r["status"] == "running" and db.now() - r["updated"] < RUN_LEASE_S]
+    b = next((x for x in list_boards() if x["id"] == board_id), None)
+    if live and not force and (b or {}).get("status") != "quarantined":
+        raise ValueError(f"board {board_id} is running {live[0]['id']} right now; wait for it, or reset with force "
+                         "to fail that run")
     with db.conn() as c:
         c.execute("UPDATE hil_runs SET status='failed', result=?, updated=? WHERE board_id=? AND status='running'",
                   (db.j({"ok": False, "error": "board reset by the lab"}), db.now(), board_id))

@@ -1,6 +1,6 @@
 # SAI Platform – idea brainstorm
 
-Ideas grouped by who they serve. ★ = in the v0.1 prototype, ◐ = partly, ○ = not built.
+Ideas grouped by who they serve. ★ = built, ◐ = partly, ○ = not built (status as of the sequence-model / multi-model release).
 
 ## 1. Customer (OEM firmware / product engineer)
 
@@ -16,7 +16,7 @@ Ideas grouped by who they serve. ★ = in the v0.1 prototype, ◐ = partly, ○ 
 | ○ | Duty-cycle and battery-life estimate (inferences/s × energy per inference from the board farm) | The question battery-product buyers actually ask |
 | ○ | Side-by-side vs TFLite Micro / CMSIS-NN (same model, same board, measured) | The sales proof point, generated per customer |
 | ○ | One-click CubeIDE / PlatformIO / Zephyr / MCUXpresso project export | Removes integration friction |
-| ○ | Model versioning + A/B and OTA-ready packages (signed with `sai_signing`) | Field updates, rollbacks |
+| ◐ | Model versioning + A/B and OTA-ready packages (signed with `sai_signing`) | Field updates, rollbacks |
 | ○ | Drift monitor: the device logs feature statistics; the platform flags distribution shift and proposes retraining | Lifecycle revenue |
 
 ## 2. Data
@@ -24,11 +24,11 @@ Ideas grouped by who they serve. ★ = in the v0.1 prototype, ◐ = partly, ○ 
 | | Idea |
 |---|---|
 | ★ | CSV (windowed per recording, majority label), NPZ, HTTPS, synthetic demo data per model type |
-| ○ | Column-mapping wizard (choose time / channels / label / segment columns, units, sample rate) |
+| ★ | Column-mapping wizard (choose time / channels / label / segment columns, units, sample rate) |
 | ○ | Label studio for time series: scrub a signal, paint label spans, auto-suggest from a pre-trained pool model |
 | ○ | Live capture: the board farm or the customer's dev board streams sensor data (USB CDC / BLE / MQTT) straight into a dataset |
 | ○ | Connectors: S3 / GCS / Azure, OPC-UA, InfluxDB / TimescaleDB, Edge Impulse import |
-| ○ | Data quality report: clipping, sample-rate jitter, class balance, leakage between recordings, duplicate windows |
+| ★ | Data quality report: clipping, sample-rate jitter, class balance, leakage between recordings, duplicate windows |
 | ○ | Privacy modes: on-prem runner, or "bring the compiler to the data" (customer VPC worker, only metrics leave) |
 | ○ | Synthetic augmentation from physics models (bearing defect frequencies from geometry, arc models) to bootstrap small datasets |
 
@@ -38,10 +38,10 @@ Ideas grouped by who they serve. ★ = in the v0.1 prototype, ◐ = partly, ○ 
 |---|---|
 | ★ | Model Studio: layer builder restricted to SAI ops, live shapes/MACs, SAI fit check on every board before training |
 | ★ | Publish to pool (draft / published), copy a built-in as a starting point |
-| ○ | NAS inside the SAI search space: search architectures with SAI's exact RAM/flash as constraints (hardware-in-the-loop NAS) |
-| ○ | Pretrained base weights per model type + customer fine-tuning (few-shot on customer data) |
-| ○ | Leaderboard per model type: accuracy × RAM × latency on every board, nightly on the board farm |
-| ○ | Feature front ends as first-class pool blocks (FFT band energies, MFCC, envelope, RMS) with a C implementation that training uses too (no train/deploy skew) |
+| ◐ | NAS inside the SAI search space: search architectures with SAI's exact RAM/flash as constraints (hardware-in-the-loop NAS) |
+| ★ | Pretrained base weights per model type + customer fine-tuning (few-shot on customer data) |
+| ★ | Leaderboard per model type: accuracy × RAM × latency on every board, nightly on the board farm |
+| ★ | Feature front ends as first-class pool blocks (FFT band energies, MFCC, envelope, RMS) with a C implementation that training uses too (no train/deploy skew) |
 | ○ | Benchmark corpus: MLPerf Tiny tasks as regression tests of the compiler + pool |
 | ○ | Operator-gap tracker: every refused customer model is logged with the missing op → drives SAI Core compatibility releases |
 
@@ -51,20 +51,20 @@ Ideas grouped by who they serve. ★ = in the v0.1 prototype, ◐ = partly, ○ 
 |---|---|
 | ★ | Plan search: `sai estimate` × 3 objectives × each board, `sai explore` plan space, budgets checked against board profiles |
 | ★ | `sai compile` + `sai verify` (19 checks) on every delivered package |
-| ◐ | Latency: SAI kernel cost model where it exists, heuristic elsewhere, calibrated from real boards later |
-| ○ | Build any explored candidate (`--plan NAME --candidate-id`), not only the three objective winners; `--certify-top N` |
-| ○ | Edition / tier gating: SAI Standard vs Professional plans shown side by side ("Professional saves 31 % latency on your model") – an upsell surfaced by the product itself |
-| ○ | Multi-model option: several pool models sharing one workspace on one MCU (e.g. anomaly + classifier) |
-| ○ | Measured-row registry: every board-farm run becomes a SAI measurement record, so `sai estimate` reports `measured` |
+| ★ | Latency: SAI kernel cost model where it exists, heuristic elsewhere, calibrated from real boards later |
+| ★ | Build any explored candidate (`--plan NAME --candidate-id`), not only the three objective winners; `--certify-top N` |
+| ★ | Edition / tier gating: SAI Standard vs Professional plans shown side by side ("Professional saves 31 % latency on your model") – an upsell surfaced by the product itself |
+| ★ | Multi-model option: several pool models sharing one workspace on one MCU (e.g. anomaly + classifier) |
+| ★ | Measured-row registry: every board-farm run becomes a SAI measurement record, so `sai estimate` reports `measured` |
 
 ## 5. Hardware / board farm
 
 | | Idea |
 |---|---|
 | ★ | Board registry, HIL queue, bit-exact output check, calibration fit (simulated agent today) |
-| ○ | Harness firmware per target (UART vectors, DWT/mcycle, stack painting) |
+| ★ | Harness firmware per target (UART vectors, DWT/mcycle, stack painting) |
 | ○ | Power: INA228 / Joulescope per board → µJ per inference, sleep current |
-| ○ | Nightly regression: every pool model × every board × every SAI release; alerts on regressions |
+| ★ | Nightly regression: every pool model × every board × every SAI release; alerts on regressions |
 | ○ | Remote "virtual dev board" for customers: run *their* firmware on our boards before buying hardware |
 | ○ | Partner boards: silicon vendors place boards in the farm to be "SAI-ready" (co-marketing) |
 

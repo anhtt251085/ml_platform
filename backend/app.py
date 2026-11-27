@@ -326,6 +326,8 @@ def catalog_save(body: dict, u: dict = Depends(auth.require("studio"))):
 
 @app.delete("/api/catalog/{tid}")
 def catalog_delete(tid: str, u: dict = Depends(auth.require("studio"))):
+    _busy(pipeline.active_jobs(("train", "basetrain", "recommend"), lambda p: p.get("template_id") == tid),
+          "a project or job of this model type")
     try:
         store.delete_template(tid)
     except ValueError as e:
@@ -364,6 +366,13 @@ async def _stage_upload(file: UploadFile, limit: int) -> Path:
 
 
 MAX_MODEL_BYTES = 256 * 1024 * 1024        # an MCU model is far smaller; this bounds the explorer upload
+
+
+def _busy(jobs: list[dict], what: str):
+    """409 when a job that does the same thing is still queued or running (double clicks, second tabs)."""
+    if jobs:
+        j = jobs[0]
+        raise HTTPException(409, f"{what} is already {j['status']} (job {j['id']}); wait for it or cancel it first")
 
 
 def _ds(did: str, u: dict) -> dict:
@@ -471,6 +480,8 @@ def dataset_delete(did: str, u: dict = Depends(auth.current)):
     running = [x for x in store.dataset_usage(did) if x["status"] in ("queued", "running")]
     if running:
         raise HTTPException(409, f"dataset is used by {len(running)} running project(s); wait or cancel them first")
+    _busy(pipeline.active_jobs(("recommend", "basetrain", "train"), lambda p: p.get("dataset_id") == did),
+          "a job that reads this dataset")
     store.delete_dataset(did)
     auth.audit(u, "dataset_deleted", did)
     return {"ok": True}
@@ -589,6 +600,10 @@ def recommend_start(body: RecommendIn, u: dict = Depends(auth.current)):
         raise HTTPException(400, f"goal must be one of {pipeline.GOALS}")
     cfg = body.model_dump()
     cfg["max_candidates"] = max(2, min(cfg["max_candidates"], 16))
+    _busy(pipeline.active_jobs("recommend", lambda p: (p.get("dataset_id"), p.get("template_id"), p.get("goal"),
+                                                        sorted(p.get("targets") or []))
+                               == (body.dataset_id, body.template_id, body.goal, sorted(body.targets)),
+                               u["org_id"]), "a recommendation for this data, goal and boards")
     cfg["_org_id"] = u["org_id"]
     job = pipeline.create("recommend", cfg, org_id=u["org_id"], user_id=u["id"], priority=1)
     auth.audit(u, "recommend_started", job["id"], {"template": body.template_id, "dataset": body.dataset_id})
@@ -711,7 +726,10 @@ def job_cancel(jid: str, u: dict = Depends(auth.current)):
 
 @app.post("/api/jobs/{jid}/rebuild")
 def job_rebuild(jid: str, u: dict = Depends(auth.current)):
-    _job(jid, u)
+    src = _job(jid, u)
+    if src["kind"] != "train" or src["status"] != "succeeded":
+        raise HTTPException(400, "only a finished project can be rebuilt")
+    _busy(pipeline.active_jobs("rebuild", lambda p: p.get("job_id") == jid), "a rebuild of this project")
     j = pipeline.create("rebuild", {"job_id": jid}, org_id=u["org_id"], user_id=u["id"], priority=1)
     auth.audit(u, "rebuild_requested", jid, {"rebuild_job": j["id"]})
     return j
@@ -824,6 +842,8 @@ def multimodel_start(body: MultiIn, u: dict = Depends(auth.current)):
                                      "supported by the multi-model plugin yet; choose SAI Core projects")
         if not (config.DATA_DIR / "jobs" / jid / "model.onnx").exists():
             raise HTTPException(400, f"{jid} has no model file")
+    _busy(pipeline.active_jobs("multimodel", lambda p: sorted(p.get("job_ids") or []) == sorted(ids)
+                               and p.get("target") == body.target, u["org_id"]), "a build of these projects together")
     job = pipeline.create("multimodel", {"name": body.name[:80], "job_ids": ids, "target": body.target,
                                          "budgets": body.budgets}, org_id=u["org_id"], user_id=u["id"], priority=1)
     auth.audit(u, "multimodel_started", job["id"], {"projects": ids, "target": body.target})
@@ -915,6 +935,8 @@ def arch_update(aid: str, body: ArchIn, u: dict = Depends(auth.require("research
 @app.delete("/api/architectures/{aid}")
 def arch_delete(aid: str, u: dict = Depends(auth.require("research"))):
     _own_arch(aid, u)
+    _busy(pipeline.active_jobs("archverify", lambda p: not p.get("ids") or aid in p["ids"]),
+          "an SAI check of this architecture")
     archlib.delete(aid)
     auth.audit(u, "architecture_deleted", aid)
     return {"ok": True}
@@ -930,6 +952,8 @@ def arch_verify(body: dict, u: dict = Depends(auth.require("research"))):
                 raise HTTPException(404, f"unknown architecture {aid}")
     elif not auth.has(u, "studio"):
         raise HTTPException(403, "verifying the whole library is for SAI researchers and admins")
+    _busy(pipeline.active_jobs("archverify", lambda p: not ids or not p.get("ids") or set(ids) & set(p["ids"])),
+          "an SAI check of " + ("these architectures" if ids else "the library"))
     return pipeline.create("archverify", {"ids": ids, "targets": body.get("targets")}, org_id=u["org_id"],
                            user_id=u["id"], priority=1)
 
@@ -1032,6 +1056,8 @@ def studio_basetrain(body: BaseTrainIn, u: dict = Depends(auth.require("publish"
     _tpl(body.template_id)
     if body.dataset_id:
         _ds(body.dataset_id, u)
+    _busy(pipeline.active_jobs("basetrain", lambda p: p.get("template_id") == body.template_id),
+          "base-weight training for this model type")
     j = pipeline.create("basetrain", body.model_dump(), org_id=u["org_id"], user_id=u["id"])
     auth.audit(u, "basetrain_requested", body.template_id, {"job": j["id"]})
     return j
@@ -1083,6 +1109,10 @@ def board_run(body: RunIn, u: dict = Depends(auth.current)):
     bd = {b["id"]: b for b in boards.list_boards()}
     if body.board_id and body.board_id not in bd:
         raise HTTPException(404, "unknown board")
+    open_ = boards.open_runs(job_id=body.job_id)
+    if open_:
+        raise HTTPException(409, f"a board run of this project is already {open_[0]['status']} ({open_[0]['id']}); "
+                                 "wait for it to finish")
     plan = commercial.check_board_run(u, bd[body.board_id]["kind"] if body.board_id else "emulated")
     allowed = None if plan["farm"] == "all" else ["emulated", "simulated"]      # enforced again when a board claims it
     try:
@@ -1154,14 +1184,18 @@ def agent_package(rid: str, authorization: str | None = Header(None)):
 
 
 @app.post("/api/boards/{bid}/reset")
-def board_reset(bid: str, u: dict = Depends(auth.require("farm_admin"))):
-    boards.reset_board(bid)
+def board_reset(bid: str, body: dict | None = None, u: dict = Depends(auth.require("farm_admin"))):
+    try:
+        boards.reset_board(bid, force=bool((body or {}).get("force")))
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from None
     auth.audit(u, "board_reset", bid)
     return {"ok": True}
 
 
 @app.post("/api/admin/regression")
 def regression_start(body: dict, u: dict = Depends(auth.require("farm_admin"))):
+    _busy(pipeline.active_jobs("regression"), "a regression run")
     j = pipeline.create("regression", {"templates": body.get("templates"), "hil": body.get("hil", True)},
                         org_id=u["org_id"], user_id=u["id"], priority=-1)
     auth.audit(u, "regression_requested", j["id"])
