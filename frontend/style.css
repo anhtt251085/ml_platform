@@ -186,3 +186,8 @@ body.signed-out .shell { grid-template-columns: 1fr; }
 a:focus-visible, button:focus-visible, .tile:focus-visible, .drop:focus-visible, .chip:focus-visible, .tab:focus-visible, summary:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
+
+.sigplot { display: block; height: 260px; background: var(--panel-2, transparent); border: 1px solid var(--line); border-radius: 6px; }
+a.tab { text-decoration: none; }
+tr.sel td { background: var(--accent-soft); }
+pre.code { white-space: pre-wrap; word-break: break-all; background: var(--accent-soft); padding: 8px; border-radius: 6px; }

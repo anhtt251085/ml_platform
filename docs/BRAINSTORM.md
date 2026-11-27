@@ -12,12 +12,13 @@ Ideas grouped by who they serve. ★ = built, ◐ = partly, ○ = not built (sta
 | ★ | Bit-exact accuracy of the deployed C program (not a framework's approximation) | Removes the #1 TinyML surprise: accuracy drop after deployment |
 | ★ | Package: library, headers, `sai_app.h` (integer-only input quantization, decode), `main_example.c`, model card, SBOM, memory certificate | Drop-in for STM32CubeIDE / Eclipse projects |
 | ★ | Evidence badges on every number | Trust: exact vs proven vs estimated |
-| ○ | "What-if" sliders: window length, channels, sample rate → instant RAM/latency/accuracy curve | Lets the customer trade sensor cost against accuracy |
-| ○ | Duty-cycle and battery-life estimate (inferences/s × energy per inference from the board farm) | The question battery-product buyers actually ask |
-| ○ | Side-by-side vs TFLite Micro / CMSIS-NN (same model, same board, measured) | The sales proof point, generated per customer |
+| ◐ | "What-if" sliders: window length and channels → instant RAM/flash/latency scaled from the project's SAI numbers, exact SAI check on demand (accuracy still needs a retrain) | Lets the customer trade sensor cost against accuracy |
+| ★ | Duty-cycle and battery-life estimate: inferences/s × energy per inference (assumed MCU profile, or measured `energy_uj` from physical board runs), sensor and radio budget | The question battery-product buyers actually ask |
+| ◐ | Side-by-side vs TFLite Micro / CMSIS-NN: TFLM greedy arena replayed on the same graph + CMSIS-NN scratch, assumed code size and cycles/MAC, the customer's measured TFLM build replaces the model (no in-farm TFLM build yet) | The sales proof point, generated per customer |
 | ○ | One-click CubeIDE / PlatformIO / Zephyr / MCUXpresso project export | Removes integration friction |
 | ◐ | Model versioning + A/B and OTA-ready packages (signed with `sai_signing`) | Field updates, rollbacks |
-| ○ | Drift monitor: the device logs feature statistics; the platform flags distribution shift and proposes retraining | Lifecycle revenue |
+| ◐ | Drift monitor: field recordings / datasets vs training data (PSI per channel feature, prediction mix, confidence), history per project (on-device statistics logging still open) |
+| ★ | Operator-gap log: every model refused for a missing operator (SAI, SAI front end, model editor) with target and co-occurring ops, grouped for the compiler roadmap | Tells the compiler team what to build next | Lifecycle revenue |
 
 ## 2. Data
 
@@ -25,12 +26,12 @@ Ideas grouped by who they serve. ★ = built, ◐ = partly, ○ = not built (sta
 |---|---|
 | ★ | CSV (windowed per recording, majority label), NPZ, HTTPS, synthetic demo data per model type |
 | ★ | Column-mapping wizard (choose time / channels / label / segment columns, units, sample rate) |
-| ○ | Label studio for time series: scrub a signal, paint label spans, auto-suggest from a pre-trained pool model |
-| ○ | Live capture: the board farm or the customer's dev board streams sensor data (USB CDC / BLE / MQTT) straight into a dataset |
-| ○ | Connectors: S3 / GCS / Azure, OPC-UA, InfluxDB / TimescaleDB, Edge Impulse import |
+| ★ | Label studio for time series: zoomable min/max view, paint and erase label spans, suggestions from a finished project's INT8 model, recordings → dataset (groups per span) |
+| ◐ | Live capture: a device / gateway / `tools/capture_client.py` (serial or stdin) posts samples with a capture token while the engineer watches and marks labels live (BLE / MQTT bridges still open) |
+| ◐ | Connectors: S3 (+ GCS HMAC, MinIO, R2), Azure Blob, InfluxDB v2, PostgreSQL / TimescaleDB (read-only SELECT); secrets Fernet-encrypted; public endpoints only unless single-customer mode (OPC-UA, Edge Impulse import still open) |
 | ★ | Data quality report: clipping, sample-rate jitter, class balance, leakage between recordings, duplicate windows |
-| ○ | Privacy modes: on-prem runner, or "bring the compiler to the data" (customer VPC worker, only metrics leave) |
-| ○ | Synthetic augmentation from physics models (bearing defect frequencies from geometry, arc models) to bootstrap small datasets |
+| ◐ | Privacy modes: on-prem install, and customer-VPC workers for private data sources (credentials stay on the worker; data imported, training still on the platform)  |
+| ★ | Physics augmentation: bearing kinematics (BPFO/BPFI/BSF/FTF) with resonance ringing, MCSA sidebands, DC arcs from the machine's own parameters; mix with real data plus gain / speed / noise variants |
 
 ## 3. Researcher (SAI model pool team)
 
@@ -42,7 +43,7 @@ Ideas grouped by who they serve. ★ = built, ◐ = partly, ○ = not built (sta
 | ★ | Pretrained base weights per model type + customer fine-tuning (few-shot on customer data) |
 | ★ | Leaderboard per model type: accuracy × RAM × latency on every board, nightly on the board farm |
 | ★ | Feature front ends as first-class pool blocks (FFT band energies, MFCC, envelope, RMS) with a C implementation that training uses too (no train/deploy skew) |
-| ○ | Benchmark corpus: MLPerf Tiny tasks as regression tests of the compiler + pool |
+| ★ | Benchmark corpus: MLPerf Tiny reference tasks (KWS, VWW, IC, AD) + every model type, SAI on every board vs TFLM, compared run over run  |
 | ○ | Operator-gap tracker: every refused customer model is logged with the missing op → drives SAI Core compatibility releases |
 
 ## 4. Compiler integration (SAI)
@@ -65,8 +66,8 @@ Ideas grouped by who they serve. ★ = built, ◐ = partly, ○ = not built (sta
 | ★ | Harness firmware per target (UART vectors, DWT/mcycle, stack painting) |
 | ○ | Power: INA228 / Joulescope per board → µJ per inference, sleep current |
 | ★ | Nightly regression: every pool model × every board × every SAI release; alerts on regressions |
-| ○ | Remote "virtual dev board" for customers: run *their* firmware on our boards before buying hardware |
-| ○ | Partner boards: silicon vendors place boards in the farm to be "SAI-ready" (co-marketing) |
+| ◐ | Virtual dev board: the customer's firmware on QEMU boards with their own inputs, UART and bit-exact check (physical boards through the farm)  |
+| ◐ | Partner boards: catalogue (planned / community / certified, mapped to a SAI build) and partner-hosted lab agents  |
 
 ## 6. Business
 

@@ -107,7 +107,8 @@ QUARANTINE_AFTER = 3
 
 def list_boards() -> list[dict]:
     with db.conn() as c:
-        rows = [db.row(r) for r in c.execute("SELECT * FROM boards ORDER BY target, name")]
+        rows = [db.row(r) for r in c.execute("SELECT b.*, a.partner AS partner FROM boards b LEFT JOIN agents a"
+                                             " ON a.id = b.agent_id ORDER BY b.target, b.name")]
     t = db.now()
     for r in rows:
         r["info"] = db.uj(r["info"], {})
@@ -175,7 +176,8 @@ def claim(agent_id: str) -> dict | None:
 
 
 RESULT_KEYS = {"ok": bool, "simulated": bool, "emulated": bool, "outputs": list, "cycles": int, "cycles_min": int,
-               "cycles_max": int, "latency_ms": float, "stack_painted": int, "energy_uj": float, "board": str,
+               "cycles_max": int, "latency_ms": float, "stack_painted": int, "energy_uj": float, "active_power_mw": float,
+               "sleep_power_uw": float, "board": str,
                "n_vectors": int, "firmware": str, "log": list, "error": str, "config": dict}
 
 

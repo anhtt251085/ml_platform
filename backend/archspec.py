@@ -116,6 +116,8 @@ def normalize(spec: dict) -> dict:
     for i, raw in enumerate(spec.get("layers") or []):
         op = raw.get("op")
         if op not in OPS:
+            from . import opgaps
+            opgaps.record(str(op), "platform", reason=f"layer type {op!r} has no SAI lowering in the model editor")
             raise SpecError(f"layer {i}: unknown op {op!r}; SAI-compatible ops are {', '.join(OPS)}")
         layer = {"op": op}
         for name, typ in OPS[op]["params"].items():

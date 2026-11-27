@@ -2,7 +2,7 @@
 """Dataset ingestion: every source ends as data.npz (X float32 [N, C, H, W], y, labels, groups) plus meta.json.
 
 Sources: file upload (CSV, NPZ, ZIP of WAV folders), HTTPS URL, synthetic demo data.
-Planned connectors (docs/IMPLEMENTATION_PLAN.md): S3/GCS/Azure, MQTT/OPC-UA live capture, board-farm logger.
+Also: connectors.py (S3 / Azure / InfluxDB / PostgreSQL), recordings.py (labelling, live capture), physics.py.
 
 CSV (time series): one row per sample. Columns are mapped explicitly (`mapping`: channels, label, segment, time)
 or guessed (numeric columns = channels, `label`, `segment`/`file`/`recording`, `time`). Windows of `window`
@@ -90,6 +90,9 @@ def _save(X, y, labels, meta: dict, groups=None, template: dict | None = None) -
     meta["warnings"] = meta.get("warnings", []) + meta["quality"]["warnings"]
     (d / "meta.json").write_text(json.dumps(meta, indent=1))
     return meta
+
+
+save = _save            # public name for other ingest sources (physics, recordings, connectors)
 
 
 def load(did: str):

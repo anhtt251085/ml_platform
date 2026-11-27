@@ -237,17 +237,20 @@ def scope(u: dict) -> str | None:
 
 
 # ---- agents ------------------------------------------------------------------------------------------------------
-def create_agent(name: str) -> tuple[dict, str]:
+def create_agent(name: str, partner: str | None = None) -> tuple[dict, str]:
+    """A lab agent; `partner` marks a lab hosted by a board partner (their boards appear as partner boards)."""
     aid = "agt_" + uuid.uuid4().hex[:8]
     token = "sai_agent_" + secrets.token_urlsafe(32)
     with db.conn() as c:
-        c.execute("INSERT INTO agents VALUES (?,?,?,?,?,0)", (aid, name, _th(token), db.now(), None))
-    return {"id": aid, "name": name}, token
+        c.execute("INSERT INTO agents (id, name, token_hash, created, last_seen, disabled, partner) VALUES (?,?,?,?,?,0,?)",
+                  (aid, name, _th(token), db.now(), None, partner))
+    return {"id": aid, "name": name, "partner": partner}, token
 
 
 def agents() -> list[dict]:
     with db.conn() as c:
-        return [db.row(r) for r in c.execute("SELECT id, name, created, last_seen, disabled FROM agents ORDER BY created")]
+        return [db.row(r) for r in c.execute("SELECT id, name, created, last_seen, disabled, partner FROM agents"
+                                             " ORDER BY created")]
 
 
 def disable_agent(aid: str):
