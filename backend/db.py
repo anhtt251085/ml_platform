@@ -99,6 +99,25 @@ MIGRATIONS: list[str] = [
                                       checked REAL);
     CREATE INDEX architecture_checks_i ON architecture_checks(arch_id, target, checked);
     """,
+    # 9: recordings (continuous signals to label, captured live or imported) and data connections (cloud / DB)
+    """
+    CREATE TABLE recordings (id TEXT PRIMARY KEY, org_id TEXT, meta TEXT, status TEXT, token_hash TEXT,
+                             created REAL, updated REAL);
+    CREATE INDEX recordings_i ON recordings(org_id, created);
+    CREATE TABLE connections (id TEXT PRIMARY KEY, org_id TEXT, kind TEXT, name TEXT, config TEXT, secret TEXT,
+                              created_by TEXT, created REAL);
+    CREATE INDEX connections_i ON connections(org_id);
+    """,
+    # 10: models SAI refused for a missing operator (compiler roadmap signal) and drift checks of projects
+    """
+    CREATE TABLE operator_gaps (id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL, org_id TEXT, job_id TEXT,
+                                kind TEXT, source TEXT, op TEXT, target TEXT, capability TEXT, reason TEXT,
+                                model_ops TEXT);
+    CREATE INDEX operator_gaps_i ON operator_gaps(op, created);
+    CREATE TABLE drift_checks (id TEXT PRIMARY KEY, job_id TEXT, org_id TEXT, created REAL, source TEXT,
+                               status TEXT, result TEXT);
+    CREATE INDEX drift_checks_i ON drift_checks(job_id, created);
+    """,
 ]
 
 

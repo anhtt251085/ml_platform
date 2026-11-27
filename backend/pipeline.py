@@ -294,6 +294,10 @@ def _run(jid: str, kind: str, params: dict):
         with db.conn() as c:
             c.execute("UPDATE jobs SET status='failed', error=?, updated=? WHERE id=?", (f"{type(e).__name__}: {e}", db.now(), jid))
         return
+    from . import opgaps
+    with db.conn() as c:
+        org = (c.execute("SELECT org_id FROM jobs WHERE id=?", (jid,)).fetchone() or [None])[0]
+    opgaps.JOB.set((jid, kind, org))
     try:
         {"train": run_train, "fitcheck": run_fitcheck, "analyze": run_analyze, "rebuild": run_rebuild,
          "basetrain": run_basetrain, "regression": _regression, "ingest": run_ingest,

@@ -20,8 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import numpy as np
+from xml.etree.ElementTree import ParseError as ET_ERRORS
 
-from . import approvals, archlib, archspec, auth, boards, commercial, config, data, db, pipeline, sai_engine, store
+from . import (approvals, archlib, archspec, auth, boards, commercial, config, connectors, data, db, insight,
+               opgaps, physics, pipeline, recordings, sai_engine, store)
 
 app = FastAPI(title=config.BRAND_NAME, version=config.PLATFORM_VERSION)
 FRONT = config.ROOT / "frontend"
@@ -462,6 +464,340 @@ def dataset_demo(body: DemoIn, u: dict = Depends(auth.current)):
     return meta
 
 
+# ---- physics-based augmentation ----------------------------------------------------------------------------------
+@app.get("/api/physics/models")
+def physics_models(u: dict = Depends(auth.current)):
+    return physics.MODELS
+
+
+class PhysicsIn(BaseModel):
+    template_id: str
+    params: dict = {}
+    per_class: int = 200
+    mix_with_dataset_id: str | None = None
+    augment: dict | None = None
+    name: str | None = None
+    preview: bool = False
+
+
+@app.post("/api/datasets/physics")
+def dataset_physics(body: PhysicsIn, u: dict = Depends(auth.current)):
+    """Simulated windows from the machine's own parameters (preview: frequencies + one window per class)."""
+    t = _tpl(body.template_id, u)
+    if body.mix_with_dataset_id:
+        _ds(body.mix_with_dataset_id, u)
+    try:
+        if body.preview:
+            model = physics.model_for(t)
+            X, y, labels = physics.simulate(t, body.params, 1)
+            return {"model": model, "frequencies": physics.frequencies(model, body.params),
+                    "sample_rate": t["input"].get("sample_rate_hz"),
+                    "examples": [{"label": labels[int(k)], "series": X[i, :, 0, :].round(4).tolist()}
+                                 for i, k in enumerate(y)]}
+        meta = physics.build(t, body.params, body.per_class, body.mix_with_dataset_id, body.augment, body.name)
+    except data.DataError as e:
+        _bad(e)
+    store.add_dataset(meta, u["org_id"])
+    auth.audit(u, "dataset_physics", meta["id"], {"model": meta["physics"]["model"], "mixed": body.mix_with_dataset_id})
+    return meta
+
+
+# ---- recordings: labelling tool and live capture ------------------------------------------------------------------
+def _rec(rid: str, u: dict) -> dict:
+    r = recordings.get(rid)
+    if not r:
+        raise HTTPException(404, "unknown recording")
+    _own(u, r.get("org_id"), "recording")
+    return r
+
+
+@app.get("/api/recordings")
+def recording_list(u: dict = Depends(auth.current)):
+    return recordings.list_(auth.scope(u))
+
+
+@app.post("/api/recordings/upload")
+async def recording_upload(file: UploadFile = File(...), name: str | None = Form(None),
+                           sample_rate: float | None = Form(None), licence: str = Form("proprietary"),
+                           template_id: str | None = Form(None), u: dict = Depends(auth.current)):
+    raw = await file.read(recordings.MAX_VALUES * 4)
+    try:
+        r = await run_in_threadpool(recordings.from_csv, raw, u["org_id"], u["id"], name or file.filename or "recording",
+                                    sample_rate, licence, template_id)
+    except data.DataError as e:
+        _bad(e)
+    auth.audit(u, "recording_uploaded", r["id"], {"name": r["name"]})
+    return r
+
+
+@app.get("/api/recordings/{rid}")
+def recording_get(rid: str, u: dict = Depends(auth.current)):
+    r = _rec(rid, u)
+    r["samples"] = recordings.samples(r)
+    return r
+
+
+@app.get("/api/recordings/{rid}/view")
+def recording_view(rid: str, start: int = 0, end: int | None = None, points: int = 1000, tail: int | None = None,
+                   u: dict = Depends(auth.current)):
+    return recordings.view(_rec(rid, u), start, end, points, tail)
+
+
+class SpansIn(BaseModel):
+    spans: list[dict]
+    replace: bool = False
+    labels: list[str] | None = None
+
+
+@app.put("/api/recordings/{rid}/spans")
+def recording_spans(rid: str, body: SpansIn, u: dict = Depends(auth.current)):
+    _rec(rid, u)
+    try:
+        r = recordings.set_spans(rid, body.spans, body.replace)
+        if body.labels is not None:
+            r = recordings.set_labels(rid, body.labels)
+    except data.DataError as e:
+        _bad(e)
+    return r
+
+
+class SuggestIn(BaseModel):
+    job_id: str
+    hop: int | None = None
+    min_conf: float = 0.6
+    start: int = 0
+    end: int | None = None
+
+
+@app.post("/api/recordings/{rid}/suggest")
+def recording_suggest(rid: str, body: SuggestIn, u: dict = Depends(auth.current)):
+    r = _rec(rid, u)
+    j = _job(body.job_id, u)
+    if j["kind"] != "train" or j["status"] != "succeeded":
+        raise HTTPException(400, "suggestions come from a finished project")
+    try:
+        return recordings.suggest(r, body.job_id, body.hop, body.min_conf, body.start, body.end)
+    except (data.DataError, ValueError) as e:
+        _bad(e)
+
+
+class RecDatasetIn(BaseModel):
+    recording_ids: list[str]
+    template_id: str
+    name: str = "Labelled recordings"
+    window: int | None = None
+    hop: int | None = None
+    min_cover: float = 0.5
+    licence: str | None = None
+
+
+@app.post("/api/recordings/dataset")
+def recording_dataset(body: RecDatasetIn, u: dict = Depends(auth.current)):
+    recs = [_rec(x, u) for x in body.recording_ids]
+    if not recs:
+        raise HTTPException(400, "pick at least one recording")
+    if any(r["status"] == "capturing" for r in recs):
+        raise HTTPException(409, "stop the capture first")
+    t = _tpl(body.template_id, u)
+    try:
+        meta = recordings.to_dataset(recs, t, body.name[:120], body.window, body.hop,
+                                     max(0.1, min(body.min_cover, 1.0)), body.licence)
+    except data.DataError as e:
+        _bad(e)
+    store.add_dataset(meta, u["org_id"])
+    auth.audit(u, "dataset_from_recordings", meta["id"], {"recordings": body.recording_ids})
+    return meta
+
+
+@app.delete("/api/recordings/{rid}")
+def recording_delete(rid: str, u: dict = Depends(auth.current)):
+    r = _rec(rid, u)
+    if r["status"] == "capturing":
+        raise HTTPException(409, "stop the capture first")
+    recordings.delete(rid)
+    auth.audit(u, "recording_deleted", rid, {})
+    return {"ok": True}
+
+
+class CaptureIn(BaseModel):
+    name: str = "Live capture"
+    channels: list[str]
+    sample_rate: float
+    template_id: str | None = None
+    licence: str = "proprietary"
+
+
+@app.post("/api/recordings/capture")
+def capture_start(body: CaptureIn, u: dict = Depends(auth.current)):
+    open_ = [r for r in recordings.list_(u["org_id"]) if r["status"] == "capturing" and r.get("created_by") == u["id"]]
+    if len(open_) >= 3:
+        raise HTTPException(409, f"you already have {len(open_)} captures running; stop one first")
+    try:
+        r, token = recordings.start_capture(u["org_id"], u["id"], body.name, body.channels, body.sample_rate,
+                                            body.template_id, body.licence)
+    except data.DataError as e:
+        _bad(e)
+    auth.audit(u, "capture_started", r["id"], {"channels": len(body.channels)})
+    return {**r, "token": token, "push_url": f"/api/capture/{r['id']}/push"}
+
+
+@app.post("/api/capture/{rid}/push")
+async def capture_push(rid: str, request: Request, x_capture_token: str = Header("")):
+    """Device side: samples for a running capture (token from starting it; no user login)."""
+    try:
+        r = recordings.check_token(rid, x_capture_token)
+    except PermissionError:
+        raise HTTPException(401, "bad capture token") from None
+    except data.DataError as e:
+        _bad(e, 409)
+    body = await request.body()
+    if len(body) > 16 * 1024 * 1024:
+        raise HTTPException(413, "at most 16 MB per request")
+    try:
+        arr = recordings.parse_push(body, request.headers.get("content-type", ""), len(r["channels"]))
+        n = recordings.push(r, arr)
+    except data.DataError as e:
+        _bad(e)
+    return {"received": int(len(arr)), "samples": n}
+
+
+class MarkIn(BaseModel):
+    label: str | None = None
+
+
+@app.post("/api/recordings/{rid}/mark")
+def capture_mark(rid: str, body: MarkIn, u: dict = Depends(auth.current)):
+    _rec(rid, u)
+    try:
+        return recordings.mark(rid, body.label)
+    except data.DataError as e:
+        _bad(e)
+
+
+@app.post("/api/recordings/{rid}/stop")
+def capture_stop(rid: str, u: dict = Depends(auth.current)):
+    _rec(rid, u)
+    r = recordings.stop_capture(rid)
+    auth.audit(u, "capture_stopped", rid, {"samples": recordings.samples(r)})
+    return {**r, "samples": recordings.samples(r)}
+
+
+# ---- data connectors (cloud storage, databases) -------------------------------------------------------------------
+def _con(cid: str, u: dict) -> dict:
+    c = connectors.get(cid)
+    if not c:
+        raise HTTPException(404, "unknown connection")
+    _own(u, c.get("org_id"), "connection")
+    return c
+
+
+@app.get("/api/connectors")
+def connector_list(u: dict = Depends(auth.current)):
+    return {"kinds": connectors.KINDS, "connections": connectors.list_(auth.scope(u)),
+            "private_endpoints": connectors.private_allowed()}
+
+
+class ConnIn(BaseModel):
+    kind: str = ""
+    name: str = ""
+    config: dict = {}
+    secrets: dict = {}
+
+
+@app.post("/api/connectors")
+def connector_create(body: ConnIn, u: dict = Depends(auth.current)):
+    try:
+        c = connectors.create(u["org_id"], u["id"], body.kind, body.name, body.config, body.secrets)
+    except data.DataError as e:
+        _bad(e)
+    auth.audit(u, "connection_created", c["id"], {"kind": c["kind"], "name": c["name"]})
+    return c
+
+
+@app.put("/api/connectors/{cid}")
+def connector_update(cid: str, body: ConnIn, u: dict = Depends(auth.current)):
+    _con(cid, u)
+    try:
+        c = connectors.update(cid, body.name or None, body.config, body.secrets)
+    except data.DataError as e:
+        _bad(e)
+    auth.audit(u, "connection_updated", cid, {})
+    return c
+
+
+@app.delete("/api/connectors/{cid}")
+def connector_delete(cid: str, u: dict = Depends(auth.current)):
+    _con(cid, u)
+    connectors.delete(cid)
+    auth.audit(u, "connection_deleted", cid, {})
+    return {"ok": True}
+
+
+@app.post("/api/connectors/{cid}/test")
+def connector_test(cid: str, u: dict = Depends(auth.current)):
+    _con(cid, u)
+    try:
+        return connectors.test(cid)
+    except data.DataError as e:
+        return {"ok": False, "detail": str(e)}
+
+
+@app.get("/api/connectors/{cid}/browse")
+def connector_browse(cid: str, prefix: str = "", u: dict = Depends(auth.current)):
+    _con(cid, u)
+    try:
+        return {"items": connectors.browse(cid, prefix)}
+    except (data.DataError, ET_ERRORS) as e:
+        _bad(e)
+
+
+class ConnImportIn(BaseModel):
+    key: str | None = None            # object stores
+    query: str | None = None          # databases
+    as_: str = "dataset"              # dataset | recording
+    template_id: str | None = None
+    name: str | None = None
+    window: int | None = None
+    hop: int | None = None
+    licence: str = "unknown"
+    sample_rate: float | None = None
+    mapping: dict | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+@app.post("/api/connectors/{cid}/import")
+def connector_import(cid: str, body: dict, u: dict = Depends(auth.current)):
+    c = _con(cid, u)
+    b = ConnImportIn(**{("as_" if k == "as" else k): v for k, v in body.items()})
+    try:
+        if b.key:
+            raw, fname = connectors.fetch(cid, b.key)
+        elif b.query:
+            raw, fname = connectors.time_to_seconds(connectors.query(cid, b.query)), f"{c['name']}-query.csv"
+        else:
+            raise data.DataError("give an object key or a query")
+        if b.as_ == "recording":
+            if not fname.lower().endswith((".csv", ".txt")) and not b.query:
+                raise data.DataError("recordings import CSV objects")
+            r = recordings.from_csv(raw, u["org_id"], u["id"], b.name or fname, b.sample_rate, b.licence,
+                                    b.template_id, source=f"connector:{c['kind']}")
+            auth.audit(u, "recording_imported", r["id"], {"connection": cid, "key": b.key})
+            return {"recording": r}
+        if not b.template_id:
+            raise data.DataError("choose the model type")
+        meta = data.ingest_bytes(raw, fname if not b.query else "query.csv", _tpl(b.template_id, u), window=b.window,
+                                 hop=b.hop, mapping=b.mapping, licence=b.licence)
+    except (data.DataError, ET_ERRORS) as e:
+        _bad(e)
+    meta["source"] = f"connector:{c['kind']}"
+    if b.name:
+        meta["name"] = b.name[:120]
+    store.add_dataset(meta, u["org_id"])
+    auth.audit(u, "dataset_imported", meta["id"], {"connection": cid, "key": b.key, "query": bool(b.query)})
+    return {"dataset": meta}
+
+
 @app.get("/api/datasets")
 def dataset_list(template_id: str | None = None, u: dict = Depends(auth.current)):
     return store.datasets(template_id, auth.scope(u))
@@ -690,6 +1026,104 @@ def _job(jid: str, u: dict, log_after: int = 0, metrics_after: int | None = None
 @app.get("/api/jobs")
 def job_list(kind: str | None = None, u: dict = Depends(auth.current)):
     return pipeline.list_jobs(kind, org_id=auth.scope(u))
+
+
+def _done_project(jid: str, u: dict) -> dict:
+    j = _job(jid, u)
+    if j["kind"] != "train" or j["status"] != "succeeded":
+        raise HTTPException(400, "this needs a finished project")
+    return j
+
+
+@app.get("/api/jobs/{jid}/whatif")
+def job_whatif(jid: str, u: dict = Depends(auth.current)):
+    """RAM / flash / latency of the selected model for other window lengths and channel counts (scaled)."""
+    j = _done_project(jid, u)
+    try:
+        return insight.whatif_grid(j["result"], _tpl(j["params"]["template_id"]))
+    except ValueError as e:
+        _bad(e)
+
+
+class WhatIfIn(BaseModel):
+    window: int
+    channels: int
+    targets: list[str] = []
+
+
+@app.post("/api/jobs/{jid}/whatif/check")
+def job_whatif_check(jid: str, body: WhatIfIn, u: dict = Depends(auth.current)):
+    """A real SAI fit check of the selected architecture with that input (background job)."""
+    j = _done_project(jid, u)
+    try:
+        spec = insight.whatif_spec(j["result"], body.window, body.channels)
+    except (ValueError, archspec.SpecError) as e:
+        _bad(e)
+    targets = [t for t in body.targets if t in sai_engine.MCU_TARGETS] or [j["result"]["selected"]["target"]]
+    _busy(pipeline.active_jobs("fitcheck", lambda p: p.get("spec") == spec and p.get("targets") == targets, u["org_id"]),
+          "an SAI check of this input")
+    return pipeline.create("fitcheck", {"spec": spec, "targets": targets, "goal": j["params"].get("goal", "balanced")
+                                        if j["params"].get("goal") != "accuracy" else "balanced",
+                                        "whatif_of": jid}, org_id=u["org_id"], user_id=u["id"], priority=1)
+
+
+@app.post("/api/jobs/{jid}/battery")
+def job_battery(jid: str, body: dict, u: dict = Depends(auth.current)):
+    j = _done_project(jid, u)
+    try:
+        return insight.battery(j["result"], jid, _tpl(j["params"]["template_id"]), body or {})
+    except (ValueError, TypeError) as e:
+        _bad(e)
+
+
+class DriftIn(BaseModel):
+    recording_id: str | None = None
+    dataset_id: str | None = None
+
+
+@app.get("/api/jobs/{jid}/drift")
+def job_drift_history(jid: str, u: dict = Depends(auth.current)):
+    _done_project(jid, u)
+    return insight.history(jid)
+
+
+@app.post("/api/jobs/{jid}/drift")
+def job_drift(jid: str, body: DriftIn, u: dict = Depends(auth.current)):
+    """Compare production data (a recording or a dataset) with the project's training data."""
+    j = _done_project(jid, u)
+    raw = (j["result"].get("preprocessing") or {}).get("raw_shape")
+    try:
+        if body.recording_id:
+            r = _rec(body.recording_id, u)
+            if r["status"] == "capturing":
+                raise HTTPException(409, "stop the capture first")
+            X, src = insight.windows_from_recording(r, raw), f"recording {r['name']}"
+        elif body.dataset_id:
+            d = _ds(body.dataset_id, u)
+            X = data.load(body.dataset_id)[0]
+            src = f"dataset {d.get('name')}"
+        else:
+            raise HTTPException(400, "give a recording or a dataset of production data")
+        names = (store.template(j["params"]["template_id"]) or {}).get("input", {}).get("channel_names")
+        out = insight.check(j, X, src, names)
+    except (ValueError, data.DataError) as e:
+        _bad(e)
+    out = insight.save(j, out)
+    auth.audit(u, "drift_checked", jid, {"status": out["status"], "psi": out["psi"]})
+    return out
+
+
+@app.get("/api/admin/operator-gaps")
+def operator_gaps(days: int = 365, u: dict = Depends(auth.current)):
+    """Operators SAI refused: all organisations for SAI researchers / platform admins, own organisation for an
+    organisation admin."""
+    if auth.has(u, "studio") or auth.has(u, "platform_admin"):
+        org = None
+    elif auth.has(u, "org_admin") or auth.has(u, "research"):
+        org = u["org_id"]
+    else:
+        raise HTTPException(403, "for researchers and admins")
+    return opgaps.summary(db.now() - max(1, days) * 86400, org)
 
 
 @app.get("/api/jobs/{jid}")
