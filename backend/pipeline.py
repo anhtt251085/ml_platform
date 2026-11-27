@@ -133,6 +133,24 @@ def create(kind: str, params: dict, project_id: str | None = None, org_id: str |
     return get(jid)
 
 
+ACTIVE = ("queued", "running")
+
+
+def active_jobs(kinds, match=lambda params: True, org_id: str | None = None) -> list[dict]:
+    """Queued or running jobs of these kinds whose params satisfy `match` (oldest first)."""
+    kinds = [kinds] if isinstance(kinds, str) else list(kinds)
+    q = ("SELECT id, kind, status, params, org_id FROM jobs WHERE status IN ('queued', 'running') AND kind IN ("
+         + ",".join("?" * len(kinds)) + ")" + (" AND org_id=?" if org_id else "") + " ORDER BY created")
+    with db.conn() as c:
+        rows = [db.row(r) for r in c.execute(q, (*kinds, *([org_id] if org_id else [])))]
+    out = []
+    for r in rows:
+        r["params"] = db.uj(r["params"], {})
+        if match(r["params"]):
+            out.append(r)
+    return out
+
+
 def get(jid: str, log_after: int = 0, metrics_after: int | None = None) -> dict | None:
     with db.conn() as c:
         r = db.row(c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone())

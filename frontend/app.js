@@ -225,24 +225,28 @@ function modelEditor(box, o) {
     $("#ed_reset").onclick = () => { layers = JSON.parse(JSON.stringify(o.baseline)); draw(); };
     $("#ed_cancel").onclick = () => { box.innerHTML = ""; o.onCancel && o.onCancel(); };
     $("#ed_ok").onclick = () => { if (!valid) return toast("Fix the model first: see the message under the table"); o.onSave(JSON.parse(JSON.stringify(layers)), $("#ed_name").value.trim() || o.label); box.innerHTML = ""; };
-    if ($("#ed_lib")) $("#ed_lib").onclick = async () => {
+    if ($("#ed_lib")) $("#ed_lib").onclick = () => {
       if (!valid) return toast("Fix the model first");
-      try { const a = await api("/api/architectures", { json: { name: $("#ed_name").value.trim() || o.label, family: "Custom", inputs: [o.inputKind], tasks: [o.task], layers, summary: `Customized from ${o.baseName}` } }); toast(`Saved to your library as ${a.name}`); } catch (e) { toast(e.message); }
+      return busy($("#ed_lib"), "Saving…", async () => { const a = await api("/api/architectures", { json: { name: $("#ed_name").value.trim() || o.label, family: "Custom", inputs: [o.inputKind], tasks: [o.task], layers, summary: `Customized from ${o.baseName}` } }); toast(`Saved to your library as ${a.name}`); });
     };
     $("#ed_fit").onclick = async () => {
       if (!valid) return toast("Fix the model first");
+      if ($("#ed_fit").disabled) return;
+      $("#ed_fit").disabled = true; $("#ed_fit").textContent = "Checking with SAI…";
+      const fitDone = () => { if ($("#ed_fit")) { $("#ed_fit").disabled = false; $("#ed_fit").textContent = "Check with SAI"; } };
       $("#ed_fitres").innerHTML = `<div class="callout info" style="margin-top:10px">Compiling with SAI on ${o.targets().map(esc).join(", ")}…</div>`;
       try {
         const job = await api("/api/models/fitcheck", { json: { dataset_id: o.datasetId, layers, preprocess: o.prep(), targets: o.targets(), goal: o.goal() } });
         const wait = async () => {
           let j; try { j = await api(`/api/jobs/${job.id}`); } catch (e) { if (!(e instanceof Stale)) $("#ed_fitres").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; return; }
           if (!$("#ed_fitres")) return;
+          if (["succeeded", "failed", "cancelled"].includes(j.status)) fitDone();
           if (j.status === "succeeded") { const p = j.result.plans; $("#ed_fitres").innerHTML = `<div style="margin-top:12px">${p.recommended ? `<div class="callout ok">Fits: best plan ${esc(p.recommended.target)} · ${bytes(p.recommended.ram)} RAM · ${bytes(p.recommended.flash)} flash · ${ms(p.recommended.latency.ms)}</div>` : `<div class="callout bad">${esc(p.advice || "no plan fits")}</div>`}${planTable(p.candidates)}</div>`; return; }
           if (j.status === "failed" || j.status === "cancelled") { $("#ed_fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(j.error || j.status)}</div>`; return; }
           ft = setTimeout(wait, 1000);
         };
         wait();
-      } catch (e) { $("#ed_fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(e.message)}</div>`; }
+      } catch (e) { fitDone(); $("#ed_fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(e.message)}</div>`; }
     };
     check();
   };
@@ -269,6 +273,17 @@ function archChecks(a, targets) {
   if (!ts.length || !Object.keys(a.checks || {}).length) return `<span class="badge">not SAI-checked yet</span>`;
   return ts.map((t) => { const c = (a.checks || {})[t]; return !c ? `<span class="badge">${esc(t)}: not checked</span>` : c.fits ? `<span class="badge b-ok" title="SAI ${esc(c.sai_version)} · ${bytes(c.ram)} RAM · ${bytes(c.flash)} flash · ${fmt(c.latency_ms, 3)} ms at the reference input">✓ ${esc(t)}</span>` : `<span class="badge b-bad" title="${esc(((c.detail || {}).violations || []).join("; ") || (c.detail || {}).error || "")}">✗ ${esc(t)}</span>`; }).join(" ");
 }   // downloads that need a manager's approval
+// Disables `btn` while `fn` runs (double clicks, a second request while the first is still at work); the server
+// also refuses a duplicate of a job that is queued or running, with the job id (409), which ends up in the toast.
+async function busy(btn, label, fn) {
+  if (!btn || btn.disabled) return undefined;
+  const text = btn.innerHTML;
+  btn.disabled = true;
+  if (label) btn.textContent = label;
+  try { return await fn(); }
+  catch (e) { if (!(e instanceof Stale)) toast(e.message); return undefined; }
+  finally { if (btn.isConnected) { btn.disabled = false; btn.innerHTML = text; } }
+}
 function dur(sec) {
   if (sec === null || sec === undefined || !isFinite(sec)) return "–";
   sec = Math.max(0, Math.round(sec));
@@ -336,7 +351,7 @@ route(/^\/pool$/, async (el) => {
       ${Object.entries(t.variants).map(([k, layers]) => `<tr><td>${esc(k)}</td><td class="n">${fmt(t.sizes[k]?.params)}</td><td class="n">${fmt(t.sizes[k]?.macs)}</td><td class="mono small">${layers.map((l) => l.op + (l.out ? l.out : "") + (l.k ? "k" + l.k : "") + (l.stride > 1 ? "/s" + l.stride : "")).join(" → ")} → fc(head)</td></tr>`).join("")}
       </tbody></table></div></div>`;
     const bt = $("#basetrain");
-    if (bt) bt.onclick = async () => { const j = await api("/api/studio/basetrain", { json: { template_id: bt.dataset.t } }); SYS = null; location.hash = `#/job/${j.id}`; };
+    if (bt) bt.onclick = () => busy(bt, "Starting…", async () => { const j = await api("/api/studio/basetrain", { json: { template_id: bt.dataset.t } }); SYS = null; location.hash = `#/job/${j.id}`; });
     $("#detail").scrollIntoView({ behavior: "smooth" });
   }
 });
@@ -434,6 +449,11 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
       $("#m_go").onclick = () => send(file, { label: $("#m_label").value || null, segment: $("#m_seg").value || null, time: $("#m_time").value || null, channels: $$(".m_ch:checked").map((x) => x.value) });
     }
     async function doIngest(fn) {
+      if (b.dataset.importing === "1") return toast("An import is still running");
+      b.dataset.importing = "1";
+      const locked = $$("button, input, select", b).filter((x) => !x.disabled);
+      locked.forEach((x) => (x.disabled = true));
+      const unlock = () => { b.dataset.importing = ""; locked.forEach((x) => { if (x.isConnected) x.disabled = false; }); };
       $("#dsinfo").innerHTML = `<div class="callout info" style="margin-top:12px">Ingesting…</div>`;
       try {
         let r = await fn();
@@ -447,8 +467,9 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
             await new Promise((res) => setTimeout(res, 1500));
           }
         }
+        unlock();
         st.ds = r; toast("Dataset ready"); stepData(b);
-      } catch (e) { if (!(e instanceof Stale)) $("#dsinfo").innerHTML = `<div class="callout bad" style="margin-top:12px">${esc(e.message)}</div>`; }
+      } catch (e) { unlock(); if (!(e instanceof Stale)) $("#dsinfo").innerHTML = `<div class="callout bad" style="margin-top:12px">${esc(e.message)}</div>`; }
     }
     if (st.ds) $("#dsinfo").innerHTML = datasetSummary(st.ds);
     wire();
@@ -749,7 +770,7 @@ route(/^\/architectures$/, async (el) => {
       };
     };
     if ($("#addarch")) $("#addarch").onclick = () => form(null);
-    if ($("#verall")) $("#verall").onclick = async () => { const j = await api("/api/architectures/verify", { json: {} }); toast("Verifying every architecture with SAI…"); location.hash = `#/job/${j.id}`; };
+    if ($("#verall")) $("#verall").onclick = () => busy($("#verall"), "Starting…", async () => { const j = await api("/api/architectures/verify", { json: {} }); toast("Verifying every architecture with SAI…"); location.hash = `#/job/${j.id}`; });
     el.onclick = async (e) => {
       const t = e.target;
       if (t.dataset.k !== undefined && t.classList.contains("chip")) { kind = t.dataset.k; return load(); }
@@ -779,9 +800,9 @@ route(/^\/multimodel$/, async (el) => {
   const ok = results.filter((j) => j && j.result && j.result.backend !== "xmodels");
   $("#mmlist").innerHTML = ok.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th></th><th>Project</th><th>Built for</th><th class="n">RAM</th><th class="n">Flash</th></tr></thead><tbody>${ok.map((j) => { const s = j.result.selected; return `<tr><td><input type="checkbox" data-pick="${esc(j.id)}"></td><td><a href="#/job/${esc(j.id)}">${esc(j.params.name || j.id)}</a><div class="small muted">${esc(j.params.template_id)}</div></td><td class="small">${esc(s.target)} · ${esc(s.size)}</td><td class="n">${bytes(s.ram)}</td><td class="n">${bytes(s.flash)}</td></tr>`; }).join("")}</tbody></table></div>` : `<div class="empty small">No finished SAI Core projects yet.</div>`;
   $("#mmlist").onchange = () => { picked = $$("[data-pick]:checked").map((x) => x.dataset.pick); };
-  $("#mmgo").onclick = async () => {
+  $("#mmgo").onclick = () => {
     if (picked.length < 2) return toast("Pick at least two projects");
-    try { const j = await api("/api/multimodel", { json: { name: $("#mmname").value, job_ids: picked, target: $("#mmtgt").value, budgets: { max_ram: +$("#mmram").value || null, max_flash: +$("#mmflash").value || null } } }); location.hash = `#/job/${j.id}`; } catch (e) { toast(e.message); }
+    return busy($("#mmgo"), "Starting…", async () => { const j = await api("/api/multimodel", { json: { name: $("#mmname").value, job_ids: picked, target: $("#mmtgt").value, budgets: { max_ram: +$("#mmram").value || null, max_flash: +$("#mmflash").value || null } } }); location.hash = `#/job/${j.id}`; });
   };
   const prev = (await api("/api/jobs?kind=multimodel"));
   $("#mmprev").innerHTML = prev.length ? `<table class="t"><tbody>${prev.map((j) => `<tr><td><a href="#/job/${esc(j.id)}">${esc(j.params.name || j.id)}</a></td><td>${statusBadge(j.status, j.progress)}</td><td class="small">${esc(j.params.target)} · ${(j.params.job_ids || []).length} models</td><td class="small muted">${ago(j.created)}</td></tr>`).join("")}</tbody></table>` : `<p class="small muted">None yet.</p>`;
@@ -838,7 +859,8 @@ route(/^\/packages$/, async (el) => {
     const ask = { request: "Why do you need the compiled package? (shown to the approving manager)", approve: "Approval note (optional)", reject: "Reason for rejecting (required)", revoke: "Reason for revoking (required)" }[act];
     const note = prompt(ask, "");
     if (note === null) return;
-    try { await api(`/api/packages/${j}/${act}`, { json: { note } }); toast({ request: "Requested", approve: "Approved", reject: "Rejected", revoke: "Revoked" }[act]); load(); } catch (err) { toast(err.message); }
+    await busy(t, "…", async () => { await api(`/api/packages/${j}/${act}`, { json: { note } }); toast({ request: "Requested", approve: "Approved", reject: "Rejected", revoke: "Revoked" }[act]); });
+    load();
   };
   load();
 });
@@ -971,7 +993,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
       $("#pkgreq").onclick = async () => {
         const note = prompt("Why do you need the compiled package? (shown to the approving manager)", "");
         if (note === null) return;
-        try { await api(`/api/packages/${jid}/request`, { json: { note } }); toast("Requested: a manager will review it"); drawPackageButton(); refreshPending(); } catch (e) { toast(e.message); }
+        await busy($("#pkgreq"), "Requesting…", async () => { await api(`/api/packages/${jid}/request`, { json: { note } }); toast("Requested: a manager will review it"); drawPackageButton(); refreshPending(); });
       };
     }
   }
@@ -1036,7 +1058,7 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
     ${provCard(r, jid)}
     <div class="card" style="margin-top:16px" id="hil"></div>`;
     const rb = $("#rebuild");
-    if (rb) rb.onclick = async () => { const j = await api(`/api/jobs/${jid}/rebuild`, { method: "POST" }); toast("Rebuild queued"); location.hash = `#/job/${j.id}`; };
+    if (rb) rb.onclick = () => busy(rb, "Queuing…", async () => { const j = await api(`/api/jobs/${jid}/rebuild`, { method: "POST" }); toast("Rebuild queued"); location.hash = `#/job/${j.id}`; });
     drawHil();
   }
   let hilTimer = null;
@@ -1058,12 +1080,15 @@ route(/^\/job\/([\w]+)$/, async (el, jid) => {
       <p class="small muted" style="margin:8px 0">The board builds the HIL harness firmware around the SAI package for its own target, runs the test vectors, and reports outputs, cycles and painted stack. Outputs are compared bit-exactly with the host build; real boards turn the plan's latency into <b>measured</b>. Emulated boards (QEMU) prove the program on the target ISA; their cycles are not latency.</p>
       ${runs.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Run</th><th>Board</th><th>Status</th><th class="n">Estimated</th><th class="n">Measured</th><th class="n">Error</th><th>Outputs</th><th>Stack (painted)</th></tr></thead><tbody>
       ${runs.map((x) => { const res = x.result || {}, est = x.request.estimated_ms, got = res.latency_ms; return `<tr><td class="mono small">${esc(x.id)}</td><td>${esc(x.board_id || "queued")} ${res.simulated ? `<span class="badge b-warn">simulated</span>` : res.emulated ? `<span class="badge b-info" title="real firmware on QEMU: outputs are real, cycles are QEMU's instruction clock">emulated</span>` : ""}</td><td>${statusBadge(x.status)}</td><td class="n">${ms(est)}</td><td class="n">${res.emulated ? `<span class="small muted">${fmt(res.cycles)} emu. cycles</span>` : ms(got)}</td><td class="n">${est && got && !res.emulated ? `${((got - est) / est * 100).toFixed(1)}%` : "–"}</td><td>${res.outputs_match === undefined ? "–" : res.outputs_match ? `<span class="badge b-ok">✓ ${fmt(res.n_vectors)} match</span>` : `<span class="badge b-bad">mismatch</span>`}</td><td>${bytes(res.stack_painted)}</td></tr>`; }).join("")}</tbody></table></div>` : ""}`;
-    $("#hrun").onclick = async () => {
+    const openRun = runs.find((x) => x.status === "queued" || x.status === "running");
+    $("#hrun").disabled = !!openRun;
+    $("#hrun").title = openRun ? `Run ${openRun.id} is ${openRun.status}; the next one can start when it finishes` : "";
+    $("#hrun").onclick = () => busy($("#hrun"), "Queuing…", async () => {
       const o = $("#hb").selectedOptions[0];
-      try { await api("/api/boards/runs", { json: { job_id: jid, board_id: o.value || null, target: o.dataset.t || null } }); toast("Queued on the board farm"); }
-      catch (e) { return toast(e.message); }
+      await api("/api/boards/runs", { json: { job_id: jid, board_id: o.value || null, target: o.dataset.t || null } });
+      toast("Queued on the board farm");
       pollHil();
-    };
+    });
     if (keep && [...$("#hb").options].some((o) => o.value === keep)) $("#hb").value = keep;
     return runs.some((x) => x.status === "queued" || x.status === "running");
   }
@@ -1234,6 +1259,9 @@ route(/^\/studio$/, async (el) => {
     catch (e) { toast(e.message); }
   }
   $("#runfit").onclick = async () => {
+    if ($("#runfit").disabled) return;
+    $("#runfit").disabled = true;
+    const doneFit = () => { if ($("#runfit")) $("#runfit").disabled = false; };
     readMeta();
     $("#fitres").innerHTML = `<div class="callout info" style="margin-top:10px">Compiling with SAI…</div>`;
     try {
@@ -1243,13 +1271,14 @@ route(/^\/studio$/, async (el) => {
       const wait = async () => {
         let j;
         try { j = await api(`/api/jobs/${job.id}`); } catch (e) { if (!(e instanceof Stale)) $("#fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(e.message)}</div>`; return; }
+        if (["succeeded", "failed", "cancelled"].includes(j.status)) doneFit();
         if (j.status === "cancelled") { $("#fitres").innerHTML = `<div class="callout" style="margin-top:10px">Fit check cancelled.</div>`; return; }
         if (j.status === "succeeded") { $("#fitres").innerHTML = `<div style="margin-top:12px">${planTable(j.result.plans.candidates)}${j.result.plans.advice ? `<div class="callout" style="margin-top:8px">${esc(j.result.plans.advice)}</div>` : ""}${spaceNote(j.result.plans)}<a class="small" href="#/job/${j.id}">Open full report →</a></div>`; return; }
         if (j.status === "failed") { $("#fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(j.error)}</div>`; return; }
         ft = setTimeout(wait, 800);
       };
       wait();
-    } catch (e) { $("#fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(e.message)}</div>`; }
+    } catch (e) { doneFit(); $("#fitres").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(e.message)}</div>`; }
   };
   $("#newb").onclick = () => { m = BLANK(); drawMeta(); drawArch(); };
   $("#load").onchange = async (e) => {
@@ -1271,10 +1300,14 @@ route(/^\/explorer$/, async (el) => {
     <div id="st"></div></div>
     <div class="card"><h2>Recent analyses</h2>${jobs.length ? `<table class="t"><tbody>${jobs.map((j) => `<tr><td><a href="#/job/${j.id}">${esc(j.params.filename || j.id)}</a></td><td>${statusBadge(j.status)}</td><td class="muted">${ago(j.created)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty small">None yet</div>`}</div></div>`;
   const d = $("#drop"), f = $("#file");
+  let sending = false;
   const go = async (file) => {
+    if (sending) return toast("The previous model is still uploading");
+    sending = true; d.classList.add("busy");
     const fd = new FormData(); fd.append("file", file); fd.append("targets", $$(".tg:checked").map((x) => x.value).join(",")); fd.append("goal", $("#goal").value); if ($("#mr").value) fd.append("max_ram", $("#mr").value);
     $("#st").innerHTML = `<div class="callout info" style="margin-top:10px">Uploading…</div>`;
     try { const j = await api("/api/explorer/analyze", { method: "POST", body: fd }); location.hash = `#/job/${j.id}`; } catch (e) { $("#st").innerHTML = `<div class="callout bad" style="margin-top:10px">${esc(e.message)}</div>`; }
+    finally { sending = false; d.classList.remove("busy"); }
   };
   d.onclick = () => f.click(); f.onchange = () => f.files[0] && go(f.files[0]);
   d.ondragover = (e) => { e.preventDefault(); d.classList.add("hover"); }; d.ondragleave = () => d.classList.remove("hover");
@@ -1307,9 +1340,13 @@ python agent/board_agent.py --server ${esc(location.origin)} \\
       ${b.runs.map((x) => { const r = x.result || {}; return `<tr><td class="mono small">${esc(x.id)}</td><td><a href="#/job/${esc(x.job_id)}">${esc(x.job_id)}</a></td><td>${esc(x.board_id || "–")}</td><td>${statusBadge(x.status)}</td><td class="n">${ms(x.request.estimated_ms)}</td>
         <td class="n">${r.emulated ? `<span class="small muted">${fmt(r.cycles)} emu. cycles</span>` : r.simulated ? `${ms(r.latency_ms)} (sim)` : ms(r.latency_ms)}</td>
         <td>${r.outputs_match === undefined ? (r.error ? `<span class="badge b-bad" title="${esc(r.error)}">error</span>` : "–") : r.outputs_match ? `<span class="badge b-ok">match</span>` : `<span class="badge b-bad">mismatch</span>`}</td><td class="n">${bytes(r.stack_painted)}</td><td class="muted">${ago(x.created)}</td></tr>`; }).join("")}</tbody></table></div>` : `<div class="empty small">No runs yet. Open a finished project and press “Flash &amp; measure”.</div>`}</div>`;
-    $$("[data-reset]").forEach((bt) => (bt.onclick = async () => { await api(`/api/boards/${bt.dataset.reset}/reset`, { method: "POST" }); draw(); }));
+    $$("[data-reset]").forEach((bt) => (bt.onclick = () => busy(bt, "Resetting…", async () => {
+      try { await api(`/api/boards/${bt.dataset.reset}/reset`, { method: "POST" }); }
+      catch (e) { if (!confirm(`${e.message}\n\nReset anyway and fail that run?`)) return; await api(`/api/boards/${bt.dataset.reset}/reset`, { json: { force: true } }); }
+      draw();
+    })));
     const rr = $("#regrun");
-    if (rr) rr.onclick = async () => { const j = await api("/api/admin/regression", { json: {} }); location.hash = `#/job/${j.id}`; };
+    if (rr) rr.onclick = () => busy(rr, "Starting…", async () => { const j = await api("/api/admin/regression", { json: {} }); location.hash = `#/job/${j.id}`; });
   };
   await draw();
   const t = setInterval(draw, 4000); onLeave(() => clearInterval(t));
@@ -1379,9 +1416,9 @@ route(/^\/data\/(ds_[0-9a-f]+)$/, async (el, did) => {
   if ($("#sl")) $("#sl").onchange = (e) => { label = e.target.value === "" ? null : +e.target.value; offset = 0; loadSamples(); };
   $("#prev").onclick = () => { offset = Math.max(0, offset - 6); loadSamples(); };
   $("#nextp").onclick = () => { offset += 6; loadSamples(); };
-  $("#del").onclick = async () => {
+  $("#del").onclick = () => {
     if (!confirm(`Delete dataset "${d.name}"? Finished projects keep their reports and packages.`)) return;
-    try { await api(`/api/datasets/${did}`, { method: "DELETE" }); toast("Dataset deleted"); location.hash = "#/data"; } catch (e) { toast(e.message); }
+    return busy($("#del"), "Deleting…", async () => { await api(`/api/datasets/${did}`, { method: "DELETE" }); toast("Dataset deleted"); location.hash = "#/data"; });
   };
   loadSamples();
 });
@@ -1466,7 +1503,7 @@ route(/^\/admin$/, async (el) => {
       box.innerHTML = `<div class="card"><div class="kpis">${Object.entries(q.by_status).map(([k, v]) => `<div class="kpi"><div class="l">${esc(k)}</div><div class="v">${fmt(v)}</div></div>`).join("")}</div><p class="small muted" style="margin-top:10px">Busy workers: ${q.busy_workers.map(esc).join(", ") || "none"}${q.paused ? " · <b>paused</b>" : ""}</p></div>
         <div class="card" style="margin-top:16px"><h2>Storage retention</h2><p class="small">Finished projects keep their package, model, report and build. Intermediates are removed when a job ends; the hourly sweep removes uploads older than ${fmt(q.upload_ttl_days)} days, and board builds and failed/cancelled job folders older than ${fmt(q.retention_days)} days.</p>
         <p class="small muted">Last sweep: ${rt ? `${ago(rt.at)}, freed ${bytes(rt.freed_bytes)}` : "never"}</p><button class="btn" id="sweep">Clean up now</button><span id="sweepres" class="small" style="margin-left:10px"></span></div>`;
-      $("#sweep").onclick = async () => { const r = await api("/api/admin/retention", { method: "POST" }); $("#sweepres").textContent = `freed ${bytes(r.freed_bytes)} (${Object.entries(r.removed).map(([k, v]) => `${k}: ${v}`).join(", ") || "nothing to remove"})`; };
+      $("#sweep").onclick = () => busy($("#sweep"), "Cleaning up…", async () => { const r = await api("/api/admin/retention", { method: "POST" }); $("#sweepres").textContent = `freed ${bytes(r.freed_bytes)} (${Object.entries(r.removed).map(([k, v]) => `${k}: ${v}`).join(", ") || "nothing to remove"})`; });
     }
   };
   draw();

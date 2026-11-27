@@ -140,6 +140,8 @@ table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
 .mon .kv { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px 12px; font-size: 12px; margin: 6px 0 4px; }
 .mon .kv b { display: block; font-size: 14px; font-family: var(--mono); }
 .drop { border: 2px dashed var(--line); border-radius: var(--radius); padding: 26px; text-align: center; color: var(--muted); cursor: pointer; }
+.drop.busy { opacity: .55; pointer-events: none; }
+.btn:disabled, .btn[disabled] { opacity: .55; cursor: not-allowed; }
 .drop.hover { border-color: var(--accent); background: var(--accent-soft); }
 .callout { border-left: 3px solid var(--warn); background: var(--warn-soft); padding: 8px 12px; border-radius: 6px; font-size: 13px; }
 .callout.info { border-color: var(--info); background: var(--info-soft); }
