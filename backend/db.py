@@ -99,6 +99,15 @@ MIGRATIONS: list[str] = [
                                       checked REAL);
     CREATE INDEX architecture_checks_i ON architecture_checks(arch_id, target, checked);
     """,
+    # 9: recordings (continuous signals to label, captured live or imported) and data connections (cloud / DB)
+    """
+    CREATE TABLE recordings (id TEXT PRIMARY KEY, org_id TEXT, meta TEXT, status TEXT, token_hash TEXT,
+                             created REAL, updated REAL);
+    CREATE INDEX recordings_i ON recordings(org_id, created);
+    CREATE TABLE connections (id TEXT PRIMARY KEY, org_id TEXT, kind TEXT, name TEXT, config TEXT, secret TEXT,
+                              created_by TEXT, created REAL);
+    CREATE INDEX connections_i ON connections(org_id);
+    """,
 ]
 
 

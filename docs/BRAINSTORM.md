@@ -25,12 +25,12 @@ Ideas grouped by who they serve. ★ = built, ◐ = partly, ○ = not built (sta
 |---|---|
 | ★ | CSV (windowed per recording, majority label), NPZ, HTTPS, synthetic demo data per model type |
 | ★ | Column-mapping wizard (choose time / channels / label / segment columns, units, sample rate) |
-| ○ | Label studio for time series: scrub a signal, paint label spans, auto-suggest from a pre-trained pool model |
-| ○ | Live capture: the board farm or the customer's dev board streams sensor data (USB CDC / BLE / MQTT) straight into a dataset |
-| ○ | Connectors: S3 / GCS / Azure, OPC-UA, InfluxDB / TimescaleDB, Edge Impulse import |
+| ★ | Label studio for time series: zoomable min/max view, paint and erase label spans, suggestions from a finished project's INT8 model, recordings → dataset (groups per span) |
+| ◐ | Live capture: a device / gateway / `tools/capture_client.py` (serial or stdin) posts samples with a capture token while the engineer watches and marks labels live (BLE / MQTT bridges still open) |
+| ◐ | Connectors: S3 (+ GCS HMAC, MinIO, R2), Azure Blob, InfluxDB v2, PostgreSQL / TimescaleDB (read-only SELECT); secrets Fernet-encrypted; public endpoints only unless single-customer mode (OPC-UA, Edge Impulse import still open) |
 | ★ | Data quality report: clipping, sample-rate jitter, class balance, leakage between recordings, duplicate windows |
 | ○ | Privacy modes: on-prem runner, or "bring the compiler to the data" (customer VPC worker, only metrics leave) |
-| ○ | Synthetic augmentation from physics models (bearing defect frequencies from geometry, arc models) to bootstrap small datasets |
+| ★ | Physics augmentation: bearing kinematics (BPFO/BPFI/BSF/FTF) with resonance ringing, MCSA sidebands, DC arcs from the machine's own parameters; mix with real data plus gain / speed / noise variants |
 
 ## 3. Researcher (SAI model pool team)
 

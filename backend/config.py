@@ -54,5 +54,5 @@ def _git_sha() -> str:
 
 PLATFORM_VERSION = os.environ.get("SAI_PLATFORM_VERSION") or f"0.2.0+{_git_sha()}"
 
-for sub in ("datasets", "jobs", "studio", "uploads", "pool"):
+for sub in ("datasets", "jobs", "studio", "uploads", "pool", "recordings"):
     (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)

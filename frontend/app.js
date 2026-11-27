@@ -59,6 +59,7 @@ async function system() { if (!SYS) SYS = await api("/api/system"); return SYS; 
 const routes = [];
 const route = (re, fn) => routes.push([re, fn]);
 let cleanup = [];
+const NAV_ALIAS = { "/recordings": "/data", "/recording": "/data", "/connectors": "/data", "/physics": "/data" };
 function onLeave(fn) { cleanup.push(fn); }
 function leave() { GEN++; cleanup.forEach((f) => f()); cleanup = []; }
 async function render() {
@@ -69,7 +70,7 @@ async function render() {
   for (const [re, fn] of routes) {
     const m = hash.match(re);
     if (m) {
-      $$(".side nav a").forEach((a) => { const on = a.getAttribute("href") === "#" + (base.split("/").slice(0, 2).join("/") || "/"); a.classList.toggle("active", on); if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
+      $$(".side nav a").forEach((a) => { const seg = base.split("/").slice(0, 2).join("/"); const on = a.getAttribute("href") === "#" + (NAV_ALIAS[seg] || seg || "/"); a.classList.toggle("active", on); if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
       main.innerHTML = `<div class="empty">Loading…</div>`;
       try { await fn(main, ...m.slice(1)); } catch (e) { if (!(e instanceof Stale)) main.innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; }
       window.scrollTo(0, 0);
@@ -386,7 +387,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
     const t = st.tpl, ts = t.input.height === 1;
     const csvCols = [...(t.input.channel_names || []), "label", "segment (optional)"].join(", ");
     b.innerHTML = `<div class="grid g2"><div class="card">
-      <div class="tabs"><button class="tab on" data-tab="up">Upload file</button><button class="tab" data-tab="url">From URL</button><button class="tab" data-tab="demo">Demo data</button><button class="tab" data-tab="have">Existing dataset</button><button class="tab" data-tab="soon">Live sources</button></div>
+      <div class="tabs"><button class="tab on" data-tab="up">Upload file</button><button class="tab" data-tab="url">From URL</button><button class="tab" data-tab="demo">Demo data</button><button class="tab" data-tab="have">Existing dataset</button><button class="tab" data-tab="soon">Live, cloud &amp; physics</button></div>
       <div id="tab"></div></div>
       <div class="card"><h2>${esc(t.icon)} ${esc(t.name)} – data contract</h2>
         ${ts ? `<p class="small"><b>CSV</b>: one row per sample with columns <code>${esc(csvCols)}</code>. Windows of <b>${fmt(t.window)}</b> samples every <b>${fmt(t.hop)}</b> are cut per segment; the window label is its majority label.</p>` : ""}
@@ -402,7 +403,7 @@ route(/^\/new(?:\?(.*))?$/, async (el, query) => {
       demo: () => `<p class="small">Generate a <b>synthetic</b> dataset with the physics of this task, to try the whole pipeline now. Results on synthetic data say nothing about field accuracy.</p>
         <label class="f">Windows per class<input id="per" type="number" value="300" min="30" max="2000" style="width:120px"></label><div class="row" style="margin-top:10px"><button class="btn" id="gen" ${t.synth ? "" : "disabled"}>Generate demo data</button></div>`,
       have: () => `<div id="havelist" class="small muted">Loading…</div>`,
-      soon: () => `<p class="small">Planned connectors (see the implementation plan):</p><ul class="small" style="padding-left:18px"><li>Board-farm data logger: capture straight from your sensor board</li><li>MQTT / OPC-UA live streams with labelling UI</li><li>S3 / GCS / Azure Blob buckets</li><li>Import from Edge Impulse projects or Kaggle datasets</li></ul>`,
+      soon: () => `<p class="small">Other ways to bring data in (each makes a dataset you can pick under <i>Existing dataset</i>):</p><ul class="small" style="padding-left:18px"><li><a href="#/recordings">Live capture and labelling</a>: stream from a sensor board, mark what happens, or label a long recording by time span</li><li><a href="#/connectors">Cloud and database</a>: S3 / GCS / Azure Blob, InfluxDB, PostgreSQL</li><li><a href="#/physics">Physics augmentation</a>: simulate fault signatures from your machine's parameters</li></ul>`,
     };
     const setTab = (k) => {
       $$(".tab", b).forEach((x) => x.classList.toggle("on", x.dataset.tab === k)); $("#tab").innerHTML = tabs[k]();
@@ -1369,7 +1370,7 @@ route(/^\/system$/, async (el) => {
 route(/^\/data$/, async (el) => {
   const [list, cat] = await Promise.all([api("/api/datasets"), api("/api/catalog")]);
   const tn = Object.fromEntries(cat.map((t) => [t.id, t]));
-  el.innerHTML = `<div class="page-h"><div><h1>Datasets</h1><p class="muted">Everything your organisation uploaded or generated, ready to inspect and reuse.</p></div><a class="btn primary" href="#/new">+ New project</a></div>
+  el.innerHTML = `<div class="page-h"><div><h1>Data</h1><p class="muted">Everything your organisation uploaded, captured, imported or generated, ready to inspect and reuse.</p></div><a class="btn primary" href="#/new">+ New project</a></div>${dataTabs("#/data")}
   <div class="card">${list.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Dataset</th><th>Model type</th><th>Source</th><th>Licence</th><th class="n">Windows</th><th>Shape</th><th class="n">Recordings</th><th>Quality</th><th>Created</th></tr></thead><tbody>
     ${list.map((d) => `<tr><td><a href="#/data/${esc(d.id)}"><b>${esc(d.name)}</b></a></td><td>${esc((tn[d.template] || {}).icon || "")} ${esc((tn[d.template] || {}).name || d.template)}</td><td>${esc(d.source)}${d.frontend ? ` <span class="badge b-info">${esc(d.frontend.type)}</span>` : ""}</td>
       <td><span class="badge ${d.commercial_use ? "b-ok" : "b-warn"}">${esc(d.licence)}</span></td><td class="n">${fmt(d.n)}</td><td class="mono small">${esc((d.shape || []).join("×"))}</td><td class="n">${fmt(d.recordings)}</td>
@@ -1421,6 +1422,269 @@ route(/^\/data\/(ds_[0-9a-f]+)$/, async (el, did) => {
     return busy($("#del"), "Deleting…", async () => { await api(`/api/datasets/${did}`, { method: "DELETE" }); toast("Dataset deleted"); location.hash = "#/data"; });
   };
   loadSamples();
+});
+
+/* ------------------------------------------------------------------------------------------------ data sources */
+function dataTabs(on) {
+  const t = [["#/data", "Datasets"], ["#/recordings", "Recordings & labelling"], ["#/connectors", "Cloud & database"], ["#/physics", "Physics augmentation"]];
+  return `<div class="tabs">${t.map(([h, l]) => `<a class="tab ${h === on ? "on" : ""}" href="${h}">${l}</a>`).join("")}</div>`;
+}
+const LABEL_COLORS = ["#4f7cff", "#e0a100", "#e5484d", "#2bb673", "#9b59d0", "#00a3bf", "#f76b15", "#7a8599"];
+const labelColor = (labels, l) => LABEL_COLORS[Math.max(0, labels.indexOf(l)) % LABEL_COLORS.length];
+
+/* min/max envelope plot of a recording range, label spans behind it; returns svg + the x->sample mapping */
+function signalPlot(v, { w = 1000, h = 260, sel = null, hidden = [] } = {}) {
+  const pad = { l: 8, r: 8, t: 8, b: 22 };
+  const n0 = v.start, n1 = Math.max(v.end, v.start + 1);
+  const X = (i) => pad.l + (i - n0) / (n1 - n0) * (w - pad.l - pad.r);
+  const chans = v.min.map((_, k) => k).filter((k) => !hidden.includes(k));
+  const all = chans.flatMap((k) => [...v.min[k], ...v.max[k]]);
+  let lo = all.length ? Math.min(...all) : 0, hi = all.length ? Math.max(...all) : 1; if (lo === hi) { lo -= 1; hi += 1; }
+  const Y = (y) => h - pad.b - (y - lo) / (hi - lo) * (h - pad.t - pad.b);
+  let s = `<svg viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="none" class="sigplot" role="img" aria-label="signal">`;
+  for (const sp of v.spans) {
+    const a = Math.max(sp.start, n0), b = Math.min(sp.end, n1);
+    s += `<rect x="${X(a)}" y="${pad.t}" width="${Math.max(1, X(b) - X(a))}" height="${h - pad.t - pad.b}" fill="${labelColor(v.labels, sp.label)}" opacity=".16"><title>${esc(sp.label)} ${sp.start}–${sp.end}</title></rect>
+      ${X(b) - X(a) > 8 * sp.label.length ? `<text x="${X(a) + 4}" y="${pad.t + 12}" style="fill:${labelColor(v.labels, sp.label)};font-weight:600">${esc(sp.label)}</text>` : ""}`;
+  }
+  if (v.live && v.live.label) s += `<rect x="${X(Math.max(v.live.start, n0))}" y="${pad.t}" width="${Math.max(1, X(n1) - X(Math.max(v.live.start, n0)))}" height="${h - pad.t - pad.b}" fill="${labelColor(v.labels, v.live.label)}" opacity=".22"/>`;
+  chans.forEach((k) => {
+    const c = `var(--c${(k % 3) + 1})`;
+    const top = v.x.map((x, i) => `${X(x)},${Y(v.max[k][i])}`), bot = v.x.map((x, i) => `${X(x)},${Y(v.min[k][i])}`).reverse();
+    s += v.x.length && v.min[k].some((m, i) => m !== v.max[k][i]) ? `<polygon points="${[...top, ...bot].join(" ")}" fill="${c}" fill-opacity=".55" stroke="${c}" stroke-width=".6"/>` : `<polyline points="${top.join(" ")}" fill="none" stroke="${c}" stroke-width="1.2"/>`;
+  });
+  if (sel) s += `<rect x="${X(Math.min(sel[0], sel[1]))}" y="${pad.t}" width="${Math.abs(X(sel[1]) - X(sel[0]))}" height="${h - pad.t - pad.b}" fill="var(--accent)" opacity=".18" stroke="var(--accent)"/>`;
+  const sr = v.sample_rate || 1;
+  for (let i = 0; i <= 5; i++) { const n = n0 + (n1 - n0) * i / 5; s += `<text x="${Math.min(w - 30, Math.max(14, X(n)))}" y="${h - 6}" text-anchor="middle">${(n / sr).toFixed((n1 - n0) / sr < 5 ? 2 : 1)} s</text>`; }
+  return s + "</svg>";
+}
+
+route(/^\/recordings$/, async (el) => {
+  const [list, cat] = await Promise.all([api("/api/recordings"), api("/api/catalog")]);
+  const ts = cat.filter((t) => t.input && t.input.kind === "timeseries");
+  el.innerHTML = `<div class="page-h"><div><h1>Data</h1><p class="muted">Continuous signals to label by time span, captured live or imported, then cut into a training dataset.</p></div></div>${dataTabs("#/recordings")}
+  <div class="grid g2"><div class="card"><h2>Import a recording</h2><p class="small muted">CSV: numeric columns become channels; a <span class="mono">time</span> column gives the sample rate; an optional <span class="mono">label</span> column becomes spans you can edit.</p>
+      <div class="stack"><label class="f">File<input type="file" id="rf" accept=".csv,.txt"></label>
+      <div class="grid g2"><label class="f">Sample rate (Hz)<input id="rsr" type="number" placeholder="from the time column"></label><label class="f">Licence<select id="rlic">${["proprietary", "cc-by-4.0", "cc0", "research-only", "unknown"].map((l) => `<option>${l}</option>`).join("")}</select></label></div>
+      <button class="btn primary" id="rup">Import</button></div></div>
+    <div class="card"><h2>Live capture</h2><p class="small muted">Stream from a sensor while you watch and mark what is happening. A device, gateway or <span class="mono">tools/capture_client.py</span> posts samples with the capture token.</p>
+      <div class="stack"><label class="f">Name<input id="cn" value="Bench capture"></label>
+      <label class="f">Model type (sets channels and rate)<select id="ct"><option value="">custom</option>${ts.map((t) => `<option value="${esc(t.id)}">${esc(t.icon)} ${esc(t.name)}</option>`).join("")}</select></label>
+      <div class="grid g2"><label class="f">Channels (comma separated)<input id="cc" value="acc_x,acc_y,acc_z"></label><label class="f">Sample rate (Hz)<input id="csr" type="number" value="3200"></label></div>
+      <button class="btn primary" id="cgo">Start capture</button></div></div></div>
+  <div class="card" style="margin-top:16px"><h2>Recordings</h2>${list.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Name</th><th>Status</th><th>Source</th><th>Channels</th><th class="n">Duration</th><th>Labels</th><th>Created</th></tr></thead><tbody>
+    ${list.map((r) => `<tr><td><a href="#/recording/${esc(r.id)}"><b>${esc(r.name)}</b></a></td><td>${r.status === "capturing" ? `<span class="badge b-warn">● capturing</span>` : `<span class="badge b-ok">ready</span>`}</td><td>${esc(r.source)}</td><td class="small">${esc(r.channels.join(", "))}</td>
+      <td class="n">${fmt(r.samples / r.sample_rate, 1)} s</td><td>${(r.labels || []).map((l) => `<span class="badge" style="background:${labelColor(r.labels, l)}22;color:${labelColor(r.labels, l)}">${esc(l)}</span>`).join(" ") || `<span class="muted small">none yet</span>`}</td><td class="muted">${ago(r.created)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">No recordings yet.</div>`}</div>`;
+  $("#ct").onchange = () => { const t = ts.find((x) => x.id === $("#ct").value); if (!t) return; $("#cc").value = (t.input.channel_names || []).join(","); $("#csr").value = t.input.sample_rate_hz || ""; };
+  $("#rup").onclick = () => busy($("#rup"), "Importing…", async () => {
+    const f = $("#rf").files[0]; if (!f) return toast("Choose a CSV file");
+    const fd = new FormData(); fd.append("file", f); fd.append("licence", $("#rlic").value); if ($("#rsr").value) fd.append("sample_rate", $("#rsr").value);
+    const r = await api("/api/recordings/upload", { method: "POST", body: fd }); location.hash = `#/recording/${r.id}`;
+  });
+  $("#cgo").onclick = () => busy($("#cgo"), "Starting…", async () => {
+    const r = await api("/api/recordings/capture", { json: { name: $("#cn").value, channels: $("#cc").value.split(",").map((s) => s.trim()).filter(Boolean), sample_rate: +$("#csr").value, template_id: $("#ct").value || null } });
+    sessionStorage.setItem(`captok_${r.id}`, r.token);
+    location.hash = `#/recording/${r.id}`;
+  });
+});
+
+route(/^\/recording\/(rec_[0-9a-f]+)$/, async (el, rid) => {
+  let rec = await api(`/api/recordings/${rid}`);
+  const [cat, jobs] = await Promise.all([api("/api/catalog"), api("/api/jobs?kind=train")]);
+  const ts = cat.filter((t) => t.input && t.input.kind === "timeseries");
+  let view = null, win = null, sel = null, hidden = [], cur = (rec.labels || [])[0] || "", suggestion = null, timer = null;
+  const live = () => rec.status === "capturing";
+  const tok = sessionStorage.getItem(`captok_${rid}`);
+  el.innerHTML = `<div class="page-h"><div><h1>${esc(rec.name)}</h1><div class="row small muted"><span class="mono">${esc(rid)}</span> · ${esc(rec.channels.join(", "))} · ${fmt(rec.sample_rate)} Hz · ${esc(rec.source)} · ${esc(rec.licence)}</div></div>
+    <div class="row"><a class="btn" href="#/recordings">All recordings</a><button class="btn" id="rdel">Delete</button></div></div>
+  <div id="capbox"></div>
+  <div class="card"><div class="row" style="flex-wrap:wrap;gap:8px"><b>Label</b><div id="labs" class="row" style="gap:6px;flex-wrap:wrap"></div><input id="newlab" placeholder="new label" style="width:120px"><button class="btn sm" id="addlab">Add</button>
+      <span class="spacer"></span><span class="small muted" id="selinfo">Drag on the plot to select a range</span></div>
+    <div id="plot" style="margin-top:10px;user-select:none;cursor:crosshair"></div>
+    <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px"><button class="btn sm" id="zin">Zoom to selection</button><button class="btn sm" id="zout">Zoom out</button><button class="btn sm" id="pl">◀ Pan</button><button class="btn sm" id="pr">Pan ▶</button><button class="btn sm" id="zall">Whole recording</button>
+      <span class="legend" id="chs"></span><span class="spacer"></span><button class="btn sm primary" id="apply">Label selection</button><button class="btn sm" id="erase">Erase labels in selection</button></div></div>
+  <div class="grid g2" style="margin-top:16px"><div class="card"><h2>Suggest labels with a model</h2><p class="small muted">Runs a finished project's INT8 model over sliding windows of the visible range. Nothing changes until you accept.</p>
+      <div class="stack"><label class="f">Project<select id="sj">${jobs.filter((j) => j.status === "succeeded").map((j) => `<option value="${esc(j.id)}">${esc((j.params && j.params.name) || j.name || j.id)}${j.params && j.params.template_id ? ` · ${esc(j.params.template_id)}` : ""}</option>`).join("") || `<option value="">no finished project</option>`}</select></label>
+      <label class="f">Minimum confidence <input id="sc" type="range" min="0.3" max="0.99" step="0.01" value="0.6"> <span id="scv" class="mono small">0.60</span></label>
+      <div class="row"><button class="btn" id="sgo">Suggest</button><button class="btn primary" id="sacc" disabled>Accept suggestions</button><button class="btn" id="sdis" disabled>Discard</button></div><div id="sres" class="small"></div></div></div>
+    <div class="card"><h2>Make a dataset</h2><p class="small muted">Windows of the model type's length; a window takes the label covering at least the given share of it, unlabelled ones are skipped. Splits keep each labelled span together.</p>
+      <div class="stack"><label class="f">Model type<select id="dt">${ts.map((t) => `<option value="${esc(t.id)}" ${t.id === rec.template_id ? "selected" : ""}>${esc(t.icon)} ${esc(t.name)} — ${esc((t.labels || []).join(", "))}</option>`).join("")}</select></label>
+      <div class="grid g3"><label class="f">Window<input id="dw" type="number" placeholder="model type"></label><label class="f">Hop<input id="dh" type="number" placeholder="model type"></label><label class="f">Min. labelled<input id="dc" type="number" step="0.05" value="0.5"></label></div>
+      <label class="f">Name<input id="dn" value="${esc(rec.name)} (labelled)"></label>
+      <button class="btn primary" id="dgo">Create dataset</button><div id="dres" class="small"></div></div></div></div>
+  <div class="card" style="margin-top:16px"><h2>Spans</h2><div id="spans"></div></div>`;
+
+  const drawLabels = () => {
+    const labs = rec.labels || [];
+    $("#labs").innerHTML = labs.map((l) => `<button class="btn sm ${l === cur ? "primary" : ""}" data-l="${esc(l)}" style="${l === cur ? "" : `border-color:${labelColor(labs, l)};color:${labelColor(labs, l)}`}">${esc(l)}</button>`).join("") || `<span class="small muted">add your classes →</span>`;
+    $$("#labs [data-l]").forEach((b) => (b.onclick = async () => { cur = b.dataset.l; drawLabels(); if (live()) await mark(cur); }));
+  };
+  const drawSpans = () => {
+    const sp = rec.spans || [];
+    $("#spans").innerHTML = sp.length ? `<div class="tbl-wrap"><table class="t"><thead><tr><th>Label</th><th class="n">Start (s)</th><th class="n">End (s)</th><th class="n">Length (s)</th><th>By</th><th></th></tr></thead><tbody>${sp.map((s, i) => `<tr><td><span class="badge" style="background:${labelColor(rec.labels, s.label)}22;color:${labelColor(rec.labels, s.label)}">${esc(s.label)}</span></td><td class="n">${fmt(s.start / rec.sample_rate, 3)}</td><td class="n">${fmt(s.end / rec.sample_rate, 3)}</td><td class="n">${fmt((s.end - s.start) / rec.sample_rate, 3)}</td><td class="small muted">${s.by ? "model " + esc(s.by) : "you"}</td><td><button class="btn sm" data-go="${i}">Show</button></td></tr>`).join("")}</tbody></table></div>` : `<div class="empty small">No labels yet.</div>`;
+    $$("[data-go]").forEach((b) => (b.onclick = () => { const s = sp[+b.dataset.go]; const pad = Math.round((s.end - s.start) * 0.2); win = [Math.max(0, s.start - pad), s.end + pad]; sel = [s.start, s.end]; load(); }));
+  };
+  const drawPlot = () => {
+    if (!view) return;
+    const v = suggestion ? { ...view, labels: rec.labels, spans: suggestion.spans.filter((s) => s.end > view.start && s.start < view.end) } : view;
+    $("#plot").innerHTML = signalPlot(v, { sel, hidden }) + (suggestion ? `<div class="small muted">Showing the model's suggestions: accept to keep them, discard to go back to your labels</div>` : "");
+    $("#chs").innerHTML = rec.channels.map((c, k) => `<span style="cursor:pointer;opacity:${hidden.includes(k) ? .35 : 1}" data-ch="${k}"><i style="background:var(--c${(k % 3) + 1})"></i>${esc(c)}</span>`).join("");
+    $$("[data-ch]").forEach((s) => (s.onclick = () => { const k = +s.dataset.ch; hidden = hidden.includes(k) ? hidden.filter((x) => x !== k) : [...hidden, k]; drawPlot(); }));
+    $("#selinfo").textContent = sel ? `selection ${fmt(Math.min(...sel) / rec.sample_rate, 3)}–${fmt(Math.max(...sel) / rec.sample_rate, 3)} s (${fmt(Math.abs(sel[1] - sel[0]))} samples)` : `${fmt(view.start / rec.sample_rate, 2)}–${fmt(view.end / rec.sample_rate, 2)} s of ${fmt(view.samples / rec.sample_rate, 2)} s`;
+  };
+  const load = async () => {
+    const q = live() && !win ? `tail=${Math.round(rec.sample_rate * 10)}` : `start=${win ? win[0] : 0}${win ? `&end=${win[1]}` : ""}`;
+    view = await api(`/api/recordings/${rid}/view?points=1000&${q}`);
+    drawPlot();
+  };
+  const refresh = async () => { rec = await api(`/api/recordings/${rid}`); drawLabels(); drawSpans(); await load(); };
+  const mark = async (label) => { rec = await api(`/api/recordings/${rid}/mark`, { json: { label } }); drawCap(); drawSpans(); load(); };
+  const drawCap = () => {
+    if (!live()) { $("#capbox").innerHTML = ""; return; }
+    const host = location.origin;
+    $("#capbox").innerHTML = `<div class="card" style="margin-bottom:16px;border-color:var(--warn)"><div class="row"><h2 style="margin:0">● Capturing</h2><span class="spacer"></span><span class="mono" id="capn">${fmt(view ? view.samples : 0)} samples</span><button class="btn" id="unmark">Unlabelled</button><button class="btn primary" id="stop">Stop capture</button></div>
+      <p class="small muted" style="margin-top:6px">Click a label above to mark what happens from now on. ${rec.live && rec.live.label ? `Marking <b>${esc(rec.live.label)}</b>.` : "Nothing marked."}</p>
+      ${tok ? `<details><summary class="small">Device connection</summary><pre class="code small">python tools/capture_client.py --server ${esc(host)} --id ${esc(rid)} --token ${esc(tok)} --serial /dev/ttyACM0
+# or: curl -X POST ${esc(host)}/api/capture/${esc(rid)}/push -H "X-Capture-Token: ${esc(tok)}" -H "Content-Type: text/plain" --data-binary @samples.csv</pre><p class="small muted">The token is shown only in this browser tab; it stops working when the capture stops.</p></details>` : ""}</div>`;
+    $("#stop").onclick = () => busy($("#stop"), "Stopping…", async () => { rec = await api(`/api/recordings/${rid}/stop`, { method: "POST" }); sessionStorage.removeItem(`captok_${rid}`); clearInterval(timer); toast("Capture stopped: label and build a dataset"); win = null; drawCap(); refresh(); });
+    $("#unmark").onclick = () => mark(null);
+  };
+  // selection by drag
+  let dragging = false;
+  const toSample = (e) => { const b = $("#plot svg").getBoundingClientRect(); const f = Math.min(1, Math.max(0, (e.clientX - b.left - b.width * 8 / 1000) / (b.width * 984 / 1000))); return Math.round(view.start + f * (view.end - view.start)); };
+  $("#plot").onmousedown = (e) => { if (!view) return; dragging = true; sel = [toSample(e), toSample(e)]; drawPlot(); };
+  $("#plot").onmousemove = (e) => { if (!dragging) return; sel[1] = toSample(e); drawPlot(); };
+  window.addEventListener("mouseup", () => { dragging = false; if (sel && Math.abs(sel[1] - sel[0]) < 2) { sel = null; drawPlot(); } });
+  const span = () => (sel ? [Math.min(...sel), Math.max(...sel)] : null);
+  $("#zin").onclick = () => { if (span()) { win = span(); sel = null; load(); } };
+  $("#zout").onclick = () => { if (!view) return; const c = (view.start + view.end) / 2, w = (view.end - view.start) * 2; win = [Math.max(0, Math.round(c - w / 2)), Math.round(c + w / 2)]; load(); };
+  $("#zall").onclick = () => { win = [0, view ? view.samples : 0]; load(); };
+  const pan = (d) => { if (!view) return; const w = view.end - view.start, a = Math.max(0, Math.min(view.samples - w, view.start + d * w / 2)); win = [Math.round(a), Math.round(a + w)]; load(); };
+  $("#pl").onclick = () => pan(-1); $("#pr").onclick = () => pan(1);
+  $("#addlab").onclick = async () => { const l = $("#newlab").value.trim(); if (!l) return; try { rec = await api(`/api/recordings/${rid}/spans`, { method: "PUT", json: { spans: [], labels: [...(rec.labels || []), l] } }); cur = l; $("#newlab").value = ""; drawLabels(); } catch (e) { toast(e.message); } };
+  const paint = (label) => busy(label ? $("#apply") : $("#erase"), "Saving…", async () => {
+    if (!span()) return toast("Drag on the plot to select a range first");
+    if (label === undefined) { if (!cur) return toast("Add or pick a label first"); label = cur; }
+    rec = await api(`/api/recordings/${rid}/spans`, { method: "PUT", json: { spans: [{ start: span()[0], end: span()[1], label }] } });
+    sel = null; drawLabels(); drawSpans(); load();
+  });
+  $("#apply").onclick = () => paint(undefined);
+  $("#erase").onclick = () => paint("");
+  $("#sc").oninput = () => { $("#scv").textContent = (+$("#sc").value).toFixed(2); };
+  $("#sgo").onclick = () => busy($("#sgo"), "Running the model…", async () => {
+    if (!$("#sj").value) return toast("No finished project to suggest with");
+    suggestion = await api(`/api/recordings/${rid}/suggest`, { json: { job_id: $("#sj").value, min_conf: +$("#sc").value, start: view ? view.start : 0, end: view ? view.end : null } });
+    const labs = [...new Set([...(rec.labels || []), ...suggestion.labels])]; rec.labels = labs;
+    $("#sres").innerHTML = `${suggestion.spans.length} span(s) from ${fmt(suggestion.windows)} windows of ${suggestion.window} samples. <span class="muted">${esc(suggestion.note)}</span>`;
+    $("#sacc").disabled = $("#sdis").disabled = !suggestion.spans.length; drawPlot();
+  });
+  $("#sacc").onclick = () => busy($("#sacc"), "Saving…", async () => { rec = await api(`/api/recordings/${rid}/spans`, { method: "PUT", json: { spans: suggestion.spans } }); suggestion = null; $("#sacc").disabled = $("#sdis").disabled = true; $("#sres").textContent = "Accepted."; drawLabels(); drawSpans(); load(); });
+  $("#sdis").onclick = () => { suggestion = null; $("#sacc").disabled = $("#sdis").disabled = true; $("#sres").textContent = ""; drawPlot(); };
+  $("#dgo").onclick = () => busy($("#dgo"), "Cutting windows…", async () => {
+    const d = await api("/api/recordings/dataset", { json: { recording_ids: [rid], template_id: $("#dt").value, name: $("#dn").value, window: +$("#dw").value || null, hop: +$("#dh").value || null, min_cover: +$("#dc").value || 0.5 } });
+    $("#dres").innerHTML = `<div class="callout ok" style="margin-top:8px">Dataset <a href="#/data/${esc(d.id)}">${esc(d.name)}</a>: ${fmt(d.n)} windows (${fmt(d.unlabelled_windows_skipped)} unlabelled skipped).</div>`;
+  });
+  $("#rdel").onclick = () => { if (!confirm(`Delete recording "${rec.name}"? Datasets made from it are kept.`)) return; return busy($("#rdel"), "Deleting…", async () => { await api(`/api/recordings/${rid}`, { method: "DELETE" }); location.hash = "#/recordings"; }); };
+  drawLabels(); drawSpans(); await load(); drawCap();
+  if (live()) {
+    timer = setInterval(async () => { if (!win) { try { await load(); if ($("#capn")) $("#capn").textContent = `${fmt(view.samples)} samples`; } catch (e) { /* page left */ } } }, 1000);
+    onLeave(() => clearInterval(timer));
+  }
+});
+
+route(/^\/connectors$/, async (el) => {
+  const [r, cat] = await Promise.all([api("/api/connectors"), api("/api/catalog")]);
+  let kind = "s3", openId = null;
+  el.innerHTML = `<div class="page-h"><div><h1>Data</h1><p class="muted">Connect the bucket or database where your sensor data already lives, browse it and import files or query results.</p></div></div>${dataTabs("#/connectors")}
+  ${r.private_endpoints ? "" : `<div class="callout info" style="margin-bottom:12px">This hosted platform connects to public endpoints only. Data inside your network (MinIO, an internal database) needs the platform installed in that network (single-customer mode) or a customer-VPC worker.</div>`}
+  <div class="grid g2"><div class="card"><h2>Connections</h2><div id="clist"></div></div>
+    <div class="card"><h2>New connection</h2><div class="tabs" id="ktabs">${Object.entries(r.kinds).map(([k, v]) => `<button class="tab ${k === kind ? "on" : ""}" data-k="${k}">${esc({ s3: "S3 / GCS", azure: "Azure Blob", influxdb: "InfluxDB", postgres: "PostgreSQL" }[k] || k)}</button>`).join("")}</div><div id="kform"></div></div></div>
+  <div class="card" style="margin-top:16px" id="cdetail" hidden></div>`;
+  const drawList = () => { $("#clist").innerHTML = r.connections.length ? `<table class="t"><tbody>${r.connections.map((c) => `<tr><td><b>${esc(c.name)}</b><div class="small muted">${esc(r.kinds[c.kind].label)} · ${esc(c.config.bucket || c.config.container || c.config.database || c.config.org || "")}</div></td><td class="small muted">secrets: ${c.secrets_set.length ? esc(c.secrets_set.join(", ")) + " set" : "none"}</td><td><button class="btn sm" data-open="${esc(c.id)}">Open</button></td></tr>`).join("")}</tbody></table>` : `<div class="empty small">No connections yet.</div>`; $$("[data-open]").forEach((b) => (b.onclick = () => openConn(b.dataset.open))); };
+  const drawForm = () => {
+    const k = r.kinds[kind];
+    $("#kform").innerHTML = `<div class="stack"><label class="f">Name<input id="kn" value="${esc(k.label.split(" (")[0])}"></label>${k.fields.map(([f, l, d]) => typeof d === "boolean" ? `<label class="row small"><input type="checkbox" data-f="${f}" ${d ? "checked" : ""}> ${esc(l)}</label>` : `<label class="f">${esc(l)}<input data-f="${f}" value="${esc(d)}"></label>`).join("")}
+      ${k.secrets.map(([f, l]) => `<label class="f">${esc(l)}<input type="password" data-s="${f}" autocomplete="off"></label>`).join("")}<p class="small muted">Secrets are encrypted at rest and never shown again.</p><button class="btn primary" id="ksave">Save connection</button></div>`;
+    $("#ksave").onclick = () => busy($("#ksave"), "Saving…", async () => {
+      const config = {}, secrets = {};
+      $$("#kform [data-f]").forEach((i) => (config[i.dataset.f] = i.type === "checkbox" ? i.checked : i.value));
+      $$("#kform [data-s]").forEach((i) => (secrets[i.dataset.s] = i.value));
+      const c = await api("/api/connectors", { json: { kind, name: $("#kn").value, config, secrets } });
+      r.connections.unshift(c); drawList(); openConn(c.id);
+    });
+  };
+  $$("#ktabs [data-k]").forEach((b) => (b.onclick = () => { kind = b.dataset.k; $$("#ktabs .tab").forEach((x) => x.classList.toggle("on", x === b)); drawForm(); }));
+  const ts = cat.filter((t) => t.input && t.input.kind !== "image");
+  const openConn = (cid) => {
+    openId = cid;
+    const c = r.connections.find((x) => x.id === cid);
+    const store = c.kind === "s3" || c.kind === "azure";
+    const box = $("#cdetail"); box.hidden = false;
+    box.innerHTML = `<div class="row"><h2 style="margin:0">${esc(c.name)}</h2><span class="small muted">${esc(r.kinds[c.kind].label)}</span><span class="spacer"></span><button class="btn sm" id="ctest">Test</button><button class="btn sm" id="cdel">Delete</button></div><div id="ctres" class="small" style="margin-top:6px"></div>
+      <div class="grid g2" style="margin-top:12px"><div>${store ? `<div class="row"><input id="cpre" placeholder="prefix (folder)" style="flex:1"><button class="btn sm" id="cbr">Browse</button></div><div id="citems" style="margin-top:8px;max-height:320px;overflow:auto"></div>`
+        : `<label class="f">${c.kind === "influxdb" ? "Flux query (pivot fields into columns)" : "SELECT query (read-only)"}<textarea id="cq" rows="7" class="mono small">${esc(c.kind === "influxdb" ? `from(bucket: "${c.config.bucket || "sensors"}")\n  |> range(start: -1h)\n  |> filter(fn: (r) => r._measurement == "vibration")\n  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")\n  |> keep(columns: ["_time", "acc_x", "acc_y", "acc_z"])` : "SELECT ts AS time, acc_x, acc_y, acc_z, label\nFROM vibration\nWHERE machine = 'pump-3'\nORDER BY ts\nLIMIT 200000")}</textarea></label>`}</div>
+        <div class="stack"><div class="small"><b>Import as</b> <label><input type="radio" name="cas" value="dataset" checked> dataset (needs a label column)</label> <label><input type="radio" name="cas" value="recording"> recording to label</label></div>
+          <label class="f">Model type<select id="cimt">${ts.map((t) => `<option value="${esc(t.id)}">${esc(t.icon)} ${esc(t.name)}</option>`).join("")}</select></label>
+          <div class="grid g2"><label class="f">Licence<select id="cil">${["proprietary", "cc-by-4.0", "cc0", "research-only", "unknown"].map((l) => `<option>${l}</option>`).join("")}</select></label><label class="f">Name<input id="cin" placeholder="from the object"></label></div>
+          <div><b class="small">Selected:</b> <span id="csel" class="mono small">${store ? "click an object" : "the query"}</span></div>
+          <button class="btn primary" id="cimp">Import</button><div id="cires" class="small"></div></div></div>`;
+    let key = null;
+    $("#ctest").onclick = () => busy($("#ctest"), "Testing…", async () => { const t = await api(`/api/connectors/${cid}/test`, { method: "POST" }); $("#ctres").innerHTML = `<span class="badge ${t.ok ? "b-ok" : "b-bad"}">${t.ok ? "ok" : "failed"}</span> ${esc(t.detail)}`; });
+    $("#cdel").onclick = () => { if (!confirm(`Delete connection "${c.name}"?`)) return; busy($("#cdel"), "…", async () => { await api(`/api/connectors/${cid}`, { method: "DELETE" }); r.connections = r.connections.filter((x) => x.id !== cid); box.hidden = true; drawList(); }); };
+    if (store) $("#cbr").onclick = () => busy($("#cbr"), "Listing…", async () => {
+      const { items } = await api(`/api/connectors/${cid}/browse?prefix=${encodeURIComponent($("#cpre").value)}`);
+      $("#citems").innerHTML = items.length ? `<table class="t"><tbody>${items.map((it, i) => `<tr data-i="${i}" style="cursor:pointer"><td class="mono small">${esc(it.key)}</td><td class="n small">${it.size != null ? bytes(it.size) : ""}</td></tr>`).join("")}</tbody></table>` : `<div class="empty small">Nothing under this prefix.</div>`;
+      $$("#citems [data-i]").forEach((tr) => (tr.onclick = () => { key = items[+tr.dataset.i].key; $("#csel").textContent = key; $$("#citems tr").forEach((x) => x.classList.toggle("sel", x === tr)); }));
+    });
+    $("#cimp").onclick = () => busy($("#cimp"), "Importing…", async () => {
+      const as = $$('input[name="cas"]').find((x) => x.checked).value;
+      if (store && !key) return toast("Pick an object first");
+      const body = { as, template_id: $("#cimt").value, licence: $("#cil").value, name: $("#cin").value || null, ...(store ? { key } : { query: $("#cq").value }) };
+      const out = await api(`/api/connectors/${cid}/import`, { json: body });
+      $("#cires").innerHTML = out.dataset ? `<div class="callout ok">Dataset <a href="#/data/${esc(out.dataset.id)}">${esc(out.dataset.name)}</a>: ${fmt(out.dataset.n)} windows.</div>` : `<div class="callout ok">Recording <a href="#/recording/${esc(out.recording.id)}">${esc(out.recording.name)}</a> ready to label.</div>`;
+    });
+  };
+  drawList(); drawForm();
+});
+
+route(/^\/physics$/, async (el) => {
+  const [models, cat, dsets] = await Promise.all([api("/api/physics/models"), api("/api/catalog"), api("/api/datasets")]);
+  const ts = cat.filter((t) => models[t.synth] && t.input.kind === "timeseries" && !t.frontend);
+  let tpl = ts[0];
+  el.innerHTML = `<div class="page-h"><div><h1>Data</h1><p class="muted">Simulate fault signatures from <b>your machine's</b> parameters, to fill classes you have little data for, or to augment real recordings with physically plausible variations.</p></div></div>${dataTabs("#/physics")}
+  <div class="grid g2"><div class="card"><h2>Machine</h2><div class="stack"><label class="f">Model type<select id="pt">${ts.map((t) => `<option value="${esc(t.id)}">${esc(t.icon)} ${esc(t.name)}</option>`).join("")}</select></label><div id="pp" class="grid g2"></div></div></div>
+    <div class="card"><h2>What the physics gives</h2><div id="pf"></div><div id="pex" style="margin-top:8px"></div></div></div>
+  <div class="card" style="margin-top:16px"><h2>Generate</h2><div class="grid g3"><label class="f">Windows per class<input id="pn" type="number" value="200"></label>
+      <label class="f">Mix with my dataset<select id="pm"><option value="">no: simulated only (licence: synthetic)</option></select></label><label class="f">Name<input id="pname" placeholder="automatic"></label></div>
+    <div id="paug" class="grid g3" style="margin-top:8px" hidden><label class="f">Sensor gain error ±%<input id="ag" type="number" value="5"></label><label class="f">Speed change ±%<input id="as" type="number" value="3"></label><label class="f">Added noise SNR (dB)<input id="an" type="number" value="30"></label></div>
+    <div class="row" style="margin-top:10px"><label class="small" id="paugl" hidden><input type="checkbox" id="pa" checked> also add one physical variant of every real window</label><span class="spacer"></span><button class="btn primary" id="pgo">Create dataset</button></div><div id="pres" style="margin-top:8px"></div></div>`;
+  const params = () => Object.fromEntries($$("#pp [data-p]").map((i) => [i.dataset.p, +i.value]));
+  let deb = null;
+  const preview = async () => {
+    try {
+      const r = await api("/api/datasets/physics", { json: { template_id: tpl.id, params: params(), preview: true } });
+      const f = r.frequencies;
+      $("#pf").innerHTML = `<table class="t"><tbody>${Object.entries(f).map(([k, v]) => `<tr><td class="muted">${esc({ shaft: "Shaft rotation", ftf: "Cage (FTF)", bpfo: "Outer-race defect (BPFO)", bpfi: "Inner-race defect (BPFI)", bsf: "Ball spin (BSF)", supply: "Supply", broken_bar: "Broken-bar sidebands (1±2s)f", eccentricity: "Eccentricity sidebands", switching: "Switching" }[k] || k)}</td><td class="n mono">${Array.isArray(v) ? v.map((x) => fmt(x, 2)).join(" / ") : fmt(v, 2)} Hz</td></tr>`).join("")}</tbody></table>`;
+      $("#pex").innerHTML = `<div class="grid g2">${r.examples.map((e) => `<div class="card" style="padding:8px"><b class="small">${esc(e.label)}</b>${sparkSeries(e.series.slice(0, 3), 300, 70)}</div>`).join("")}</div>`;
+    } catch (e) { if (!(e instanceof Stale)) $("#pf").innerHTML = `<div class="callout bad">${esc(e.message)}</div>`; }
+  };
+  const drawParams = () => {
+    tpl = ts.find((t) => t.id === $("#pt").value) || ts[0];
+    const m = models[tpl.synth];
+    $("#pp").innerHTML = m.params.map((p) => `<label class="f">${esc(p.label)}${p.unit ? ` (${esc(p.unit)})` : ""}<input type="number" data-p="${p.key}" value="${p.default}" min="${p.min}" max="${p.max}" step="${p.step || "any"}"></label>`).join("");
+    $$("#pp [data-p]").forEach((i) => (i.oninput = () => { clearTimeout(deb); deb = setTimeout(preview, 300); }));
+    $("#pm").innerHTML = `<option value="">no: simulated only (licence: synthetic)</option>` + dsets.filter((d) => d.template === tpl.id).map((d) => `<option value="${esc(d.id)}">${esc(d.name)} (${fmt(d.n)} windows)</option>`).join("");
+    preview();
+  };
+  $("#pm").onchange = () => { const on = !!$("#pm").value; $("#paug").hidden = $("#paugl").hidden = !on; };
+  $("#pt").onchange = drawParams;
+  $("#pgo").onclick = () => busy($("#pgo"), "Simulating…", async () => {
+    const mix = $("#pm").value || null;
+    const d = await api("/api/datasets/physics", { json: { template_id: tpl.id, params: params(), per_class: +$("#pn").value, mix_with_dataset_id: mix, name: $("#pname").value || null, augment: mix && $("#pa").checked ? { gain_pct: +$("#ag").value, speed_pct: +$("#as").value, snr_db: +$("#an").value } : null } });
+    $("#pres").innerHTML = `<div class="callout ok">Dataset <a href="#/data/${esc(d.id)}">${esc(d.name)}</a>: ${fmt(d.n)} windows${d.physics_windows ? `, ${fmt(d.physics_windows)} simulated` : ""} · licence ${esc(d.licence)}.</div>`;
+  });
+  if (!ts.length) { $("#pp").innerHTML = `<div class="empty small">No model type with a physics model.</div>`; return; }
+  drawParams();
 });
 
 /* ------------------------------------------------------------------------------------------------ plan & usage */
